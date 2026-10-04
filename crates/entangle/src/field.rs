@@ -106,7 +106,7 @@ impl Field {
         self.peers
             .values()
             .filter(|record| include_unentangled || record.state == PeerState::Entangled)
-            .filter(|record| context.map_or(true, |value| record.resonance.context.as_deref() == Some(value)))
+            .filter(|record| context.is_none_or(|value| record.resonance.context.as_deref() == Some(value)))
             .map(|record| {
                 json!({
                     "particle_id": record.resonance.particle_id.as_str(),
