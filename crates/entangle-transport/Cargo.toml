@@ -1,0 +1,17 @@
+[package]
+name = "entangle-transport"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+entangle-core = { path = "../entangle-core" }
+hex.workspace = true
+rand.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["process"] }
+
+[dev-dependencies]
+tempfile = "3.0"

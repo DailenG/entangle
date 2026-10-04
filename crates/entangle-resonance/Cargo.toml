@@ -1,0 +1,15 @@
+[package]
+name = "entangle-resonance"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+entangle-core = { path = "../entangle-core" }
+mdns-sd.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true

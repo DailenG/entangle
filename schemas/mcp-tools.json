@@ -1,0 +1,113 @@
+{
+  "tools": [
+    {
+      "name": "find_entangled_particles",
+      "title": "Find entangled particles",
+      "description": "List Entangle peers (particles) discovered on the local network via mDNS. Each particle reports its identity, address, capability manifest, and whether the handshake has completed (state = \"entangled\"). Only entangled particles can receive state syncs.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "context": { "type": "string", "description": "Only return particles whose project context ID equals this value." },
+          "include_unentangled": { "type": "boolean", "default": false, "description": "Also return particles that were discovered but have not completed the handshake." }
+        },
+        "additionalProperties": false
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "self": { "type": "object", "description": "This particle's own manifest." },
+          "particles": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "particle_id": { "type": "string" },
+                "name": { "type": "string" },
+                "hostname": { "type": "string" },
+                "addrs": { "type": "array", "items": { "type": "string" } },
+                "port": { "type": "integer" },
+                "context": { "type": ["string", "null"] },
+                "state": { "type": "string", "enum": ["resonating", "entangled"] },
+                "manifest": { "type": ["object", "null"] },
+                "last_seen_secs": { "type": "integer" }
+              },
+              "required": ["particle_id", "name", "state"]
+            }
+          }
+        },
+        "required": ["self", "particles"]
+      }
+    },
+    {
+      "name": "sync_entangled_state",
+      "title": "Sync entangled state",
+      "description": "Send a JSON message or a single file to an entangled particle. A one-time secret is generated, the payload is transferred with croc over a relay on the local network, and the call returns once the receiver has verified the SHA-256 of what it got. Provide exactly one of `state` or `file_path`.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "particle_id": { "type": "string", "description": "Target particle ID (full ID or the 8-character short form) from find_entangled_particles." },
+          "state": { "description": "Arbitrary JSON value to deliver to the peer agent." },
+          "file_path": { "type": "string", "description": "Path to a single regular file on this machine to deliver." },
+          "label": { "type": "string", "maxLength": 200, "description": "Short human-readable note describing the payload for the receiving agent." },
+          "timeout_secs": { "type": "integer", "minimum": 5, "maximum": 3600, "default": 120 }
+        },
+        "required": ["particle_id"],
+        "additionalProperties": false
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "sync_id": { "type": "string" },
+          "particle_id": { "type": "string" },
+          "kind": { "type": "string", "enum": ["json", "file"] },
+          "bytes": { "type": "integer" },
+          "sha256": { "type": "string" },
+          "delivered": { "type": "boolean" },
+          "elapsed_ms": { "type": "integer" }
+        },
+        "required": ["sync_id", "particle_id", "kind", "bytes", "sha256", "delivered"]
+      }
+    },
+    {
+      "name": "observe_entangled_states",
+      "title": "Observe entangled states",
+      "description": "Read state syncs this particle has received from peers. JSON payloads are returned inline; files are returned as a local path (plus inline text for small UTF-8 files). Set `collapse` to true to remove the returned items from the inbox after reading.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "since_sync_id": { "type": "string", "description": "Only return items received after this sync ID." },
+          "collapse": { "type": "boolean", "default": false, "description": "Remove returned items from the inbox (files stay on disk)." },
+          "limit": { "type": "integer", "minimum": 1, "maximum": 100, "default": 20 }
+        },
+        "additionalProperties": false
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "states": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "sync_id": { "type": "string" },
+                "from_particle_id": { "type": "string" },
+                "from_name": { "type": "string" },
+                "kind": { "type": "string", "enum": ["json", "file"] },
+                "label": { "type": ["string", "null"] },
+                "received_at": { "type": "string", "description": "RFC 3339 timestamp." },
+                "bytes": { "type": "integer" },
+                "sha256": { "type": "string" },
+                "state": { "description": "Inline JSON payload (kind = json)." },
+                "path": { "type": "string", "description": "Local path of the received file (kind = file)." },
+                "text": { "type": "string", "description": "Inline contents for small UTF-8 files." }
+              },
+              "required": ["sync_id", "from_particle_id", "kind", "received_at", "bytes", "sha256"]
+            }
+          },
+          "remaining": { "type": "integer" }
+        },
+        "required": ["states", "remaining"]
+      }
+    }
+  ]
+}
