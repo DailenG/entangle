@@ -122,6 +122,14 @@ impl fmt::Debug for RelayTicket {
     }
 }
 
+/// Returns whether `id` is a 32-character lowercase hexadecimal sync ID.
+pub fn is_valid_sync_id(id: &str) -> bool {
+    id.len() == 32
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
 /// Returns a safe single-component filename, rejecting traversal and control bytes.
 pub fn sanitize_name(name: &str) -> Option<String> {
     if name.is_empty()
@@ -179,6 +187,24 @@ mod tests {
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)));
         assert_ne!(id, ParticleId::generate());
         assert_eq!(id.short().len(), 8);
+    }
+
+    #[test]
+    fn sync_ids_require_32_lowercase_hex_characters() {
+        assert!(is_valid_sync_id("0123456789abcdef0123456789abcdef"));
+
+        for invalid in [
+            "",
+            "..",
+            "../../..",
+            "a/b",
+            "0123456789abcdef0123456789abcde",
+            "0123456789abcdef0123456789abcdef0",
+            "0123456789ABCDEF0123456789ABCDEF",
+            "0123456789abcdef0123456789abcdefg",
+        ] {
+            assert!(!is_valid_sync_id(invalid), "{invalid:?}");
+        }
     }
 
     #[test]

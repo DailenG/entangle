@@ -7,7 +7,9 @@ use crate::{
 };
 use anyhow::{Context, Result};
 use chrono::Utc;
-use entangle_core::{Manifest, ParticleId, RelayTicket, StateKind, PROTOCOL_VERSION};
+use entangle_core::{
+    is_valid_sync_id, Manifest, ParticleId, RelayTicket, StateKind, PROTOCOL_VERSION,
+};
 use entangle_link::{LinkError, LinkHandler, LinkListener, SyncDecision, SyncOffer};
 use entangle_resonance::{Advertisement, Resonance, ResonanceEvent, Resonator};
 use entangle_transport::{Croc, LocalRelay, Secret};
@@ -26,6 +28,9 @@ use tokio::{
     time::sleep,
 };
 use tracing::{debug, info};
+
+const MIN_TIMEOUT_SECS: u64 = 5;
+const MAX_TIMEOUT_SECS: u64 = 3600;
 
 /// A single running Entangle process and its stateful local services.
 pub struct Particle {
@@ -297,7 +302,7 @@ impl Particle {
             .get("timeout_secs")
             .and_then(Value::as_u64)
             .unwrap_or(120)
-            .clamp(5, 3600);
+            .clamp(MIN_TIMEOUT_SECS, MAX_TIMEOUT_SECS);
         let sync_id = uuid::Uuid::new_v4().simple().to_string();
         let (path, name, cleanup) = if has_state {
             let path = self.data_dir.join("outbox").join(format!("{sync_id}.json"));
@@ -523,6 +528,9 @@ impl Particle {
     }
 
     async fn receive_offer(&self, offer: SyncOffer) -> Result<String, String> {
+        if !is_valid_sync_id(&offer.sync_id) {
+            return Err("offered sync_id is malformed".to_owned());
+        }
         let _permit = Arc::clone(&self.inbound_limit)
             .acquire_owned()
             .await
@@ -585,7 +593,9 @@ impl Particle {
             .await
             .map_err(|e| e.to_string())?;
         receiver
-            .wait(Duration::from_secs(offer.timeout_secs))
+            .wait(Duration::from_secs(
+                offer.timeout_secs.clamp(MIN_TIMEOUT_SECS, MAX_TIMEOUT_SECS),
+            ))
             .await
             .map_err(|e| e.to_string())?;
         let path = directory.join(name);
@@ -789,6 +799,73 @@ mod tests {
             no_mdns: true,
             log_level: "warn".into(),
         }
+    }
+
+    #[tokio::test]
+    async fn malformed_offer_sync_id_is_rejected_before_inbound_work() {
+        let temp = tempfile::tempdir().unwrap();
+        let inbox_dir = temp.path().join("inbox");
+        let escape_dir = temp.path().join("escape");
+        tokio::fs::create_dir(&inbox_dir).await.unwrap();
+        tokio::fs::create_dir(&escape_dir).await.unwrap();
+        let sentinel = escape_dir.join("keep.txt");
+        tokio::fs::write(&sentinel, b"keep").await.unwrap();
+
+        let inbound_limit = Arc::new(Semaphore::new(0));
+        inbound_limit.close();
+        let particle = Particle {
+            manifest: Manifest {
+                particle_id: ParticleId::generate(),
+                name: "receiver".into(),
+                version: "0.1.0".into(),
+                protocol: PROTOCOL_VERSION,
+                link_port: 7337,
+                context: None,
+                tools: Vec::new(),
+                accepts: vec![StateKind::Json, StateKind::File],
+                max_payload_bytes: 1024,
+            },
+            field: Arc::new(RwLock::new(Field::default())),
+            options: options(
+                "receiver",
+                7337,
+                9109,
+                "127.0.0.1:7338".into(),
+                temp.path().to_path_buf(),
+            ),
+            croc: Croc {
+                path: PathBuf::new(),
+                version: String::new(),
+            },
+            data_dir: temp.path().to_path_buf(),
+            relay: Mutex::new(None),
+            resonator: Mutex::new(None),
+            inbox: Mutex::new(Vec::new()),
+            notifications: None,
+            inbound_limit,
+        };
+        let offer = SyncOffer {
+            from: ParticleId::generate(),
+            sync_id: "../escape".into(),
+            timeout_secs: 60,
+            kind: StateKind::File,
+            name: "payload.txt".into(),
+            size: 0,
+            sha256: String::new(),
+            label: None,
+            relay: RelayTicket {
+                host: "127.0.0.1".into(),
+                port: 9109,
+                password: String::new(),
+            },
+            secret: String::new(),
+        };
+
+        assert_eq!(
+            particle.receive_offer(offer).await.unwrap_err(),
+            "offered sync_id is malformed"
+        );
+        assert_eq!(tokio::fs::read(sentinel).await.unwrap(), b"keep");
     }
 
     fn free_base_port() -> u16 {
