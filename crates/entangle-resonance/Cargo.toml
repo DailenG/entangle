@@ -8,6 +8,7 @@ license.workspace = true
 
 [dependencies]
 entangle-core = { path = "../entangle-core" }
+gethostname.workspace = true
 mdns-sd.workspace = true
 serde.workspace = true
 thiserror.workspace = true

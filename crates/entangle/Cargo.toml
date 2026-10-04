@@ -1,0 +1,31 @@
+[package]
+name = "entangle"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+entangle-core = { path = "../entangle-core" }
+entangle-resonance = { path = "../entangle-resonance" }
+entangle-transport = { path = "../entangle-transport" }
+entangle-link = { path = "../entangle-link" }
+entangle-mcp = { path = "../entangle-mcp" }
+async-trait.workspace = true
+anyhow.workspace = true
+chrono.workspace = true
+clap.workspace = true
+dirs.workspace = true
+gethostname.workspace = true
+hex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tokio = { workspace = true, features = ["full"] }
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile = "3.0"

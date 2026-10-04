@@ -16,6 +16,7 @@ use tokio::{
 
 /// Maximum number of bytes accepted in a single newline-terminated frame.
 pub const MAX_FRAME_BYTES: usize = 64 * 1024;
+const FRAME_IDLE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Control protocol message encoded as one JSON object per line.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -28,8 +29,12 @@ pub enum Frame {
     },
     /// Announces a payload and its one-time croc access details.
     SyncOffer {
+        /// Sender's particle identity.
+        from: entangle_core::ParticleId,
         /// Unique transfer identifier.
         sync_id: String,
+        /// Maximum time allowed for the payload transfer, in seconds.
+        timeout_secs: u64,
         /// Payload format.
         kind: StateKind,
         /// Safe leaf filename.
@@ -76,8 +81,12 @@ pub enum Frame {
 /// State-sync offer contents excluding the serde enum wrapper.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SyncOffer {
+    /// Sender's particle identity.
+    pub from: entangle_core::ParticleId,
     /// Unique transfer identifier.
     pub sync_id: String,
+    /// Maximum time allowed for the payload transfer, in seconds.
+    pub timeout_secs: u64,
     /// Payload format.
     pub kind: StateKind,
     /// Safe leaf filename.
@@ -97,7 +106,9 @@ pub struct SyncOffer {
 impl From<SyncOffer> for Frame {
     fn from(offer: SyncOffer) -> Self {
         Self::SyncOffer {
+            from: offer.from,
             sync_id: offer.sync_id,
+            timeout_secs: offer.timeout_secs,
             kind: offer.kind,
             name: offer.name,
             size: offer.size,
@@ -227,11 +238,20 @@ pub async fn offer(
     offer: SyncOffer,
     duration: Duration,
 ) -> Result<OfferOutcome, LinkError> {
+    offer_with_idle_timeout(addr, offer, duration, FRAME_IDLE_TIMEOUT).await
+}
+
+async fn offer_with_idle_timeout(
+    addr: SocketAddr,
+    offer: SyncOffer,
+    duration: Duration,
+    idle_timeout: Duration,
+) -> Result<OfferOutcome, LinkError> {
     let exchange = async {
         let mut stream = TcpStream::connect(addr).await?;
         let sync_id = offer.sync_id.clone();
         write_frame(&mut stream, &offer.clone().into()).await?;
-        match read_frame(&mut stream).await? {
+        match read_frame_within(&mut stream, idle_timeout).await? {
             Frame::SyncAccept { sync_id: accepted } if accepted == sync_id => {}
             Frame::SyncReject {
                 sync_id: rejected,
@@ -241,7 +261,7 @@ pub async fn offer(
             }
             frame => return Err(LinkError::Unexpected(format!("{frame:?}"))),
         }
-        match read_frame(&mut stream).await? {
+        match read_frame_within(&mut stream, duration).await? {
             Frame::SyncComplete {
                 sync_id: completed,
                 sha256,
@@ -269,7 +289,9 @@ async fn serve_connection(
             write_frame(&mut stream, &Frame::Hello { manifest: own }).await
         }
         Frame::SyncOffer {
+            from,
             sync_id,
+            timeout_secs,
             kind,
             name,
             size,
@@ -279,7 +301,9 @@ async fn serve_connection(
             secret,
         } => {
             let offer = SyncOffer {
+                from,
                 sync_id: sync_id.clone(),
+                timeout_secs,
                 kind,
                 name,
                 size,
@@ -332,6 +356,13 @@ pub async fn write_frame<W: AsyncWrite + Unpin>(
 
 /// Reads a bounded newline-terminated JSON frame.
 pub async fn read_frame<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Frame, LinkError> {
+    read_frame_within(reader, FRAME_IDLE_TIMEOUT).await
+}
+
+async fn read_frame_within<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    idle_timeout: Duration,
+) -> Result<Frame, LinkError> {
     let mut bytes = Vec::with_capacity(1024);
     loop {
         // Read one byte at a time so an untrusted peer cannot allocate an unbounded line.
@@ -339,7 +370,7 @@ pub async fn read_frame<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Frame, L
             return Err(LinkError::Oversize);
         }
         let mut byte = [0_u8; 1];
-        let read = timeout(Duration::from_secs(30), reader.read(&mut byte))
+        let read = timeout(idle_timeout, reader.read(&mut byte))
             .await
             .map_err(|_| LinkError::Timeout)??;
         if read == 0 {
@@ -405,7 +436,9 @@ mod tests {
     #[tokio::test]
     async fn frame_codec_roundtrip() {
         let frame = Frame::SyncOffer {
+            from: ParticleId::generate(),
             sync_id: "sync".into(),
+            timeout_secs: 120,
             kind: StateKind::Json,
             name: "payload.json".into(),
             size: 3,
@@ -447,5 +480,72 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(peer, expected);
+    }
+
+    struct DelayedAcceptHandler(Manifest);
+
+    #[async_trait]
+    impl LinkHandler for DelayedAcceptHandler {
+        async fn on_hello(
+            &self,
+            _peer_addr: SocketAddr,
+            _manifest: Manifest,
+        ) -> Result<Manifest, LinkError> {
+            Ok(self.0.clone())
+        }
+
+        async fn on_offer(
+            &self,
+            _peer_addr: SocketAddr,
+            _offer: SyncOffer,
+        ) -> Result<SyncDecision, LinkError> {
+            Ok(SyncDecision::Accept)
+        }
+
+        async fn on_accepted(
+            &self,
+            _peer_addr: SocketAddr,
+            _offer: SyncOffer,
+        ) -> Result<String, String> {
+            tokio::time::sleep(Duration::from_millis(80)).await;
+            Ok("digest".into())
+        }
+    }
+
+    #[tokio::test]
+    async fn offer_completion_uses_overall_timeout_after_accept() {
+        let (listener, port) = LinkListener::bind("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        tokio::spawn(listener.run(Arc::new(DelayedAcceptHandler(manifest()))));
+        let outcome = offer_with_idle_timeout(
+            SocketAddr::from(([127, 0, 0, 1], port)),
+            SyncOffer {
+                from: ParticleId::generate(),
+                sync_id: "slow-sync".into(),
+                timeout_secs: 1,
+                kind: StateKind::Json,
+                name: "payload.json".into(),
+                size: 2,
+                sha256: "digest".into(),
+                label: None,
+                relay: RelayTicket {
+                    host: "127.0.0.1".into(),
+                    port: 9109,
+                    password: "private".into(),
+                },
+                secret: "secret".into(),
+            },
+            Duration::from_secs(1),
+            Duration::from_millis(20),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            outcome,
+            OfferOutcome::Complete {
+                sha256: "digest".into()
+            }
+        );
     }
 }

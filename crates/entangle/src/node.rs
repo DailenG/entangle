@@ -21,7 +21,7 @@ use std::{
 };
 use tokio::{
     io::AsyncReadExt,
-    net::{lookup_host, TcpStream},
+    net::{lookup_host, UdpSocket},
     sync::{mpsc, Mutex, Semaphore},
     time::sleep,
 };
@@ -144,6 +144,7 @@ impl Particle {
                                 .iter()
                                 .any(|entry| {
                                     entry.state == PeerState::Entangled
+                                        && entry.resonance.addrs.contains(&address.ip())
                                         && entry.resonance.port == address.port()
                                 })
                             {
@@ -367,12 +368,22 @@ impl Particle {
         let socket = SocketAddr::new(peer_addr, peer.resonance.port);
         let relay_host = match &self.options.advertise_ip {
             Some(ip) => ip.clone(),
-            None => TcpStream::connect(socket)
+            None => {
+                let route = UdpSocket::bind(if socket.is_ipv4() {
+                    "0.0.0.0:0"
+                } else {
+                    "[::]:0"
+                })
                 .await
-                .and_then(|stream| stream.local_addr())
-                .map_err(|e| format!("could not determine a route to peer: {e}"))?
-                .ip()
-                .to_string(),
+                .map_err(|e| format!("could not determine a route to peer: {e}"))?;
+                route
+                    .connect(socket)
+                    .await
+                    .and_then(|()| route.local_addr())
+                    .map_err(|e| format!("could not determine a route to peer: {e}"))?
+                    .ip()
+                    .to_string()
+            }
         };
         let ticket = self
             .local_ticket(relay_host)
@@ -390,7 +401,9 @@ impl Particle {
         let result = entangle_link::offer(
             socket,
             SyncOffer {
+                from: self.manifest.particle_id.clone(),
                 sync_id: sync_id.clone(),
+                timeout_secs,
                 kind: kind.clone(),
                 name,
                 size,
@@ -509,11 +522,7 @@ impl Particle {
         }
     }
 
-    async fn receive_offer(
-        &self,
-        peer_addr: SocketAddr,
-        offer: SyncOffer,
-    ) -> Result<String, String> {
+    async fn receive_offer(&self, offer: SyncOffer) -> Result<String, String> {
         let _permit = Arc::clone(&self.inbound_limit)
             .acquire_owned()
             .await
@@ -522,7 +531,8 @@ impl Particle {
             .field
             .read()
             .map_err(|_| "peer field lock poisoned".to_owned())?
-            .by_addr(peer_addr.ip())
+            .by_id(&offer.from)
+            .filter(|peer| peer.state == PeerState::Entangled)
             .ok_or_else(|| "sender is not entangled; handshake first".to_owned())?;
         let Some(manifest) = peer.manifest else {
             return Err("sender is not entangled; handshake first".into());
@@ -575,7 +585,7 @@ impl Particle {
             .await
             .map_err(|e| e.to_string())?;
         receiver
-            .wait(Duration::from_secs(3600))
+            .wait(Duration::from_secs(offer.timeout_secs))
             .await
             .map_err(|e| e.to_string())?;
         let path = directory.join(name);
@@ -682,20 +692,33 @@ impl LinkHandler for Particle {
 
     async fn on_accepted(
         &self,
-        peer_addr: SocketAddr,
+        _peer_addr: SocketAddr,
         offer: SyncOffer,
     ) -> std::result::Result<String, String> {
-        self.receive_offer(peer_addr, offer).await
+        self.receive_offer(offer).await
     }
 }
 
 impl Particle {
     fn validate_offer(&self, peer_addr: SocketAddr, offer: &SyncOffer) -> Result<(), String> {
-        self.field
-            .read()
-            .map_err(|_| "peer field lock poisoned".to_owned())?
-            .by_addr(peer_addr.ip())
+        let mut field = self
+            .field
+            .write()
+            .map_err(|_| "peer field lock poisoned".to_owned())?;
+        let peer = field
+            .by_id(&offer.from)
+            .filter(|peer| peer.state == PeerState::Entangled)
             .ok_or_else(|| "sender is not entangled; handshake first".to_owned())?;
+        let source_ip = peer_addr.ip();
+        if !peer.resonance.addrs.contains(&source_ip) {
+            debug!(
+                particle_id = %offer.from,
+                source_ip = %source_ip,
+                "offer arrived from an address not listed for the sender"
+            );
+            field.add_address(&offer.from, source_ip);
+        }
+        drop(field);
         if !self.manifest.accepts.contains(&offer.kind) {
             return Err(format!(
                 "this particle does not accept {} payloads",

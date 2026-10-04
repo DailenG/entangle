@@ -89,7 +89,7 @@ impl Resonator {
         ad: Advertisement,
     ) -> Result<(Self, tokio_mpsc::Receiver<ResonanceEvent>), ResonanceError> {
         let daemon = ServiceDaemon::new()?;
-        let host = local_hostname();
+        let host = local_hostname(&ad.particle_id);
         let instance = format!("particle-{}", ad.particle_id.short());
         let mut properties = vec![
             ("id", ad.particle_id.to_string()),
@@ -240,15 +240,33 @@ fn decode_values(
     })
 }
 
-fn local_hostname() -> String {
-    let host = std::env::var("HOSTNAME")
-        .or_else(|_| std::env::var("COMPUTERNAME"))
-        .unwrap_or_else(|_| "entangle".into());
-    let host = host.trim_end_matches('.');
-    if host.ends_with(".local") {
-        format!("{host}.")
+fn local_hostname(particle_id: &ParticleId) -> String {
+    let hostname = gethostname::gethostname();
+    let suffix = format!("-{}", particle_id.short());
+    let max_host_len = 63 - suffix.len();
+    let host = sanitize_dns_label(&hostname.to_string_lossy(), max_host_len);
+    format!("{host}{suffix}.local.")
+}
+
+fn sanitize_dns_label(hostname: &str, max_len: usize) -> String {
+    let max_len = max_len.clamp(1, 63);
+    let mut label = String::with_capacity(max_len);
+    for character in hostname.chars() {
+        let character = character.to_ascii_lowercase();
+        if character.is_ascii_alphanumeric() {
+            label.push(character);
+        } else if !label.is_empty() && !label.ends_with('-') {
+            label.push('-');
+        }
+        if label.len() == max_len {
+            break;
+        }
+    }
+    let label = label.trim_matches('-');
+    if label.is_empty() {
+        "entangle".chars().take(max_len).collect()
     } else {
-        format!("{host}.local.")
+        label.to_owned()
     }
 }
 
@@ -285,6 +303,22 @@ mod tests {
         assert_eq!(peer.name, "test node");
         assert_eq!(peer.context.as_deref(), Some("sample"));
         assert_eq!(peer.proto, PROTOCOL_VERSION);
+    }
+
+    #[test]
+    fn dns_labels_are_lowercase_safe_and_bounded() {
+        assert_eq!(
+            sanitize_dns_label("My_Workstation.local", 63),
+            "my-workstation-local"
+        );
+        assert_eq!(sanitize_dns_label("---", 63), "entangle");
+        let long_label = sanitize_dns_label(&"A".repeat(80), 54);
+        assert_eq!(long_label.len(), 54);
+        assert!(long_label
+            .chars()
+            .all(|character| character.is_ascii_lowercase()
+                || character.is_ascii_digit()
+                || character == '-'));
     }
 
     #[test]

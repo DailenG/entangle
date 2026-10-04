@@ -34,7 +34,7 @@ sequenceDiagram
     A->>B: TCP Hello(manifest)
     B-->>A: TCP Hello(manifest)
     A->>R: start relay on configured local ports
-    A->>B: SyncOffer(ticket, one-time secret, hash, size)
+    A->>B: SyncOffer(from, timeout_secs, ticket, one-time secret, hash, size)
     B-->>A: SyncAccept
     B->>R: croc receive using secret from private ticket
     A->>R: croc send using secret from private ticket
@@ -54,11 +54,17 @@ payload kinds, tool names, context, link port, and payload limit.
 
 Link control messages are UTF-8 JSON objects terminated by a newline, one
 frame per short-lived TCP connection. The maximum frame is 64 KiB. Hello
-exchanges manifests; SyncOffer carries the transfer ID, sanitized filename,
-kind, size, SHA-256, optional label, relay ticket, and one-time secret. The
-receiver accepts or rejects, then sends SyncComplete only after checking the
-received bytes. SyncFailed identifies a failed receive. Connections are
-bounded by the caller's operation timeout.
+exchanges manifests; SyncOffer carries the sender particle ID (`from`), transfer
+ID, sanitized filename, kind, size, SHA-256, optional label, relay ticket,
+one-time secret, and `timeout_secs` for the payload transfer. The receiver
+accepts or rejects, then sends SyncComplete only after checking the received
+bytes. SyncFailed identifies a failed receive.
+
+Hello, SyncOffer, and SyncAccept reads use a short idle timeout. The final
+SyncComplete/SyncFailed read is bounded by the sender's overall operation
+timeout instead, so a long croc transfer does not fail merely because no link
+frame arrives while the payload is moving. The receiver also uses
+`timeout_secs` to bound its croc receive.
 
 MCP uses JSON-RPC 2.0 with newline-delimited messages on stdio. Logs are sent
 to stderr; stdout belongs exclusively to MCP. Tool schemas in

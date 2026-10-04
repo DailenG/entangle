@@ -31,8 +31,8 @@ pub struct Options {
     /// IP address advertised to remote peers for relay access.
     #[arg(long, global = true, env = "ENTANGLE_ADVERTISE_IP")]
     pub advertise_ip: Option<String>,
-    /// Static host:port peers to dial when multicast is unavailable.
-    #[arg(long, global = true, env = "ENTANGLE_PEER")]
+    /// Static host:port peers to dial when multicast is unavailable; comma-separated in ENTANGLE_PEER.
+    #[arg(long, global = true, env = "ENTANGLE_PEER", value_delimiter = ',')]
     pub peer: Vec<String>,
     /// Base data directory (a particle-specific subdirectory is created).
     #[arg(long, global = true, env = "ENTANGLE_DATA_DIR")]
@@ -78,10 +78,52 @@ impl Options {
             .clone()
             .filter(|name| !name.trim().is_empty())
             .or_else(|| {
-                std::env::var("HOSTNAME")
-                    .or_else(|_| std::env::var("COMPUTERNAME"))
-                    .ok()
+                let hostname = gethostname::gethostname();
+                let hostname = hostname.to_string_lossy().trim().to_owned();
+                (!hostname.is_empty()).then_some(hostname)
             })
             .unwrap_or_else(|| "entangle-particle".into())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn default_particle_name_uses_the_system_hostname() {
+        let options = Options {
+            name: None,
+            context: None,
+            link_port: 7337,
+            relay_port: 9109,
+            advertise_ip: None,
+            peer: vec![],
+            data_dir: None,
+            croc: None,
+            max_payload_mb: 512,
+            no_mdns: true,
+            log_level: "info".into(),
+        };
+        let hostname = gethostname::gethostname()
+            .to_string_lossy()
+            .trim()
+            .to_owned();
+        if !hostname.is_empty() {
+            assert_eq!(options.particle_name(), hostname);
+        }
+    }
+
+    #[test]
+    fn static_peers_split_comma_delimited_values() {
+        #[derive(Parser)]
+        struct TestCli {
+            #[command(flatten)]
+            options: Options,
+        }
+
+        let parsed = TestCli::try_parse_from(["entangle", "--peer", "a:7337,b:7337"]).unwrap();
+        assert_eq!(parsed.options.peer, ["a:7337", "b:7337"]);
     }
 }

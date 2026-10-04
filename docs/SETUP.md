@@ -64,6 +64,8 @@ Each device runs its own Entangle process. Set a distinct `--name` on each
 device; use a matching `--context` for agents working in the same project.
 Configuration formats can vary by client version; check your client's docs
 when the example does not match its current schema.
+GUI clients often do not inherit your shell's `PATH`, so use the absolute path
+to the `entangle` executable in their configuration.
 
 **Claude Desktop** (`claude_desktop_config.json`):
 
@@ -71,7 +73,7 @@ when the example does not match its current schema.
 {
   "mcpServers": {
     "entangle": {
-      "command": "entangle",
+      "command": "/ABSOLUTE/PATH/TO/entangle",
       "args": ["serve", "--name", "workstation-a", "--context", "project-x"]
     }
   }
@@ -91,7 +93,7 @@ check the current LM Studio docs for the exact location and format:
 {
   "mcpServers": {
     "entangle": {
-      "command": "entangle",
+      "command": "/ABSOLUTE/PATH/TO/entangle",
       "args": ["serve", "--name", "workstation-a", "--context", "project-x"]
     }
   }
@@ -117,7 +119,8 @@ from stdout. Logs are written separately to stderr.
 
 - **No peers appear:** check UDP 5353, multicast/VLAN policy, and Wi-Fi client
   isolation. Use `--peer host:7337` when multicast is blocked; `--peer` can be
-  repeated and also accepts a resolvable hostname.
+  repeated and also accepts a resolvable hostname. For example,
+  `ENTANGLE_PEER=host-a:7337,host-b:7337` provides a comma-separated list.
 - **croc is not found:** install croc 10+ or configure `--croc` / `CROC_PATH`.
 - **Port already in use:** change `--link-port` or `--relay-port`; the relay
   refuses to start if its base port is already occupied.
