@@ -51,10 +51,11 @@ pub struct Croc {
 }
 
 impl Croc {
-    /// Finds croc at an explicit path, `CROC_PATH`, or the process `PATH`.
+    /// Finds croc at an explicit path, `CROC_PATH`, beside the current executable, or on `PATH`.
     pub fn locate(explicit: Option<PathBuf>) -> Result<Self, TransportError> {
         let candidate = explicit
             .or_else(|| env::var_os("CROC_PATH").map(PathBuf::from))
+            .or_else(|| env::current_exe().ok().and_then(|exe| sibling_croc(&exe)))
             .or_else(|| find_on_path("croc"))
             .ok_or_else(|| {
                 TransportError::Croc(
@@ -161,6 +162,13 @@ fn find_on_path(name: &str) -> Option<PathBuf> {
     env::split_paths(&env::var_os("PATH")?)
         .map(|dir| dir.join(format!("{name}{}", std::env::consts::EXE_SUFFIX)))
         .find(|path| path.is_file())
+}
+
+fn sibling_croc(exe: &Path) -> Option<PathBuf> {
+    let candidate = exe
+        .parent()?
+        .join(format!("croc{}", std::env::consts::EXE_SUFFIX));
+    candidate.is_file().then_some(candidate)
 }
 
 fn relay_address(host: &str, port: u16) -> String {
@@ -505,6 +513,30 @@ pub fn relay_socket(host: &str, port: u16) -> Result<SocketAddr, TransportError>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sibling_croc_finds_existing_binary() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir
+            .path()
+            .join(format!("entangle{}", std::env::consts::EXE_SUFFIX));
+        let croc = dir
+            .path()
+            .join(format!("croc{}", std::env::consts::EXE_SUFFIX));
+        std::fs::write(&croc, []).unwrap();
+
+        assert_eq!(sibling_croc(&exe), Some(croc));
+    }
+
+    #[test]
+    fn sibling_croc_returns_none_when_binary_is_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir
+            .path()
+            .join(format!("entangle{}", std::env::consts::EXE_SUFFIX));
+
+        assert_eq!(sibling_croc(&exe), None);
+    }
 
     #[test]
     fn secrets_are_formatted_unique_and_redacted() {

@@ -57,8 +57,9 @@ cargo build --release
 ```
 
 The executable is `target/release/entangle` (or `target/release/entangle.exe`
-on Windows). Entangle locates croc on `PATH`; set `CROC_PATH` or pass
-`--croc /path/to/croc` if it is installed elsewhere.
+on Windows). Entangle locates croc in this order: an explicit `--croc` path,
+`CROC_PATH`, a `croc`/`croc.exe` beside the running Entangle executable, then
+`PATH`.
 
 ## Firewall
 

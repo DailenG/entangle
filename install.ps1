@@ -1,4 +1,7 @@
 $ErrorActionPreference = 'Stop'
+if (-not [Environment]::Is64BitOperatingSystem) {
+    throw 'Only 64-bit Windows is supported by the prebuilt installer. Install from source with: cargo install --git https://github.com/DailenG/entangle entangle'
+}
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
 function Assert-Checksum {
@@ -82,38 +85,78 @@ try {
     }
     $null = New-Item -Path $installDir -ItemType Directory -Force
     $binaryPath = Join-Path $installDir 'entangle.exe'
+    $oldBinaryPath = "$binaryPath.old"
+    if (Test-Path -LiteralPath $binaryPath) {
+        Remove-Item -LiteralPath $oldBinaryPath -Force -ErrorAction SilentlyContinue
+        Move-Item -LiteralPath $binaryPath -Destination $oldBinaryPath -Force
+    }
     Copy-Item -LiteralPath $entangleBinary.FullName -Destination $binaryPath -Force
 
-    if (Get-Command croc -ErrorAction SilentlyContinue) {
-        Write-Output "Using existing croc: $((Get-Command croc).Source)"
-    } elseif ($env:ENTANGLE_SKIP_CROC -eq '1') {
+    if ($env:ENTANGLE_SKIP_CROC -eq '1') {
         Write-Output 'Skipping croc installation because ENTANGLE_SKIP_CROC=1'
     } else {
         $crocVersion = if ([string]::IsNullOrWhiteSpace($env:CROC_VERSION)) { 'v11.5.4' } else { $env:CROC_VERSION }
         if (-not $crocVersion.StartsWith('v')) {
             $crocVersion = "v$crocVersion"
         }
-        $crocAsset = 'Windows-64bit.zip'
-        $crocArchiveName = "croc_${crocVersion}_$crocAsset"
-        $crocSumsName = "croc_${crocVersion}_checksums.txt"
-        if ($env:CROC_DOWNLOAD_BASE) {
-            $crocDownloadBase = $env:CROC_DOWNLOAD_BASE.TrimEnd('/')
-        } else {
-            $crocDownloadBase = "https://github.com/schollz/croc/releases/download/$crocVersion"
-        }
-        $crocArchivePath = Join-Path $tempDir $crocArchiveName
-        $crocSumsPath = Join-Path $tempDir $crocSumsName
-        $crocExtractDir = Join-Path $tempDir 'croc'
-        $null = Invoke-WebRequest -Uri "$crocDownloadBase/$crocArchiveName" -OutFile $crocArchivePath -UseBasicParsing
-        $null = Invoke-WebRequest -Uri "$crocDownloadBase/$crocSumsName" -OutFile $crocSumsPath -UseBasicParsing
-        Assert-Checksum $crocArchivePath $crocSumsPath $crocArchiveName
+        $installCroc = $true
+        $existingCroc = Get-Command croc -ErrorAction SilentlyContinue
+        if ($existingCroc) {
+            $existingCrocPath = if ($existingCroc.Source) { $existingCroc.Source } else { $existingCroc.Definition }
+            $existingCrocVersion = ''
+            $existingCrocSucceeded = $false
+            try {
+                $existingCrocVersion = (& croc --version 2>&1 | Out-String).Trim()
+                $existingCrocSucceeded = $LASTEXITCODE -eq 0
+            } catch {
+                $existingCrocVersion = $_.Exception.Message
+            }
 
-        Expand-Archive -LiteralPath $crocArchivePath -DestinationPath $crocExtractDir -Force
-        $crocBinary = Get-ChildItem -Path $crocExtractDir -Filter 'croc.exe' -Recurse -File | Select-Object -First 1
-        if (-not $crocBinary) {
-            throw 'The croc archive does not contain a croc.exe binary.'
+            $lastVersionToken = ($existingCrocVersion -split '\s+' | Where-Object { $_ } | Select-Object -Last 1)
+            if ($lastVersionToken -and $lastVersionToken.StartsWith('v')) {
+                $lastVersionToken = $lastVersionToken.Substring(1)
+            }
+            $majorText = if ($lastVersionToken) { $lastVersionToken.Split('.')[0] } else { '' }
+            [uint32]$existingMajor = 0
+            $majorParsed = [uint32]::TryParse($majorText, [ref]$existingMajor)
+            if ($existingCrocSucceeded -and $majorParsed -and $existingMajor -ge 10) {
+                Write-Output "Using existing croc ${existingCrocVersion}: $existingCrocPath"
+                $installCroc = $false
+            } else {
+                $displayVersion = if ([string]::IsNullOrWhiteSpace($existingCrocVersion)) { 'no version output' } else { $existingCrocVersion }
+                Write-Warning "Ignoring croc at '$existingCrocPath' with version '$displayVersion'; installing pinned croc $crocVersion in '$installDir'."
+            }
         }
-        Copy-Item -LiteralPath $crocBinary.FullName -Destination (Join-Path $installDir 'croc.exe') -Force
+
+        if ($installCroc) {
+            $crocAsset = 'Windows-64bit.zip'
+            $crocArchiveName = "croc_${crocVersion}_$crocAsset"
+            $crocSumsName = "croc_${crocVersion}_checksums.txt"
+            if ($env:CROC_DOWNLOAD_BASE) {
+                $crocDownloadBase = $env:CROC_DOWNLOAD_BASE.TrimEnd('/')
+            } else {
+                $crocDownloadBase = "https://github.com/schollz/croc/releases/download/$crocVersion"
+            }
+            $crocArchivePath = Join-Path $tempDir $crocArchiveName
+            $crocSumsPath = Join-Path $tempDir $crocSumsName
+            $crocExtractDir = Join-Path $tempDir 'croc'
+            $null = Invoke-WebRequest -Uri "$crocDownloadBase/$crocArchiveName" -OutFile $crocArchivePath -UseBasicParsing
+            $null = Invoke-WebRequest -Uri "$crocDownloadBase/$crocSumsName" -OutFile $crocSumsPath -UseBasicParsing
+            Assert-Checksum $crocArchivePath $crocSumsPath $crocArchiveName
+
+            Expand-Archive -LiteralPath $crocArchivePath -DestinationPath $crocExtractDir -Force
+            $crocBinary = Get-ChildItem -Path $crocExtractDir -Filter 'croc.exe' -Recurse -File | Select-Object -First 1
+            if (-not $crocBinary) {
+                throw 'The croc archive does not contain a croc.exe binary.'
+            }
+            $crocBinaryPath = Join-Path $installDir 'croc.exe'
+            $oldCrocPath = "$crocBinaryPath.old"
+            if (Test-Path -LiteralPath $crocBinaryPath) {
+                Remove-Item -LiteralPath $oldCrocPath -Force -ErrorAction SilentlyContinue
+                Move-Item -LiteralPath $crocBinaryPath -Destination $oldCrocPath -Force
+            }
+            Copy-Item -LiteralPath $crocBinary.FullName -Destination $crocBinaryPath -Force
+        }
     }
 
     $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
@@ -139,7 +182,7 @@ try {
     Write-Output "Entangle executable: $binaryPath"
     $jsonEscapedPath = $binaryPath.Replace('\', '\\')
     Write-Output "MCP config command (JSON-escaped): `"$jsonEscapedPath`""
-    if (Test-Path (Join-Path $installDir 'croc.exe')) {
+    if ($env:ENTANGLE_SKIP_CROC -ne '1' -and (Test-Path (Join-Path $installDir 'croc.exe'))) {
         Write-Output 'croc version:'
         & (Join-Path $installDir 'croc.exe') --version
     }
