@@ -2,6 +2,7 @@
 
 mod config;
 mod field;
+mod identity;
 mod inbox;
 mod node;
 mod tools;

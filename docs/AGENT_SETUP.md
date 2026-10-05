@@ -91,24 +91,34 @@ proceeding.
    (`~/.cargo/bin` on Unix-like systems), and report the command's error
    before making further installation changes.
 
-## 4. Choose this machine's identity
+## 4. Use this machine's identity
 
-4. **Choose a display name and project context with the human.** Use a
-   human-friendly, machine-unique `--name`. Ask the human for a `--context` if
-   they want these agents scoped to one project; it must be exactly the same
-   string on both machines. Context is optional.
+4. **Keep the default identity unless the human requests a custom name.**
+   Entangle saves a particle ID in its data directory, then defaults the
+   display name to `<hostname>-<first 4 hex of the particle ID>`. The ID and
+   default name stay stable across restarts; `--name` is optional. Do not
+   assume your particle name from the prompt: after connecting, learn your
+   own `particle_id` and `name` from the `self` field returned by
+   `find_entangled_particles`. A second Entangle server using the same data
+   directory while another holds its lock gets a temporary ID.
 
-   Example values (replace them with the human's choices):
+   Ask the human for a `--context` only if they want these agents scoped to
+   one project; it must be exactly the same string on both machines. Context
+   is optional.
+
+   Example value (replace it with the human's choice):
 
    ```text
-   --name workstation-a --context project-x
+   --context project-x
    ```
 
-   **Verify:** Record the agreed name and, if applicable, the exact shared
-   context string for the MCP configuration.
+   **Verify:** Record the agreed context, if applicable. Once connected, use
+   `find_entangled_particles.self` to identify this particle's actual ID and
+   name.
 
-   **If this fails:** Ask the human to choose the name and whether the context
-   should match the other machine; do not invent a shared project identifier.
+   **If this fails:** Ask the human whether the context should match the
+   other machine; do not invent a shared project identifier or assume a name
+   from the prompt.
 
 ## 5. Check network access
 
@@ -145,8 +155,8 @@ proceeding.
    identified above.** GUI applications may not inherit your shell's `PATH`.
    On Linux/macOS, obtain the path with `command -v entangle`; on Windows,
    obtain it with `(Get-Command entangle).Source`. Use that absolute path in
-   the `command` field below. Replace the example name/context with the values
-   approved by the human.
+   the `command` field below. Replace the example context with the value
+   approved by the human, or omit it if no shared context is needed.
 
    **Claude Desktop** (`claude_desktop_config.json`):
 
@@ -155,7 +165,7 @@ proceeding.
      "mcpServers": {
        "entangle": {
          "command": "/ABSOLUTE/PATH/TO/entangle",
-         "args": ["serve", "--name", "workstation-a", "--context", "project-x"]
+         "args": ["serve", "--context", "project-x"]
        }
      }
    }
@@ -164,7 +174,7 @@ proceeding.
    **Claude Code** (use the absolute path returned by `command -v entangle`):
 
    ```sh
-   claude mcp add entangle -- /ABSOLUTE/PATH/TO/entangle serve --name workstation-a --context project-x
+   claude mcp add entangle -- /ABSOLUTE/PATH/TO/entangle serve --context project-x
    ```
 
    **LM Studio** commonly uses an MCP configuration such as `mcp.json`; check
@@ -175,7 +185,7 @@ proceeding.
      "mcpServers": {
        "entangle": {
          "command": "/ABSOLUTE/PATH/TO/entangle",
-         "args": ["serve", "--name", "workstation-a", "--context", "project-x"]
+         "args": ["serve", "--context", "project-x"]
        }
      }
    }
@@ -204,7 +214,9 @@ proceeding.
 
    Expect the other machine's particle to appear once it is installed and
    running. After the MCP client restarts, call `find_entangled_particles`
-   and confirm its result has a populated `self` manifest.
+   and confirm its result has a populated `self` manifest. Use
+   `self.particle_id` and `self.name` as this machine's actual identity; do not
+   assume its name from the prompt.
 
    If multicast discovery is blocked by Wi-Fi client isolation, VLAN policy,
    or the network, ask for the other machine's IP and add this argument to the
@@ -230,6 +242,7 @@ proceeding.
    ```text
    - croc version:
    - Entangle version:
+   - Particle ID (from find_entangled_particles.self):
    - Particle name:
    - Context (or none):
    - MCP client/config file edited:
@@ -265,7 +278,7 @@ proceeding.
      ```json
      {
        "type": "message",
-       "from": "workstation-a",
+       "from": "<your Entangle name from find_entangled_particles.self>",
        "body": "The API change is ready for review.",
        "reply_to": null
      }

@@ -3,13 +3,12 @@
 use crate::{
     config::Options,
     field::{Field, PeerRecord, PeerState},
+    identity::{self, Identity},
     inbox::InboxItem,
 };
 use anyhow::{Context, Result};
 use chrono::Utc;
-use entangle_core::{
-    is_valid_sync_id, Manifest, ParticleId, RelayTicket, StateKind, PROTOCOL_VERSION,
-};
+use entangle_core::{is_valid_sync_id, Manifest, RelayTicket, StateKind, PROTOCOL_VERSION};
 use entangle_link::{LinkError, LinkHandler, LinkListener, SyncDecision, SyncOffer};
 use entangle_resonance::{Advertisement, Resonance, ResonanceEvent, Resonator};
 use entangle_transport::{Croc, LocalRelay, Secret};
@@ -38,6 +37,7 @@ pub struct Particle {
     pub manifest: Manifest,
     field: Arc<RwLock<Field>>,
     options: Options,
+    _identity: Identity,
     croc: Croc,
     data_dir: PathBuf,
     relay: Mutex<Option<LocalRelay>>,
@@ -65,10 +65,11 @@ impl Particle {
         notifications: Option<mpsc::Sender<Value>>,
     ) -> Result<(Arc<Self>, Manifest)> {
         let croc = Croc::locate(options.croc.clone())?;
-        let particle_id = ParticleId::generate();
-        let name = options.particle_name();
-        let root = options.data_root().join(particle_id.short());
-        let data_dir = root;
+        let root = options.data_root();
+        let identity = identity::claim(&root);
+        let particle_id = identity.id.clone();
+        let name = options.particle_name(&particle_id);
+        let data_dir = root.join(particle_id.short());
         tokio::fs::create_dir_all(data_dir.join("inbox")).await?;
         tokio::fs::create_dir_all(data_dir.join("outbox")).await?;
         let (listener, link_port) =
@@ -110,6 +111,7 @@ impl Particle {
             manifest: manifest.clone(),
             field,
             options,
+            _identity: identity,
             croc,
             data_dir,
             relay: Mutex::new(None),
@@ -161,6 +163,16 @@ impl Particle {
                 }
             }
         });
+        info!(
+            "particle identity: id={} name={} status={}",
+            particle.manifest.particle_id.as_str(),
+            particle.manifest.name,
+            if particle._identity.persistent {
+                "persistent"
+            } else {
+                "ephemeral"
+            }
+        );
         if !particle.options.no_mdns {
             info!(
                 "particle {} listening on TCP {}",
@@ -277,6 +289,7 @@ impl Particle {
             }
             matched.into_iter().next().unwrap()
         };
+        let target_peer_id = peer.resonance.particle_id.clone();
         if peer.state != PeerState::Entangled {
             return Err(format!(
                 "particle {} is not entangled",
@@ -338,6 +351,11 @@ impl Particle {
                 timeout_secs,
             })
             .await;
+        if result.is_ok() {
+            if let Ok(mut field) = self.field.write() {
+                field.touch(&target_peer_id);
+            }
+        }
         if cleanup {
             let _ = tokio::fs::remove_file(path).await;
         }
@@ -535,13 +553,20 @@ impl Particle {
             .acquire_owned()
             .await
             .map_err(|_| "inbound transfer capacity is closed".to_owned())?;
-        let peer = self
-            .field
-            .read()
-            .map_err(|_| "peer field lock poisoned".to_owned())?
-            .by_id(&offer.from)
-            .filter(|peer| peer.state == PeerState::Entangled)
-            .ok_or_else(|| "sender is not entangled; handshake first".to_owned())?;
+        let peer = {
+            let mut field = self
+                .field
+                .write()
+                .map_err(|_| "peer field lock poisoned".to_owned())?;
+            let peer = field
+                .by_id(&offer.from)
+                .filter(|peer| peer.state == PeerState::Entangled);
+            if peer.is_some() {
+                field.touch(&offer.from);
+            }
+            peer
+        }
+        .ok_or_else(|| "sender is not entangled; handshake first".to_owned())?;
         let Some(manifest) = peer.manifest else {
             return Err("sender is not entangled; handshake first".into());
         };
@@ -778,6 +803,7 @@ fn kind_name(kind: &StateKind) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use entangle_core::ParticleId;
 
     fn options(
         name: &str,
@@ -833,6 +859,7 @@ mod tests {
                 "127.0.0.1:7338".into(),
                 temp.path().to_path_buf(),
             ),
+            _identity: identity::claim(&temp.path().join("identity-root")),
             croc: Croc {
                 path: PathBuf::new(),
                 version: String::new(),

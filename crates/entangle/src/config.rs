@@ -1,6 +1,7 @@
 //! CLI-derived configuration and platform-specific particle storage locations.
 
 use clap::Args;
+use entangle_core::ParticleId;
 use std::path::PathBuf;
 
 /// Common settings with environment-variable fallbacks for MCP clients.
@@ -62,7 +63,7 @@ pub struct Options {
 }
 
 impl Options {
-    /// Returns a stable base path; the caller adds a fresh particle identifier.
+    /// Returns the base path used for the persistent identity and particle data.
     pub fn data_root(&self) -> PathBuf {
         self.data_dir.clone().unwrap_or_else(|| {
             dirs::data_dir()
@@ -72,17 +73,21 @@ impl Options {
         })
     }
 
-    /// Resolves an empty particle name to the operating-system hostname.
-    pub fn particle_name(&self) -> String {
+    /// Resolves an empty particle name to the hostname and identity prefix.
+    pub fn particle_name(&self, id: &ParticleId) -> String {
         self.name
             .clone()
             .filter(|name| !name.trim().is_empty())
-            .or_else(|| {
+            .unwrap_or_else(|| {
                 let hostname = gethostname::gethostname();
-                let hostname = hostname.to_string_lossy().trim().to_owned();
-                (!hostname.is_empty()).then_some(hostname)
+                let hostname = hostname.to_string_lossy().trim().to_lowercase();
+                let host = if hostname.is_empty() {
+                    "entangle-particle"
+                } else {
+                    &hostname
+                };
+                format!("{host}-{}", &id.as_str()[..4])
             })
-            .unwrap_or_else(|| "entangle-particle".into())
     }
 }
 
@@ -91,10 +96,9 @@ mod tests {
     use super::*;
     use clap::Parser;
 
-    #[test]
-    fn default_particle_name_uses_the_system_hostname() {
-        let options = Options {
-            name: None,
+    fn options(name: Option<String>) -> Options {
+        Options {
+            name,
             context: None,
             link_port: 7337,
             relay_port: 9109,
@@ -105,14 +109,33 @@ mod tests {
             max_payload_mb: 512,
             no_mdns: true,
             log_level: "info".into(),
-        };
+        }
+    }
+
+    #[test]
+    fn default_particle_name_uses_hostname_and_id_prefix() {
+        let options = options(None);
+        let id = ParticleId::parse("0123456789abcdef0123456789abcdef").unwrap();
         let hostname = gethostname::gethostname()
             .to_string_lossy()
             .trim()
-            .to_owned();
-        if !hostname.is_empty() {
-            assert_eq!(options.particle_name(), hostname);
-        }
+            .to_lowercase();
+        let host = if hostname.is_empty() {
+            "entangle-particle"
+        } else {
+            &hostname
+        };
+        assert_eq!(
+            options.particle_name(&id),
+            format!("{host}-{}", &id.as_str()[..4])
+        );
+    }
+
+    #[test]
+    fn explicit_particle_name_is_returned_verbatim() {
+        let options = options(Some("  Workstation A  ".into()));
+        let id = ParticleId::parse("0123456789abcdef0123456789abcdef").unwrap();
+        assert_eq!(options.particle_name(&id), "  Workstation A  ");
     }
 
     #[test]

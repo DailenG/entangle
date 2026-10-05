@@ -60,8 +60,12 @@ network interface and router configuration.
 
 ## Register as an MCP server
 
-Each device runs its own Entangle process. Set a distinct `--name` on each
-device; use a matching `--context` for agents working in the same project.
+Each device runs its own Entangle process. The default name is
+`<hostname>-<first 4 hex of the particle ID>`; Entangle saves the ID in its
+data directory so it stays stable across restarts. `--name` is optional.
+Running a second Entangle server with the same data directory gives that
+process a temporary ID while the first holds the identity lock. Use a matching
+`--context` for agents working in the same project.
 Configuration formats can vary by client version; check your client's docs
 when the example does not match its current schema.
 GUI clients often do not inherit your shell's `PATH`, so use the absolute path
@@ -74,7 +78,7 @@ to the `entangle` executable in their configuration.
   "mcpServers": {
     "entangle": {
       "command": "/ABSOLUTE/PATH/TO/entangle",
-      "args": ["serve", "--name", "workstation-a", "--context", "project-x"]
+      "args": ["serve", "--context", "project-x"]
     }
   }
 }
@@ -83,7 +87,7 @@ to the `entangle` executable in their configuration.
 **Claude Code**:
 
 ```sh
-claude mcp add entangle -- entangle serve --name workstation-a --context project-x
+claude mcp add entangle -- entangle serve --context project-x
 ```
 
 **LM Studio** commonly uses an MCP server configuration such as `mcp.json`;
@@ -94,21 +98,21 @@ check the current LM Studio docs for the exact location and format:
   "mcpServers": {
     "entangle": {
       "command": "/ABSOLUTE/PATH/TO/entangle",
-      "args": ["serve", "--name", "workstation-a", "--context", "project-x"]
+      "args": ["serve", "--context", "project-x"]
     }
   }
 }
 ```
 
-For a generic stdio MCP client, launch `entangle serve --name workstation-a
---context project-x`, send JSON-RPC lines to its stdin, and read JSON-RPC lines
-from stdout. Logs are written separately to stderr.
+For a generic stdio MCP client, launch `entangle serve --context project-x`,
+send JSON-RPC lines to its stdin, and read JSON-RPC lines from stdout. Logs
+are written separately to stderr.
 
 ## Two-machine smoke test
 
 1. Start the configured MCP server on both devices and check that both
    processes stay running.
-2. Run `entangle scan` on each device. The other named particle should appear.
+2. Run `entangle scan` on each device. The other particle should appear.
 3. Ask agent A to call `find_entangled_particles`, then send a small JSON
    value or file with `sync_entangled_state`.
 4. Ask agent B to call `observe_entangled_states`. Check the JSON value or

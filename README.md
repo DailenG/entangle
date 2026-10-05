@@ -15,7 +15,7 @@ or used by the application.
 
 | Entangle term | Meaning |
 | --- | --- |
-| Particle | A running Entangle process with a fresh process identity |
+| Particle | A running Entangle process with a persistent identity |
 | Resonance | Local network discovery through mDNS |
 | Entangled | A peer whose capability manifest completed the Hello handshake |
 | State sync | A JSON message or one-file transfer between entangled peers |
@@ -32,10 +32,13 @@ cargo build --release
 ./target/release/entangle scan
 ```
 
-Register the binary as an MCP stdio server in your agent client. Give each
-device a useful `--name`; use the same `--context` on devices working on the
-same project. See [docs/SETUP.md](docs/SETUP.md) for installation, firewall,
-client configuration, and a two-machine smoke test.
+Register the binary as an MCP stdio server in your agent client. The default
+name is `<hostname>-<first 4 hex of the particle ID>`; the ID is saved in the
+data directory and stays stable across restarts. `--name` is optional. Use the
+same `--context` on devices working on the same project. A second Entangle
+server using the same data directory gets a temporary ID while the first
+server is running. See [docs/SETUP.md](docs/SETUP.md) for installation,
+firewall, client configuration, and a two-machine smoke test.
 
 The MCP tools are `find_entangled_particles`, `sync_entangled_state`, and
 `observe_entangled_states`. The standalone commands are `entangle serve`

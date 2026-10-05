@@ -29,7 +29,10 @@
                 "context": { "type": ["string", "null"] },
                 "state": { "type": "string", "enum": ["resonating", "entangled"] },
                 "manifest": { "type": ["object", "null"] },
-                "last_seen_secs": { "type": "integer" }
+                "last_seen_secs": {
+                  "type": "integer",
+                  "description": "Seconds since the last mDNS announcement, handshake, or completed sync with this particle."
+                }
               },
               "required": ["particle_id", "name", "state"]
             }

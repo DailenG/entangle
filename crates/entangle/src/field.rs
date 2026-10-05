@@ -101,6 +101,16 @@ impl Field {
         }
     }
 
+    /// Refreshes the last-seen time for a known peer.
+    pub fn touch(&mut self, id: &ParticleId) -> bool {
+        if let Some(peer) = self.peers.get_mut(id) {
+            peer.last_seen = Instant::now();
+            true
+        } else {
+            false
+        }
+    }
+
     /// Returns a serialized view, optionally including resonating peers.
     pub fn view(&self, context: Option<&str>, include_unentangled: bool) -> Vec<Value> {
         self.peers
@@ -177,5 +187,27 @@ mod tests {
         assert_eq!(peer.state, PeerState::Entangled);
         assert!(peer.resonance.addrs.contains(&"192.0.2.1".parse().unwrap()));
         assert!(peer.resonance.addrs.contains(&"192.0.2.2".parse().unwrap()));
+    }
+
+    #[test]
+    fn touch_refreshes_known_peers_only() {
+        let id = ParticleId::generate();
+        let unknown = ParticleId::generate();
+        let mut field = Field::default();
+        field.resonate(Resonance {
+            particle_id: id.clone(),
+            name: "peer".into(),
+            hostname: "peer.local.".into(),
+            addrs: vec!["192.0.2.1".parse().unwrap()],
+            port: 7337,
+            context: None,
+            proto: PROTOCOL_VERSION,
+        });
+        let previous = field.by_id(&id).unwrap().last_seen;
+        std::thread::sleep(std::time::Duration::from_millis(2));
+
+        assert!(field.touch(&id));
+        assert!(field.by_id(&id).unwrap().last_seen > previous);
+        assert!(!field.touch(&unknown));
     }
 }

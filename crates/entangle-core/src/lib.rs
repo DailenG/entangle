@@ -13,9 +13,8 @@ pub const PROTOCOL_VERSION: u32 = 1;
 pub struct ParticleId(String);
 
 impl ParticleId {
-    /// Creates a fresh identity using the operating system random number generator.
+    /// Creates a fresh identity using the OS random number generator; callers may persist it.
     pub fn generate() -> Self {
-        // A process identity is never persisted: concurrently running copies must remain distinct.
         let mut bytes = [0_u8; 16];
         OsRng.fill_bytes(&mut bytes);
         Self(hex::encode(bytes))
