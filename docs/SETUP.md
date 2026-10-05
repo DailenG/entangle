@@ -5,16 +5,44 @@ its own machine, see [AGENT_SETUP.md](AGENT_SETUP.md).
 
 ## Prerequisites
 
-- croc 10 or newer on each device. Install with `curl
-  https://getcroc.schollz.com | bash` on Linux/macOS, `brew install croc` on
-  macOS, or `scoop install croc` / `winget install schollz.croc` on Windows.
-- Rust stable toolchain with Cargo if building from source.
+- A published Entangle release (v0.1.0+) for the prebuilt installers.
+- An internet connection for downloading Entangle and, if needed, croc.
+- Rust stable toolchain with Cargo only if building from source or using the
+  Cargo-install fallback.
 - A local network that permits the configured TCP ports; UDP multicast on
   5353 is needed for automatic mDNS resonance.
 
 ## Install Entangle
 
-Install the published Git package:
+Install the prebuilt binary first:
+
+```powershell
+irm https://raw.githubusercontent.com/DailenG/entangle/main/install.ps1 | iex
+```
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/DailenG/entangle/main/install.sh | sh
+```
+
+The installer installs croc v11.5.4 if croc is not already on `PATH`, and it
+requires no administrator or `sudo` rights. macOS/Linux installs into
+`$HOME/.local/bin` by default and prints a PATH hint if needed. Windows
+installs into `%LOCALAPPDATA%\Programs\entangle\bin` and adds that directory
+to the current user's PATH only. Set `ENTANGLE_SKIP_CROC=1` to skip croc.
+
+Configure the installers with these environment variables:
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `ENTANGLE_VERSION` | `latest` | Select `latest` or a release tag such as `v0.1.0`. |
+| `ENTANGLE_INSTALL_DIR` | `$HOME/.local/bin` on Unix; `%LOCALAPPDATA%\Programs\entangle\bin` on Windows | User-writable installation directory. |
+| `ENTANGLE_DOWNLOAD_BASE` | GitHub latest/download or the selected tag's download URL | Override the Entangle archive and `SHA256SUMS` base URL; intended for testing. |
+| `ENTANGLE_SKIP_CROC` | unset | Set to `1` to skip croc installation. |
+| `CROC_VERSION` | `v11.5.4` | Select the pinned croc release tag. |
+| `CROC_DOWNLOAD_BASE` | Croc's GitHub release URL for `CROC_VERSION` | Override the croc archive/checksum base URL; intended for testing. |
+
+The installers verify SHA-256 checksums before extracting binaries. To install
+from Cargo instead, use:
 
 ```sh
 cargo install --git https://github.com/DailenG/entangle entangle
