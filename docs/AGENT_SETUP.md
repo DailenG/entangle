@@ -43,57 +43,54 @@ proceeding.
    **If this fails:** Ask the human which client is hosting you and what
    operating system this machine uses.
 
-## 2. Install croc
+## 2. Install Entangle and croc
 
-2. **Install croc version 10 or newer.** Ask before installing a system
-   package. Use the command for this machine:
+2. **Explain the installer and ask the human before running it.** The
+   prebuilt installer downloads Entangle and, if no croc version 10 or newer
+   is available on `PATH`, croc v11.5.4. It installs into a user-level
+   directory without administrator rights. On Windows it also adds that
+   directory to the current user's PATH (not the system PATH). Prebuilt
+   binaries require a published release (v0.1.0+).
+   Wait for the human's approval before running either command.
 
-   ```sh
-   # Linux (and macOS, if using the upstream installer)
-   curl https://getcroc.schollz.com | bash
-   ```
-
-   ```sh
-   # macOS with Homebrew
-   brew install croc
-   ```
+   On Windows PowerShell:
 
    ```powershell
-   # Windows with Scoop or winget
-   scoop install croc
-   # or:
-   winget install schollz.croc
+   irm https://raw.githubusercontent.com/DailenG/entangle/main/install.ps1 | iex
    ```
 
-   **Verify:** Run `croc --version`; expect a version number whose major
-   version is at least `10`.
+   On macOS or Linux:
 
-   **If this fails:** Do not try the public relay as a workaround. Ask the
-   human to install croc or approve another installation method, then check
-   that the croc executable directory is on `PATH`.
+   ```sh
+   curl -fsSL https://raw.githubusercontent.com/DailenG/entangle/main/install.sh | sh
+   ```
 
-## 3. Install Entangle
+   `ENTANGLE_VERSION`, `ENTANGLE_INSTALL_DIR`, `ENTANGLE_DOWNLOAD_BASE`,
+   `ENTANGLE_SKIP_CROC`, `CROC_VERSION`, and `CROC_DOWNLOAD_BASE` can adjust
+   installer behavior; see [SETUP.md](SETUP.md) for their defaults and
+   details. The download-base overrides are intended for testing.
 
-3. **Install Entangle.** If `cargo` is available:
+   If no published release is available or the platform has no prebuilt
+   binary, use the source fallback only if Cargo is already installed:
 
    ```sh
    cargo install --git https://github.com/DailenG/entangle entangle
    ```
 
    If Rust/Cargo is missing, ask the human before installing `rustup` or
-   changing the machine's toolchain. The human can also build from a checkout
-   with `cargo build --release`.
+   changing the machine's toolchain.
 
-   **Verify:** Run `entangle --version` and `entangle --help`; expect the
-   version and help text listing `serve`, `node`, and `scan`.
+   **Verify:** Run `entangle --version`, `entangle --help`, and
+   `croc --version`; expect Entangle help listing `serve`, `node`, and `scan`,
+   and croc major version 10 or newer.
 
-   **If this fails:** Check that Cargo's binary directory is on `PATH`
-   (`~/.cargo/bin` on Unix-like systems), and report the command's error
-   before making further installation changes.
+   **If this fails:** Check the release availability, executable directory,
+   and PATH. Report the first failing command; do not install system packages
+   or change the toolchain without the human's approval.
 
-## 4. Use this machine's identity
+## 3. Use this machine's identity
 
-4. **Keep the default identity unless the human requests a custom name.**
+3. **Keep the default identity unless the human requests a custom name.**
    Entangle saves a particle ID in its data directory, then defaults the
    display name to `<hostname>-<first 4 hex of the particle ID>`. The ID and
    default name stay stable across restarts; `--name` is optional. Do not
@@ -120,9 +117,9 @@ proceeding.
    other machine; do not invent a shared project identifier or assume a name
    from the prompt.
 
-## 5. Check network access
+## 4. Check network access
 
-5. **Review the required ports.** Entangle uses TCP `7337` for the link,
+4. **Review the required ports.** Entangle uses TCP `7337` for the link,
    TCP `9109–9113` for its private croc relay, and UDP `5353` for mDNS. These
    are defaults and can be changed with `--link-port` and `--relay-port`.
    Show firewall commands to the human and ask before running them:
@@ -149,9 +146,9 @@ proceeding.
    **If this fails:** Stop and report the exact error to the human. Do not
    retry with elevated privileges or change network policy without approval.
 
-## 6. Register the MCP server
+## 5. Register the MCP server
 
-6. **Find Entangle's absolute path and register it in the MCP client you
+5. **Find Entangle's absolute path and register it in the MCP client you
    identified above.** GUI applications may not inherit your shell's `PATH`.
    On Linux/macOS, obtain the path with `command -v entangle`; on Windows,
    obtain it with `(Get-Command entangle).Source`. Use that absolute path in
@@ -204,9 +201,9 @@ proceeding.
    client-specific config format. Show the human any proposed config changes
    and ask them to approve them.
 
-## 7. Verify discovery
+## 6. Verify discovery
 
-7. **Check for the other machine.** Run:
+6. **Check for the other machine.** Run:
 
    ```sh
    entangle scan --timeout-secs 5
@@ -234,9 +231,9 @@ proceeding.
    the intended ports, and the network permits the traffic above. Ask the
    human before changing firewall or router settings.
 
-## 8. Report the setup
+## 7. Report the setup
 
-8. **Tell the human what was done.** Use a short checklist and distinguish
+7. **Tell the human what was done.** Use a short checklist and distinguish
    verified results from anything not checked:
 
    ```text
@@ -258,9 +255,9 @@ proceeding.
    **If this fails:** Do not claim success; give the human the first failing
    command, its error, and the step that remains.
 
-## 9. Use Entangle safely
+## 8. Use Entangle safely
 
-9. **Follow this protocol when collaborating.**
+8. **Follow this protocol when collaborating.**
 
    - Call `find_entangled_particles` first. Only particles with state
      `entangled` can receive a state sync.

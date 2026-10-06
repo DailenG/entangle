@@ -25,11 +25,28 @@ or used by the application.
 
 ## Quickstart
 
-Install croc (version 10 or newer) and the Rust toolchain, then build:
+Install a prebuilt Entangle release:
+
+```powershell
+irm https://raw.githubusercontent.com/DailenG/entangle/main/install.ps1 | iex
+```
 
 ```sh
-cargo build --release
-./target/release/entangle scan
+curl -fsSL https://raw.githubusercontent.com/DailenG/entangle/main/install.sh | sh
+```
+
+The installer downloads croc v11.5.4 by default if no croc version 10 or newer
+is available on `PATH`. It needs no administrator rights; on Windows it
+updates your user PATH. Prebuilt binaries require a published release
+(v0.1.0+). For other platforms or a source build, use
+`cargo install --git https://github.com/DailenG/entangle entangle` or build
+from a checkout. Installer environment overrides are documented in
+[docs/SETUP.md](docs/SETUP.md).
+
+After installation, check discovery:
+
+```sh
+entangle scan
 ```
 
 Register the binary as an MCP stdio server in your agent client. The default
