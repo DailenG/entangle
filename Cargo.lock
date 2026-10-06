@@ -252,7 +252,7 @@ dependencies = [
 
 [[package]]
 name = "entangle"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -278,7 +278,7 @@ dependencies = [
 
 [[package]]
 name = "entangle-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "hex",
  "rand",
@@ -289,7 +289,7 @@ dependencies = [
 
 [[package]]
 name = "entangle-link"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "entangle-core",
@@ -301,7 +301,7 @@ dependencies = [
 
 [[package]]
 name = "entangle-mcp"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "serde_json",
@@ -311,7 +311,7 @@ dependencies = [
 
 [[package]]
 name = "entangle-resonance"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "entangle-core",
  "gethostname",
@@ -324,7 +324,7 @@ dependencies = [
 
 [[package]]
 name = "entangle-transport"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "entangle-core",
  "hex",
