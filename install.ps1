@@ -4,13 +4,38 @@ if (-not [Environment]::Is64BitOperatingSystem) {
 }
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
+# Avoid script-module cmdlets that may not load when PSModulePath is polluted.
+function Get-Sha256Hex([string]$Path) {
+    $stream = $null
+    $hasher = $null
+    try {
+        $stream = [IO.File]::OpenRead($Path)
+        $hasher = [Security.Cryptography.SHA256]::Create()
+        $bytes = $hasher.ComputeHash($stream)
+        return ([BitConverter]::ToString($bytes) -replace '-', '').ToLowerInvariant()
+    } finally {
+        if ($null -ne $stream) {
+            $stream.Dispose()
+        }
+        if ($null -ne $hasher) {
+            $hasher.Dispose()
+        }
+    }
+}
+
+function Expand-ZipArchive([string]$Path, [string]$Destination) {
+    $null = Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $null = [IO.Directory]::CreateDirectory($Destination)
+    [IO.Compression.ZipFile]::ExtractToDirectory($Path, $Destination)
+}
+
 function Assert-Checksum {
     $filePath = [string]$args[0]
     $sumsPath = [string]$args[1]
     $fileName = [string]$args[2]
     $expected = $null
 
-    foreach ($line in Get-Content -LiteralPath $sumsPath) {
+    foreach ($line in [IO.File]::ReadAllLines($sumsPath)) {
         if ($line -match '^([0-9a-fA-F]{64})\s+(.+)$' -and $matches[2] -eq $fileName) {
             $expected = $matches[1].ToLowerInvariant()
             break
@@ -20,7 +45,7 @@ function Assert-Checksum {
     if (-not $expected) {
         throw "No checksum found for $fileName in $sumsPath"
     }
-    $actual = (Get-FileHash -LiteralPath $filePath -Algorithm SHA256).Hash.ToLowerInvariant()
+    $actual = Get-Sha256Hex -Path $filePath
     if ($actual -ne $expected) {
         throw "SHA-256 mismatch for $fileName"
     }
@@ -78,7 +103,7 @@ try {
     $null = Invoke-WebRequest -Uri "$downloadBase/SHA256SUMS" -OutFile $sumsPath -UseBasicParsing
     Assert-Checksum $archivePath $sumsPath $archiveName
 
-    Expand-Archive -LiteralPath $archivePath -DestinationPath $extractDir -Force
+    Expand-ZipArchive -Path $archivePath -Destination $extractDir
     $entangleBinary = Get-ChildItem -Path $extractDir -Filter 'entangle.exe' -Recurse -File | Select-Object -First 1
     if (-not $entangleBinary) {
         throw 'The Entangle archive does not contain an entangle.exe binary.'
@@ -144,7 +169,7 @@ try {
             $null = Invoke-WebRequest -Uri "$crocDownloadBase/$crocSumsName" -OutFile $crocSumsPath -UseBasicParsing
             Assert-Checksum $crocArchivePath $crocSumsPath $crocArchiveName
 
-            Expand-Archive -LiteralPath $crocArchivePath -DestinationPath $crocExtractDir -Force
+            Expand-ZipArchive -Path $crocArchivePath -Destination $crocExtractDir
             $crocBinary = Get-ChildItem -Path $crocExtractDir -Filter 'croc.exe' -Recurse -File | Select-Object -First 1
             if (-not $crocBinary) {
                 throw 'The croc archive does not contain a croc.exe binary.'
