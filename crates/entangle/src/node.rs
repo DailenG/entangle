@@ -11,7 +11,7 @@ use chrono::Utc;
 use entangle_core::{is_valid_sync_id, Manifest, RelayTicket, StateKind, PROTOCOL_VERSION};
 use entangle_link::{LinkError, LinkHandler, LinkListener, SyncDecision, SyncOffer};
 use entangle_resonance::{Advertisement, Resonance, ResonanceEvent, Resonator};
-use entangle_transport::{Croc, LocalRelay, Secret};
+use entangle_transport::{reap_stale_relay, Croc, LocalRelay, Secret};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{
@@ -26,7 +26,7 @@ use tokio::{
     sync::{mpsc, Mutex, Semaphore},
     time::sleep,
 };
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 const MIN_TIMEOUT_SECS: u64 = 5;
 const MAX_TIMEOUT_SECS: u64 = 3600;
@@ -72,10 +72,24 @@ impl Particle {
         let data_dir = root.join(particle_id.short());
         tokio::fs::create_dir_all(data_dir.join("inbox")).await?;
         tokio::fs::create_dir_all(data_dir.join("outbox")).await?;
-        let (listener, link_port) =
-            LinkListener::bind(SocketAddr::from(([0, 0, 0, 0], options.link_port)))
-                .await
-                .context("could not bind Entangle TCP link listener")?;
+        let (listener, link_port) = match LinkListener::bind(SocketAddr::from((
+            [0, 0, 0, 0],
+            options.link_port,
+        )))
+        .await
+        {
+            Ok(bound) => bound,
+            Err(LinkError::Io(error)) if error.kind() == std::io::ErrorKind::AddrInUse => {
+                warn!(
+                        configured_port = options.link_port,
+                        "configured link port is occupied; using an ephemeral port; static --peer entries pointing at this machine need the new port"
+                    );
+                LinkListener::bind(SocketAddr::from(([0, 0, 0, 0], 0)))
+                    .await
+                    .context("could not bind Entangle TCP link listener")?
+            }
+            Err(error) => return Err(error).context("could not bind Entangle TCP link listener"),
+        };
         let manifest = Manifest {
             particle_id: particle_id.clone(),
             name: name.clone(),
@@ -198,6 +212,9 @@ impl Particle {
     pub async fn shutdown(&self) {
         if let Some(relay) = self.relay.lock().await.take() {
             let _ = relay.shutdown().await;
+        }
+        if self._identity.persistent {
+            let _ = tokio::fs::remove_file(self.options.data_root().join("relay.pid")).await;
         }
         if let Some(resonator) = self.resonator.lock().await.take() {
             let _ = resonator.shutdown();
@@ -477,11 +494,35 @@ impl Particle {
     async fn local_ticket(&self, host: String) -> Result<RelayTicket> {
         let mut relay = self.relay.lock().await;
         if relay.is_none() {
+            let record_path = self.options.data_root().join("relay.pid");
+            if self._identity.persistent {
+                reap_stale_relay(&record_path);
+            }
             let relay_password = Secret::generate();
             let running = self
                 .croc
                 .start_relay(self.options.relay_port, relay_password.expose())
                 .await?;
+            if self._identity.persistent {
+                let croc_path = std::fs::canonicalize(&self.croc.path).with_context(|| {
+                    format!(
+                        "could not resolve croc executable path {}",
+                        self.croc.path.display()
+                    )
+                })?;
+                let temporary_record = record_path.with_extension("tmp");
+                let contents = format!("{}\n{}\n", running.pid(), croc_path.display());
+                let record_result = async {
+                    tokio::fs::write(&temporary_record, contents).await?;
+                    let _ = tokio::fs::remove_file(&record_path).await;
+                    tokio::fs::rename(&temporary_record, &record_path).await
+                }
+                .await;
+                if let Err(error) = record_result {
+                    let _ = tokio::fs::remove_file(&temporary_record).await;
+                    return Err(error).context("could not persist the local relay process record");
+                }
+            }
             *relay = Some(running);
         }
         Ok(relay.as_ref().expect("relay initialized").ticket(host))
@@ -897,17 +938,82 @@ mod tests {
 
     fn free_base_port() -> u16 {
         for _ in 0..100 {
-            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let listener = std::net::TcpListener::bind("0.0.0.0:0").unwrap();
             let port = listener.local_addr().unwrap().port();
             drop(listener);
-            if port <= u16::MAX - 4
-                && (0..=4)
-                    .all(|offset| std::net::TcpListener::bind(("127.0.0.1", port + offset)).is_ok())
+            if port <= u16::MAX - 9
+                && (0..=9)
+                    .all(|offset| std::net::TcpListener::bind(("0.0.0.0", port + offset)).is_ok())
             {
                 return port;
             }
         }
         panic!("could not find an available relay port range");
+    }
+
+    fn croc_for_test() -> Option<Croc> {
+        match Croc::locate(None) {
+            Ok(croc) => Some(croc),
+            Err(error) if std::env::var("ENTANGLE_REQUIRE_CROC").as_deref() != Ok("1") => {
+                eprintln!("skipping croc-dependent node test: {error}");
+                None
+            }
+            Err(error) => panic!("ENTANGLE_REQUIRE_CROC=1 but croc is unavailable: {error}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn occupied_link_port_falls_back_to_ephemeral_manifest_port() {
+        if croc_for_test().is_none() {
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let held_port = std::net::TcpListener::bind(("0.0.0.0", 0)).unwrap();
+        let configured_port = held_port.local_addr().unwrap().port();
+        let (particle, manifest) = Particle::start(
+            options(
+                "link-fallback",
+                configured_port,
+                free_base_port(),
+                "127.0.0.1:9".into(),
+                temp.path().join("particle"),
+            ),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_ne!(manifest.link_port, configured_port);
+        assert_eq!(particle.manifest.link_port, manifest.link_port);
+        particle.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn occupied_relay_base_port_falls_back_to_another_range() {
+        if croc_for_test().is_none() {
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let configured_port = free_base_port();
+        let _held_port = std::net::TcpListener::bind(("0.0.0.0", configured_port)).unwrap();
+        let (particle, _) = Particle::start(
+            options(
+                "relay-fallback",
+                free_base_port(),
+                configured_port,
+                "127.0.0.1:9".into(),
+                temp.path().join("particle"),
+            ),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let ticket = particle.local_ticket("127.0.0.1".into()).await.unwrap();
+        assert_ne!(ticket.port, configured_port);
+        assert_eq!((ticket.port - configured_port) % 5, 0);
+        particle.shutdown().await;
+        assert!(!temp.path().join("particle/relay.pid").exists());
     }
 
     #[tokio::test]

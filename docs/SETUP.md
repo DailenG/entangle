@@ -156,8 +156,12 @@ are written separately to stderr.
   repeated and also accepts a resolvable hostname. For example,
   `ENTANGLE_PEER=host-a:7337,host-b:7337` provides a comma-separated list.
 - **croc is not found:** install croc 10+ or configure `--croc` / `CROC_PATH`.
-- **Port already in use:** change `--link-port` or `--relay-port`; the relay
-  refuses to start if its base port is already occupied.
+- **Port conflicts:** stale relays recorded by Entangle are reclaimed
+  automatically. If the configured link port is occupied, Entangle listens on
+  an ephemeral port; static `--peer` entries for this machine need that new
+  port. If the relay base is occupied, Entangle tries subsequent five-port
+  ranges. Firewall rules for the configured relay range may not cover the
+  selected range.
 - **Diagnostics:** logs are on stderr; use `--log-level debug` for more detail.
 - **Inbox files:** files are stored below the platform data directory in
   `entangle/<particle-short-id>/inbox/<sync-id>/`. Override the base with

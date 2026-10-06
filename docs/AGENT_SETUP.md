@@ -122,6 +122,8 @@ proceeding.
 4. **Review the required ports.** Entangle uses TCP `7337` for the link,
    TCP `9109–9113` for its private croc relay, and UDP `5353` for mDNS. These
    are defaults and can be changed with `--link-port` and `--relay-port`.
+   If Entangle reports a port conflict, do not stop or kill processes; report
+   the exact error text to the human.
    Show firewall commands to the human and ask before running them:
 
    ```sh

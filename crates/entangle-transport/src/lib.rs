@@ -9,13 +9,14 @@ use std::{
     collections::VecDeque,
     env,
     ffi::{OsStr, OsString},
-    fmt,
+    fmt, fs, io,
     net::{SocketAddr, TcpListener},
     path::{Path, PathBuf},
     process::Stdio,
     sync::{Arc, Mutex},
     time::Duration,
 };
+use sysinfo::{Pid, ProcessStatus, ProcessesToUpdate, Signal, System};
 use thiserror::Error;
 use tokio::{
     io::{AsyncBufReadExt, AsyncRead, BufReader},
@@ -39,6 +40,9 @@ pub enum TransportError {
     /// The requested port was already occupied.
     #[error("relay base port {0} is already in use")]
     PortInUse(u16),
+    /// All attempted relay port ranges were occupied.
+    #[error("relay base port range {start}..={end} (step 5) is already in use")]
+    PortRangesInUse { start: u16, end: u16 },
 }
 
 /// A locatable croc executable and its reported version string.
@@ -106,7 +110,34 @@ impl Croc {
                 "relay base port must leave room for four transfer ports".into(),
             ));
         }
-        LocalRelay::start(self, base_port, password).await
+        let mut last_port = base_port;
+        for offset in 0..=8_u16 {
+            let Some(port) = base_port.checked_add(offset * 5) else {
+                break;
+            };
+            if port > u16::MAX - 4 {
+                break;
+            }
+            last_port = port;
+            match LocalRelay::start(self, port, password).await {
+                Ok(relay) => {
+                    if port != base_port {
+                        tracing::warn!(
+                            configured_port = base_port,
+                            selected_port = port,
+                            "configured relay range is occupied; firewall rules for the configured range will not cover the selected relay range"
+                        );
+                    }
+                    return Ok(relay);
+                }
+                Err(TransportError::PortInUse(_)) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Err(TransportError::PortRangesInUse {
+            start: base_port,
+            end: last_port,
+        })
     }
 
     /// Starts a file send to a relay ticket without putting the secret in argv.
@@ -156,6 +187,89 @@ fn base_command(croc: &Croc, relay: &RelayTicket, secret: &Secret) -> Command {
         .stderr(Stdio::piped())
         .kill_on_drop(true);
     command
+}
+
+fn spawn_croc(mut command: Command) -> io::Result<Child> {
+    install_parent_death_signal(&mut command);
+    let child = command.spawn()?;
+    #[cfg(windows)]
+    assign_to_job(&child);
+    Ok(child)
+}
+
+#[cfg(target_os = "linux")]
+fn install_parent_death_signal(command: &mut Command) {
+    use std::os::unix::process::CommandExt;
+
+    let parent_pid = std::process::id() as libc::pid_t;
+    unsafe {
+        command.as_std_mut().pre_exec(move || {
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            if libc::getppid() != parent_pid {
+                libc::_exit(1);
+            }
+            Ok(())
+        });
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn install_parent_death_signal(_: &mut Command) {}
+
+#[cfg(windows)]
+struct JobHandle(windows_sys::Win32::Foundation::HANDLE);
+
+#[cfg(windows)]
+unsafe impl Send for JobHandle {}
+
+#[cfg(windows)]
+unsafe impl Sync for JobHandle {}
+
+#[cfg(windows)]
+fn assign_to_job(child: &Child) {
+    use std::{mem::size_of, sync::OnceLock};
+    use windows_sys::Win32::{
+        Foundation::HANDLE,
+        System::JobObjects::{
+            AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+            SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        },
+    };
+
+    static JOB: OnceLock<Option<JobHandle>> = OnceLock::new();
+    let job = JOB.get_or_init(|| unsafe {
+        let handle = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+        if handle.is_null() {
+            tracing::warn!("could not create the croc child-process job object");
+            return None;
+        }
+        let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        if SetInformationJobObject(
+            handle,
+            JobObjectExtendedLimitInformation,
+            &limits as *const _ as *const _,
+            size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+        ) == 0
+        {
+            tracing::warn!("could not configure the croc child-process job object");
+            return None;
+        }
+        Some(JobHandle(handle))
+    });
+
+    if let Some(job) = job {
+        let Some(raw_handle) = child.raw_handle() else {
+            return;
+        };
+        let assigned = unsafe { AssignProcessToJobObject(job.0, raw_handle as HANDLE) };
+        if assigned == 0 {
+            tracing::warn!("could not assign a croc child process to the job object");
+        }
+    }
 }
 
 fn find_on_path(name: &str) -> Option<PathBuf> {
@@ -220,6 +334,7 @@ pub struct LocalRelay {
     child: Child,
     base_port: u16,
     password: String,
+    pid: u32,
 }
 
 impl LocalRelay {
@@ -234,14 +349,20 @@ impl LocalRelay {
                 "relay base port must leave room for four transfer ports".into(),
             ));
         }
-        let listener = TcpListener::bind(("0.0.0.0", base_port))
-            .map_err(|_| TransportError::PortInUse(base_port))?;
+        let listener = TcpListener::bind(("0.0.0.0", base_port)).map_err(|error| {
+            if error.kind() == io::ErrorKind::AddrInUse {
+                TransportError::PortInUse(base_port)
+            } else {
+                TransportError::Io(error)
+            }
+        })?;
         drop(listener);
         let ports = (base_port..=base_port.saturating_add(4))
             .map(|port| port.to_string())
             .collect::<Vec<_>>()
             .join(",");
-        let mut child = Command::new(&croc.path)
+        let mut command = Command::new(&croc.path);
+        command
             .arg("--pass")
             .arg(password)
             .args(["relay", "--host", "0.0.0.0", "--ports"])
@@ -249,8 +370,9 @@ impl LocalRelay {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
-            .kill_on_drop(true)
-            .spawn()?;
+            .kill_on_drop(true);
+        let mut child = spawn_croc(command)?;
+        let pid = child.id().expect("spawned relay child must have a pid");
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
             if TcpListener::bind(("0.0.0.0", base_port)).is_err()
@@ -262,6 +384,7 @@ impl LocalRelay {
                     child,
                     base_port,
                     password: password.to_owned(),
+                    pid,
                 });
             }
             if Instant::now() >= deadline {
@@ -283,11 +406,85 @@ impl LocalRelay {
         }
     }
 
+    /// Returns the relay process ID.
+    pub fn pid(&self) -> u32 {
+        self.pid
+    }
+
     /// Stops the relay process and waits for it to exit.
     pub async fn shutdown(mut self) -> Result<(), TransportError> {
         self.child.kill().await?;
         let _ = self.child.wait().await?;
         Ok(())
+    }
+}
+
+/// Reclaims a previously recorded relay only when its PID still runs the same executable.
+pub fn reap_stale_relay(record: &Path) {
+    let Ok(contents) = fs::read_to_string(record) else {
+        return;
+    };
+    let mut lines = contents.lines();
+    let Some(pid) = lines.next().and_then(|line| line.parse::<u32>().ok()) else {
+        return;
+    };
+    let Some(executable) = lines.next().map(Path::new) else {
+        return;
+    };
+    if pid == 0 || !executable.is_absolute() {
+        return;
+    }
+
+    let pid = Pid::from_u32(pid);
+    let mut system = System::new();
+    system.refresh_processes(ProcessesToUpdate::Some(&[pid]), true);
+    let Some(process) = system.process(pid) else {
+        let _ = fs::remove_file(record);
+        return;
+    };
+    let Some(actual_executable) = process.exe() else {
+        let _ = fs::remove_file(record);
+        return;
+    };
+    if !executable_paths_match(actual_executable, executable) {
+        let _ = fs::remove_file(record);
+        return;
+    }
+    if !process.kill_with(Signal::Kill).unwrap_or(false) {
+        tracing::warn!(
+            relay_pid = pid.as_u32(),
+            "could not terminate stale croc relay"
+        );
+    }
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        system.refresh_processes(ProcessesToUpdate::Some(&[pid]), true);
+        match system.process(pid) {
+            None => break,
+            Some(process) if process.status() == ProcessStatus::Zombie => break,
+            Some(_) if std::time::Instant::now() >= deadline => break,
+            Some(_) => std::thread::sleep(Duration::from_millis(50)),
+        }
+    }
+    let _ = fs::remove_file(record);
+}
+
+fn executable_paths_match(actual: &Path, recorded: &Path) -> bool {
+    if !actual.is_absolute() || !recorded.is_absolute() {
+        return false;
+    }
+    let actual = fs::canonicalize(actual).unwrap_or_else(|_| actual.to_path_buf());
+    let recorded = fs::canonicalize(recorded).unwrap_or_else(|_| recorded.to_path_buf());
+    #[cfg(windows)]
+    {
+        actual
+            .to_string_lossy()
+            .eq_ignore_ascii_case(&recorded.to_string_lossy())
+    }
+    #[cfg(not(windows))]
+    {
+        actual == recorded
     }
 }
 
@@ -317,7 +514,7 @@ impl Transfer {
     }
 
     fn spawn_with_retry(
-        mut command: Command,
+        command: Command,
         sending: bool,
         retries: u8,
         secret: &str,
@@ -327,7 +524,7 @@ impl Transfer {
         } else {
             None
         };
-        let child = command.spawn()?;
+        let child = spawn_croc(command)?;
         let tail = Arc::new(Mutex::new(VecDeque::with_capacity(4096)));
         let (ready_tx, ready_rx) = oneshot::channel();
         let mut transfer = Self {
@@ -513,6 +710,142 @@ pub fn relay_socket(host: &str, port: u16) -> Result<SocketAddr, TransportError>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn croc_for_test() -> Option<Croc> {
+        match Croc::locate(None) {
+            Ok(croc) => Some(croc),
+            Err(error) if std::env::var("ENTANGLE_REQUIRE_CROC").as_deref() != Ok("1") => {
+                eprintln!("skipping croc-dependent transport test: {error}");
+                None
+            }
+            Err(error) => panic!("ENTANGLE_REQUIRE_CROC=1 but croc is unavailable: {error}"),
+        }
+    }
+
+    fn free_relay_base_port() -> u16 {
+        for _ in 0..100 {
+            let listener = TcpListener::bind(("0.0.0.0", 0)).unwrap();
+            let port = listener.local_addr().unwrap().port();
+            drop(listener);
+            if port <= u16::MAX - 4
+                && (0..=4).all(|offset| TcpListener::bind(("0.0.0.0", port + offset)).is_ok())
+            {
+                return port;
+            }
+        }
+        panic!("could not find an available relay port range");
+    }
+
+    fn wait_for_relay(port: u16) -> bool {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        false
+    }
+
+    fn wait_for_child_exit(child: &mut std::process::Child) -> bool {
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
+            if child.try_wait().ok().flatten().is_some() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        false
+    }
+
+    struct TestChild(std::process::Child);
+
+    impl Drop for TestChild {
+        fn drop(&mut self) {
+            if self.0.try_wait().ok().flatten().is_none() {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+    }
+
+    #[test]
+    fn stale_relay_is_reaped_only_when_its_executable_matches() {
+        let Some(croc) = croc_for_test() else {
+            return;
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let base_port = free_relay_base_port();
+        let ports = (base_port..=base_port + 4)
+            .map(|port| port.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let mut child = TestChild(
+            std::process::Command::new(&croc.path)
+                .arg("--pass")
+                .arg("orphan-test-password")
+                .args(["relay", "--host", "0.0.0.0", "--ports"])
+                .arg(ports)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        assert!(wait_for_relay(base_port), "croc relay did not start");
+
+        let record = temp.path().join("relay.pid");
+        let executable = fs::canonicalize(&croc.path).unwrap();
+        fs::write(
+            &record,
+            format!("{}\n{}\n", child.0.id(), executable.display()),
+        )
+        .unwrap();
+        reap_stale_relay(&record);
+
+        assert!(wait_for_child_exit(&mut child.0), "croc relay did not exit");
+        assert!(!record.exists());
+        assert!(TcpListener::bind(("0.0.0.0", base_port)).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stale_record_does_not_kill_a_different_executable() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut child = TestChild(
+            std::process::Command::new("sleep")
+                .arg("30")
+                .spawn()
+                .unwrap(),
+        );
+        let record = temp.path().join("relay.pid");
+        let unrelated_executable = std::env::current_exe().unwrap();
+        fs::write(
+            &record,
+            format!("{}\n{}\n", child.0.id(), unrelated_executable.display()),
+        )
+        .unwrap();
+
+        reap_stale_relay(&record);
+
+        assert!(child.0.try_wait().unwrap().is_none());
+        assert!(!record.exists());
+        child.0.kill().unwrap();
+        let _ = child.0.wait().unwrap();
+    }
+
+    #[test]
+    fn missing_and_garbage_relay_records_are_noops() {
+        let temp = tempfile::tempdir().unwrap();
+        let missing = temp.path().join("missing-relay.pid");
+        reap_stale_relay(&missing);
+        assert!(!missing.exists());
+
+        let garbage = temp.path().join("garbage-relay.pid");
+        fs::write(&garbage, "not a relay record").unwrap();
+        reap_stale_relay(&garbage);
+        assert_eq!(fs::read_to_string(garbage).unwrap(), "not a relay record");
+    }
 
     #[test]
     fn sibling_croc_finds_existing_binary() {
