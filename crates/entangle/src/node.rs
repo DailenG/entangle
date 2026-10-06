@@ -495,8 +495,15 @@ impl Particle {
         let mut relay = self.relay.lock().await;
         if relay.is_none() {
             let record_path = self.options.data_root().join("relay.pid");
+            // Only the identity-lock holder reaps or records a relay, proving any existing
+            // record belongs to a dead predecessor rather than a concurrent process.
             if self._identity.persistent {
-                reap_stale_relay(&record_path);
+                let stale_record = record_path.clone();
+                if let Err(error) =
+                    tokio::task::spawn_blocking(move || reap_stale_relay(&stale_record)).await
+                {
+                    warn!(%error, "could not finish stale relay recovery");
+                }
             }
             let relay_password = Secret::generate();
             let running = self
@@ -504,23 +511,32 @@ impl Particle {
                 .start_relay(self.options.relay_port, relay_password.expose())
                 .await?;
             if self._identity.persistent {
-                let croc_path = std::fs::canonicalize(&self.croc.path).with_context(|| {
-                    format!(
-                        "could not resolve croc executable path {}",
-                        self.croc.path.display()
-                    )
-                })?;
-                let temporary_record = record_path.with_extension("tmp");
-                let contents = format!("{}\n{}\n", running.pid(), croc_path.display());
-                let record_result = async {
-                    tokio::fs::write(&temporary_record, contents).await?;
-                    let _ = tokio::fs::remove_file(&record_path).await;
-                    tokio::fs::rename(&temporary_record, &record_path).await
-                }
-                .await;
-                if let Err(error) = record_result {
-                    let _ = tokio::fs::remove_file(&temporary_record).await;
-                    return Err(error).context("could not persist the local relay process record");
+                match std::fs::canonicalize(&self.croc.path) {
+                    Ok(croc_path) => {
+                        let temporary_record = record_path.with_extension("tmp");
+                        let contents = format!("{}\n{}\n", running.pid(), croc_path.display());
+                        let record_result = async {
+                            tokio::fs::write(&temporary_record, contents).await?;
+                            let _ = tokio::fs::remove_file(&record_path).await;
+                            tokio::fs::rename(&temporary_record, &record_path).await
+                        }
+                        .await;
+                        if let Err(error) = record_result {
+                            let _ = tokio::fs::remove_file(&temporary_record).await;
+                            warn!(
+                                record_path = %record_path.display(),
+                                %error,
+                                "could not persist the local relay process record; keeping the relay running"
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        warn!(
+                            croc_path = %self.croc.path.display(),
+                            %error,
+                            "could not resolve croc executable path for the relay record; keeping the relay running"
+                        );
+                    }
                 }
             }
             *relay = Some(running);

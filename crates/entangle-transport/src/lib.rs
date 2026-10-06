@@ -189,6 +189,8 @@ fn base_command(croc: &Croc, relay: &RelayTicket, secret: &Secret) -> Command {
     command
 }
 
+/// `kill_on_drop` does not run when Entangle is terminated without dropping its
+/// runtime, such as during an MCP client's reload.
 fn spawn_croc(mut command: Command) -> io::Result<Child> {
     install_parent_death_signal(&mut command);
     let child = command.spawn()?;
@@ -198,6 +200,9 @@ fn spawn_croc(mut command: Command) -> io::Result<Child> {
 }
 
 #[cfg(target_os = "linux")]
+/// PDEATHSIG fires when the spawning thread exits. Croc spawns run on Tokio
+/// worker threads that live for the runtime; the `getppid` check closes the
+/// race where Entangle exits before the child arms the signal.
 fn install_parent_death_signal(command: &mut Command) {
     use std::os::unix::process::CommandExt;
 
@@ -219,6 +224,8 @@ fn install_parent_death_signal(command: &mut Command) {
 fn install_parent_death_signal(_: &mut Command) {}
 
 #[cfg(windows)]
+/// Keeps the process-wide handle open so OS closure at process exit triggers
+/// KILL_ON_JOB_CLOSE for every assigned croc child.
 struct JobHandle(windows_sys::Win32::Foundation::HANDLE);
 
 #[cfg(windows)]
@@ -228,6 +235,7 @@ unsafe impl Send for JobHandle {}
 unsafe impl Sync for JobHandle {}
 
 #[cfg(windows)]
+/// Assigns croc children to the process-wide kill-on-close job.
 fn assign_to_job(child: &Child) {
     use std::{mem::size_of, sync::OnceLock};
     use windows_sys::Win32::{
