@@ -1,7 +1,6 @@
 //! Local mDNS resonance for finding Entangle particles on a LAN.
 //!
-//! This crate carries discovery metadata only. It has no knowledge of croc or
-//! the control-link protocol; the orchestrator performs those later steps.
+//! This crate carries discovery metadata only and is independent of transport.
 
 use entangle_core::{ParticleId, PROTOCOL_VERSION};
 use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
@@ -30,6 +29,8 @@ pub struct Advertisement {
     pub port: u16,
     /// Optional project context.
     pub context: Option<String>,
+    /// Optional public pairing-group identifier (never the pairing key).
+    pub group: Option<String>,
     /// Entangle package version.
     pub version: String,
 }
@@ -49,6 +50,8 @@ pub struct Resonance {
     pub port: u16,
     /// Optional project context.
     pub context: Option<String>,
+    /// Optional public pairing-group identifier (never the pairing key).
+    pub group: Option<String>,
     /// Remote control protocol version.
     pub proto: u32,
 }
@@ -99,6 +102,9 @@ impl Resonator {
         ];
         if let Some(context) = &ad.context {
             properties.push(("ctx", context.clone()));
+        }
+        if let Some(group) = &ad.group {
+            properties.push(("grp", group.clone()));
         }
         let service = ServiceInfo::new(
             SERVICE_TYPE,
@@ -224,6 +230,15 @@ fn decode_values(
     let proto = property("proto")?
         .parse()
         .map_err(|_| ResonanceError::InvalidTxt("invalid proto".into()))?;
+    let group = property("grp").ok();
+    if group.as_deref().is_some_and(|value| {
+        value.len() != 8
+            || !value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    }) {
+        return Err(ResonanceError::InvalidTxt("invalid grp".into()));
+    }
     addrs.sort_by_key(|address| match address {
         IpAddr::V4(ip) if !ip.is_loopback() => (0, ip.to_string()),
         IpAddr::V6(ip) if !ip.is_loopback() => (1, ip.to_string()),
@@ -236,6 +251,7 @@ fn decode_values(
         addrs,
         port,
         context: property("ctx").ok(),
+        group,
         proto,
     })
 }
@@ -288,6 +304,7 @@ mod tests {
                 ("proto", PROTOCOL_VERSION.to_string()),
                 ("name", "test node".into()),
                 ("ctx", "sample".into()),
+                ("grp", "a1b2c3d4".into()),
                 ("ver", "0.1.0".into()),
             ][..],
         )
@@ -302,6 +319,7 @@ mod tests {
         assert_eq!(peer.particle_id, id);
         assert_eq!(peer.name, "test node");
         assert_eq!(peer.context.as_deref(), Some("sample"));
+        assert_eq!(peer.group.as_deref(), Some("a1b2c3d4"));
         assert_eq!(peer.proto, PROTOCOL_VERSION);
     }
 
@@ -329,6 +347,7 @@ mod tests {
             name: "loopback-test".into(),
             port: 7337,
             context: None,
+            group: None,
             version: env!("CARGO_PKG_VERSION").into(),
         })
         .unwrap();
