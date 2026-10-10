@@ -4,7 +4,7 @@ use crate::{
     config::Options,
     field::{Field, PeerRecord, PeerState},
     identity::{self, Identity},
-    inbox::InboxItem,
+    inbox::{self, InboxItem},
 };
 use anyhow::{Context, Result};
 use chrono::Utc;
@@ -70,8 +70,10 @@ impl Particle {
         let particle_id = identity.id.clone();
         let name = options.particle_name(&particle_id);
         let data_dir = root.join(particle_id.short());
-        tokio::fs::create_dir_all(data_dir.join("inbox")).await?;
+        let inbox_dir = data_dir.join("inbox");
+        tokio::fs::create_dir_all(&inbox_dir).await?;
         tokio::fs::create_dir_all(data_dir.join("outbox")).await?;
+        let persisted_inbox = inbox::load(&inbox_dir).await;
         let (listener, link_port) = match LinkListener::bind(SocketAddr::from((
             [0, 0, 0, 0],
             options.link_port,
@@ -130,7 +132,7 @@ impl Particle {
             data_dir,
             relay: Mutex::new(None),
             resonator: Mutex::new(resonator),
-            inbox: Mutex::new(Vec::new()),
+            inbox: Mutex::new(persisted_inbox),
             notifications,
             inbound_limit: Arc::new(Semaphore::new(4)),
         });
@@ -255,11 +257,15 @@ impl Particle {
             None => 0,
         };
         let selected: Vec<_> = inbox.iter().skip(start).take(limit).cloned().collect();
-        if collapse {
-            let ids: Vec<_> = selected.iter().map(|item| item.sync_id.as_str()).collect();
-            inbox.retain(|item| !ids.contains(&item.sync_id.as_str()));
-        }
+        let collapsed_ids = if collapse {
+            let ids: Vec<_> = selected.iter().map(|item| item.sync_id.clone()).collect();
+            inbox.retain(|item| !ids.contains(&item.sync_id));
+            ids
+        } else {
+            Vec::new()
+        };
         let remaining = inbox.len();
+        drop(inbox);
         let states = selected
             .into_iter()
             .map(|item| {
@@ -278,6 +284,15 @@ impl Particle {
                 })
             })
             .collect::<Vec<_>>();
+        for sync_id in collapsed_ids {
+            if let Err(error) = inbox::forget(&self.data_dir.join("inbox"), &sync_id).await {
+                warn!(
+                    sync_id,
+                    error = %error,
+                    "unable to remove collapsed inbox metadata"
+                );
+            }
+        }
         json!({ "states": states, "remaining": remaining })
     }
 
@@ -709,7 +724,7 @@ impl Particle {
             }
             StateKind::File => (None, None),
         };
-        self.inbox.lock().await.push(InboxItem {
+        let item = InboxItem {
             sync_id: offer.sync_id.clone(),
             from_particle_id: manifest.particle_id.to_string(),
             from_name: manifest.name.clone(),
@@ -721,7 +736,15 @@ impl Particle {
             state,
             path: (offer.kind == StateKind::File).then_some(path),
             text,
-        });
+        };
+        if let Err(error) = inbox::persist(&self.data_dir.join("inbox"), &item).await {
+            warn!(
+                sync_id = %item.sync_id,
+                error = %error,
+                "unable to persist received inbox metadata"
+            );
+        }
+        self.inbox.lock().await.push(item);
         if let Some(notifications) = &self.notifications {
             let _ = notifications
                 .send(json!({

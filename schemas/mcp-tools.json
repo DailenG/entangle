@@ -74,7 +74,7 @@
     {
       "name": "observe_entangled_states",
       "title": "Observe entangled states",
-      "description": "Read state syncs this particle has received from peers. JSON payloads are returned inline; files are returned as a local path (plus inline text for small UTF-8 files). Set `collapse` to true to remove the returned items from the inbox after reading.",
+      "description": "Read state syncs this particle has received from peers. JSON payloads are returned inline; files are returned as a local path (plus inline text for small UTF-8 files). Received items survive server restarts and MCP reloads until collapsed. Set `collapse` to true to remove the returned items from the inbox after reading.",
       "inputSchema": {
         "type": "object",
         "properties": {
