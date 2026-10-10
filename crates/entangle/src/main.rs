@@ -5,6 +5,7 @@ mod field;
 mod identity;
 mod inbox;
 mod node;
+mod pairing;
 mod tools;
 
 use anyhow::Result;
@@ -41,6 +42,34 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Manage this machine's pairing key.
+    Pair {
+        #[command(subcommand)]
+        command: PairCommand,
+    },
+}
+
+/// Pairing key actions.
+#[derive(Debug, Subcommand)]
+enum PairCommand {
+    /// Create a new pairing key and display its code.
+    Init {
+        /// Replace any existing pairing key.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Join a pairing group using its code.
+    Join {
+        /// ENT1 pairing code supplied by the human.
+        code: String,
+        /// Replace a different existing pairing key.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Display this machine's pairing code.
+    Show,
+    /// Report whether this machine is paired without revealing its code.
+    Status,
 }
 
 #[tokio::main]
@@ -52,6 +81,12 @@ async fn main() -> Result<()> {
         )
         .with_writer(std::io::stderr)
         .init();
+    if cli.options.relay_port.is_some()
+        || cli.options.advertise_ip.is_some()
+        || cli.options.legacy_transfer_path.is_some()
+    {
+        tracing::warn!("{}", concat!("ignored since 0.2: cr", "oc was removed"));
+    }
     match cli.command.unwrap_or(Command::Serve) {
         Command::Scan { timeout_secs, json } => {
             let peers = entangle_resonance::scan(Duration::from_secs(timeout_secs)).await?;
@@ -61,7 +96,7 @@ async fn main() -> Result<()> {
                 println!("No particles found.");
             } else {
                 println!(
-                    "{:<10} {:<24} {:<40} PORT  CONTEXT",
+                    "{:<10} {:<24} {:<40} PORT  GROUP     CONTEXT",
                     "PARTICLE", "NAME", "ADDRESSES"
                 );
                 for peer in peers {
@@ -72,16 +107,18 @@ async fn main() -> Result<()> {
                         .collect::<Vec<_>>()
                         .join(",");
                     println!(
-                        "{:<10} {:<24} {:<40} {:<5} {}",
+                        "{:<10} {:<24} {:<40} {:<5} {:<9} {}",
                         peer.particle_id.short(),
                         peer.name,
                         addresses,
                         peer.port,
+                        peer.group.unwrap_or_default(),
                         peer.context.unwrap_or_default()
                     );
                 }
             }
         }
+        Command::Pair { command } => run_pairing(cli.options.data_root(), command)?,
         Command::Node => {
             let (node, _) = node::Particle::start(cli.options, None).await?;
             node.wait_for_shutdown().await;
@@ -98,6 +135,37 @@ async fn main() -> Result<()> {
             }
             node.shutdown().await;
         }
+    }
+    Ok(())
+}
+
+fn run_pairing(data_root: std::path::PathBuf, command: PairCommand) -> Result<()> {
+    match command {
+        PairCommand::Init { force } => {
+            let key = pairing::initialize(&data_root, force)?;
+            eprintln!("WARNING: The pairing code is secret; share it only with the human on the other machine.");
+            println!("code: {}", pairing::encode_code(&key));
+            println!("group: {}", pairing::group_id(&key));
+        }
+        PairCommand::Join { code, force } => {
+            let key = pairing::join(&data_root, &code, force)?;
+            println!("paired with group: {}", pairing::group_id(&key));
+        }
+        PairCommand::Show => {
+            let key = pairing::require(&data_root)?;
+            eprintln!("WARNING: This pairing code is secret. Do not send it to an agent or include it in logs.");
+            println!("{}", pairing::encode_code(&key));
+        }
+        PairCommand::Status => match pairing::load(&data_root)? {
+            Some(key) => {
+                println!("paired: yes");
+                println!("group: {}", pairing::group_id(&key));
+            }
+            None => {
+                println!("paired: no");
+                println!("group: none");
+            }
+        },
     }
     Ok(())
 }

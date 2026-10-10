@@ -1,6 +1,7 @@
 //! Lock-backed identity persistence for a local Entangle data root.
 
 use entangle_core::ParticleId;
+use entangle_transport::generate_static;
 use std::{
     fs::{self, File, OpenOptions},
     io::{ErrorKind, Write},
@@ -12,6 +13,7 @@ use tracing::{info, warn};
 pub struct Identity {
     pub id: ParticleId,
     pub persistent: bool,
+    pub static_private: [u8; 32],
     _lock: Option<File>,
 }
 
@@ -68,7 +70,7 @@ pub fn claim(root: &Path) -> Identity {
                 .ok()
                 .and_then(|value| ParticleId::parse(value.trim().to_owned()).ok())
             {
-                return persistent(id, lock);
+                return persistent(id, lock, root);
             }
         }
         Err(error) if error.kind() == ErrorKind::NotFound => {}
@@ -100,13 +102,14 @@ pub fn claim(root: &Path) -> Identity {
         return ephemeral();
     }
 
-    persistent(id, lock)
+    persistent(id, lock, root)
 }
 
-fn persistent(id: ParticleId, lock: File) -> Identity {
+fn persistent(id: ParticleId, lock: File, root: &Path) -> Identity {
     Identity {
         id,
         persistent: true,
+        static_private: load_or_create_static(root),
         _lock: Some(lock),
     }
 }
@@ -115,8 +118,74 @@ fn ephemeral() -> Identity {
     Identity {
         id: ParticleId::generate(),
         persistent: false,
+        static_private: generate_static(),
         _lock: None,
     }
+}
+
+fn load_or_create_static(root: &Path) -> [u8; 32] {
+    let path = root.join("noise_static.key");
+    match fs::read_to_string(&path) {
+        Ok(contents) => {
+            if contents.len() == 64
+                && contents
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            {
+                if let Ok(bytes) = hex::decode(contents) {
+                    if let Ok(key) = <[u8; 32]>::try_from(bytes) {
+                        return key;
+                    }
+                }
+            }
+            warn!(
+                path = %path.display(),
+                "malformed Noise static key; generating a replacement"
+            );
+        }
+        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        Err(error) => {
+            warn!(
+                path = %path.display(),
+                %error,
+                "could not read Noise static key; generating a replacement"
+            );
+        }
+    }
+
+    let key = generate_static();
+    if let Err(error) = persist_static(&path, &key) {
+        warn!(
+            path = %path.display(),
+            %error,
+            "could not persist Noise static key; using it for this process only"
+        );
+    }
+    key
+}
+
+fn persist_static(path: &Path, key: &[u8; 32]) -> std::io::Result<()> {
+    let temporary = path.with_extension("key.tmp");
+    let mut options = OpenOptions::new();
+    options.create(true).truncate(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&temporary)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    }
+    file.write_all(hex::encode(key).as_bytes())?;
+    file.sync_all()?;
+    #[cfg(windows)]
+    if path.exists() {
+        fs::remove_file(path)?;
+    }
+    fs::rename(temporary, path)
 }
 
 #[cfg(test)]
@@ -140,6 +209,47 @@ mod tests {
         let second = claim(temp.path());
         assert!(second.persistent);
         assert_eq!(second.id, id);
+    }
+
+    #[test]
+    fn noise_static_key_persists_across_claims() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = claim(temp.path());
+        let key = first.static_private;
+        let key_text = fs::read_to_string(temp.path().join("noise_static.key")).unwrap();
+        assert_eq!(key_text.len(), 64);
+        assert!(key_text
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)));
+        drop(first);
+
+        let second = claim(temp.path());
+        assert_eq!(second.static_private, key);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn noise_static_key_is_written_with_private_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let _identity = claim(temp.path());
+        let mode = fs::metadata(temp.path().join("noise_static.key"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
+    #[test]
+    fn malformed_noise_static_key_is_regenerated() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("noise_static.key"), "broken").unwrap();
+        let identity = claim(temp.path());
+        let persisted = fs::read_to_string(temp.path().join("noise_static.key")).unwrap();
+        assert_eq!(persisted.len(), 64);
+        assert_eq!(hex::decode(persisted).unwrap(), identity.static_private);
     }
 
     #[test]
