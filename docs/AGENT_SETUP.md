@@ -16,6 +16,23 @@ with `powershell.exe -NoProfile -ExecutionPolicy Bypass -File <path>`, then
 delete the file. Never pass inline `-Command` strings: the outer shell (often
 bash in omp) can mangle quotes and `$` variables.
 
+In Windows PowerShell 5.1, module cmdlets may be unavailable in spawned
+processes. For SHA-256, set `$path` to the file and use .NET rather than
+`Get-FileHash`:
+
+```powershell
+$s=[System.Security.Cryptography.SHA256]::Create(); $f=[IO.File]::OpenRead($path); -join ($s.ComputeHash($f) | ForEach-Object { $_.ToString('x2') }); $f.Dispose()
+```
+
+If another cmdlet is reported as not recognized, import its module by full path
+and retry. For example, use the Utility module for `Get-FileHash` and friends,
+or the Management module for `Get-Process` and `Get-Item`:
+
+```powershell
+Import-Module "$PSHOME\Modules\Microsoft.PowerShell.Utility\Microsoft.PowerShell.Utility.psd1"
+Import-Module "$PSHOME\Modules\Microsoft.PowerShell.Management\Microsoft.PowerShell.Management.psd1"
+```
+
 **Verify:** You understand the goal and ground rules before making changes.
 
 **If this fails:** Ask the human to clarify the goal or any ground rule before
