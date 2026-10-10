@@ -94,6 +94,10 @@ a secret and must not be sent through Entangle or included in logs.
 
 Both devices must run version 0.2; it cannot communicate with 0.1.x peers.
 Upgrade both devices before pairing.
+Pairing-key changes take effect without a client reload; upgrading the Entangle
+binary still requires restarting or reloading the MCP client.
+If `find_entangled_particles.self.warning` is present, report its text verbatim
+to the human. Never kill or stop processes to resolve it.
 
 ## 3. Use this machine's identity
 

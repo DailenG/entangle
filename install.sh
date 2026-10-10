@@ -101,4 +101,5 @@ case ":${PATH:-}:" in
     *) printf "Add Entangle to PATH with: export PATH=\"%s:\$PATH\"\n" "$install_dir" ;;
 esac
 printf 'Reload or restart your MCP client so it runs this version.\n'
+printf 'Pairing-key changes take effect without a client reload; binary upgrades require one.\n'
 printf 'Pair this machine: run `entangle pair init` on your first machine, then `entangle pair join <code>` here.\n'

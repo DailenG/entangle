@@ -104,6 +104,8 @@ entangle pair join <code>
 Treat the pairing code as a secret. Do not send it through Entangle, place it
 in MCP configuration, or give it to an agent. Check the paired state and
 public group ID with `entangle pair status`.
+Pairing-key changes take effect within a few seconds without reloading the MCP
+client; installing a new Entangle binary still requires a client reload.
 
 ## Register as an MCP server
 
