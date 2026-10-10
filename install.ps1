@@ -184,8 +184,10 @@ try {
         }
     }
 
+    $pathChanged = $false
     $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
     if (-not (Test-PathListContainsInstallDir $userPath $installDir)) {
+        $pathChanged = $true
         if ([string]::IsNullOrWhiteSpace($userPath)) {
             $newUserPath = $installDir
         } else {
@@ -211,7 +213,10 @@ try {
         Write-Output 'croc version:'
         & (Join-Path $installDir 'croc.exe') --version
     }
-    Write-Output 'Restart your terminal and reload or restart your MCP client to pick up the PATH change.'
+    if ($pathChanged) {
+        Write-Output 'Added the install directory to your user PATH; restart your terminal to pick it up.'
+    }
+    Write-Output 'Reload or restart your MCP client so it runs this version.'
 } finally {
     Remove-Item -LiteralPath $tempDir -Recurse -Force -ErrorAction SilentlyContinue
 }
