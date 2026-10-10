@@ -5,7 +5,7 @@ use snow::{
     resolvers::{CryptoResolver, DefaultResolver},
     Builder, HandshakeState, TransportState,
 };
-use std::{fmt, io, net::SocketAddr, time::Duration};
+use std::{fmt, io, net::SocketAddr, sync::Arc, time::Duration};
 use thiserror::Error;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -19,6 +19,9 @@ const MAX_MESSAGE: usize = u16::MAX as usize;
 const TAG_LENGTH: usize = 16;
 /// Maximum plaintext bytes carried by one Noise transport message.
 pub const MAX_PLAINTEXT: usize = MAX_MESSAGE - TAG_LENGTH;
+
+/// Shared, reloadable keys used by listeners and outbound links.
+pub type KeySlot = Arc<std::sync::RwLock<Option<Arc<LinkKeys>>>>;
 
 /// Static Noise identity and pairing-derived pre-shared key.
 #[derive(Clone)]

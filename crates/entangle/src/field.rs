@@ -34,6 +34,7 @@ pub struct PeerRecord {
 #[derive(Default)]
 pub struct Field {
     peers: HashMap<ParticleId, PeerRecord>,
+    bindings: HashMap<ParticleId, [u8; 32]>,
 }
 
 impl Field {
@@ -56,6 +57,7 @@ impl Field {
     /// Stores a validated manifest and marks the peer entangled.
     pub fn entangle(&mut self, mut resonance: Resonance, manifest: Manifest, static_key: [u8; 32]) {
         let id = resonance.particle_id.clone();
+        self.bindings.insert(id.clone(), static_key);
         if let Some(existing) = self.peers.get(&id) {
             for address in &existing.resonance.addrs {
                 if !resonance.addrs.contains(address) {
@@ -78,6 +80,17 @@ impl Field {
     /// Removes a peer which disappeared from mDNS.
     pub fn remove(&mut self, id: &ParticleId) {
         self.peers.remove(id);
+    }
+
+    /// Returns the static key first authenticated for this particle ID.
+    pub fn binding(&self, id: &ParticleId) -> Option<[u8; 32]> {
+        self.bindings.get(id).copied()
+    }
+
+    /// Clears live peers and their process-lifetime static-key bindings.
+    pub fn clear(&mut self) {
+        self.peers.clear();
+        self.bindings.clear();
     }
 
     /// Returns cloned peer records matching a full or short particle ID.

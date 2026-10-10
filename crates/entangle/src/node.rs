@@ -14,7 +14,7 @@ use entangle_link::{
     LinkError, LinkHandler, LinkListener, PayloadReader, PeerInfo, SyncDecision, SyncOffer,
 };
 use entangle_resonance::{Advertisement, Resonance, ResonanceEvent, Resonator};
-use entangle_transport::LinkKeys;
+use entangle_transport::{KeySlot, LinkKeys};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{
@@ -34,6 +34,32 @@ use tracing::{debug, info, warn};
 const MIN_TIMEOUT_SECS: u64 = 5;
 const MAX_TIMEOUT_SECS: u64 = 3600;
 
+struct PartialTransferGuard {
+    directory: PathBuf,
+    armed: bool,
+}
+
+impl PartialTransferGuard {
+    fn new(directory: PathBuf) -> Self {
+        Self {
+            directory,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for PartialTransferGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = std::fs::remove_dir_all(&self.directory);
+        }
+    }
+}
+
 /// A single running Entangle process and its stateful local services.
 pub struct Particle {
     /// This process manifest.
@@ -41,13 +67,17 @@ pub struct Particle {
     field: Arc<RwLock<Field>>,
     options: Options,
     _identity: Identity,
-    pairing_group: Option<String>,
-    keys: Option<Arc<LinkKeys>>,
+    pairing_group: Arc<RwLock<Option<String>>>,
+    active_pairing_key: Arc<RwLock<Option<[u8; 32]>>>,
+    keys: KeySlot,
+    link_port_fallback: bool,
+    pairing_root: PathBuf,
     data_dir: PathBuf,
     resonator: Mutex<Option<Resonator>>,
     inbox: Mutex<Vec<InboxItem>>,
     notifications: Option<mpsc::Sender<Value>>,
     inbound_limit: Arc<Semaphore>,
+    shutdown: tokio::sync::watch::Sender<bool>,
 }
 
 struct SendPayload {
@@ -68,21 +98,25 @@ impl Particle {
         notifications: Option<mpsc::Sender<Value>>,
     ) -> Result<(Arc<Self>, Manifest)> {
         let root = options.data_root();
-        let identity = identity::claim(&root);
+        let identity = identity::claim(&root)?;
         let pairing_key = match pairing::load(&root) {
             Ok(key) => key,
+            Err(error @ pairing::PairingError::Io(_)) => {
+                return Err(error).context("could not load pairing key")
+            }
             Err(error) => {
                 warn!(%error, "pairing key is unavailable; starting unpaired");
                 None
             }
         };
-        let pairing_group = pairing_key.as_ref().map(pairing::group_id);
-        let keys = pairing_key.map(|key| {
+        let active_pairing_key = Arc::new(RwLock::new(pairing_key));
+        let pairing_group = Arc::new(RwLock::new(pairing_key.as_ref().map(pairing::group_id)));
+        let keys: KeySlot = Arc::new(RwLock::new(pairing_key.map(|key| {
             Arc::new(LinkKeys {
                 static_private: identity.static_private,
                 psk: pairing::derive_psk(&key),
             })
-        });
+        })));
         let particle_id = identity.id.clone();
         let name = options.particle_name(&particle_id);
         let data_dir = root.join(particle_id.short());
@@ -90,30 +124,23 @@ impl Particle {
         tokio::fs::create_dir_all(&inbox_dir).await?;
         tokio::fs::create_dir_all(data_dir.join("outbox")).await?;
         let persisted_inbox = inbox::load(&inbox_dir).await;
-        let (listener, link_port) = if keys.is_some() {
-            let (listener, link_port) = match LinkListener::bind(SocketAddr::from((
-                [0, 0, 0, 0],
-                options.link_port,
-            )))
-            .await
-            {
-                Ok(bound) => bound,
-                Err(LinkError::Io(error)) if error.kind() == std::io::ErrorKind::AddrInUse => {
-                    warn!(
-                        configured_port = options.link_port,
-                        "configured link port is occupied; using an ephemeral port; static --peer entries pointing at this machine need the new port"
-                    );
-                    LinkListener::bind(SocketAddr::from(([0, 0, 0, 0], 0)))
-                        .await
-                        .context("could not bind Entangle TCP link listener")?
-                }
-                Err(error) => {
-                    return Err(error).context("could not bind Entangle TCP link listener")
-                }
-            };
-            (Some(listener), link_port)
-        } else {
-            (None, options.link_port)
+        let (listener, link_port, link_port_fallback) = match LinkListener::bind(SocketAddr::from(
+            ([0, 0, 0, 0], options.link_port),
+        ))
+        .await
+        {
+            Ok((listener, port)) => (listener, port, false),
+            Err(LinkError::Io(error)) if error.kind() == std::io::ErrorKind::AddrInUse => {
+                warn!(
+                    configured_port = options.link_port,
+                    "configured link port is occupied; using an ephemeral port; static --peer entries pointing at this machine need the new port"
+                );
+                let (listener, port) = LinkListener::bind(SocketAddr::from(([0, 0, 0, 0], 0)))
+                    .await
+                    .context("could not bind Entangle TCP link listener")?;
+                (listener, port, true)
+            }
+            Err(error) => return Err(error).context("could not bind Entangle TCP link listener"),
         };
         let manifest = Manifest {
             particle_id: particle_id.clone(),
@@ -131,83 +158,30 @@ impl Particle {
             max_payload_bytes: options.max_payload_mb.saturating_mul(1024 * 1024),
         };
         let field = Arc::new(RwLock::new(Field::default()));
-        let resonator = if options.no_mdns {
-            None
-        } else {
-            Some(Resonator::start(Advertisement {
-                particle_id,
-                name,
-                port: link_port,
-                context: options.context.clone(),
-                group: pairing_group.clone(),
-                version: env!("CARGO_PKG_VERSION").into(),
-            })?)
-        };
-        let (resonator, events) = match resonator {
-            Some((daemon, events)) => (Some(daemon), Some(events)),
-            None => (None, None),
-        };
+        let (shutdown, _) = tokio::sync::watch::channel(false);
         let particle = Arc::new(Self {
             manifest: manifest.clone(),
             field,
             options,
             _identity: identity,
             pairing_group,
+            active_pairing_key,
             keys: keys.clone(),
+            link_port_fallback,
+            pairing_root: root,
             data_dir,
-            resonator: Mutex::new(resonator),
+            resonator: Mutex::new(None),
             inbox: Mutex::new(persisted_inbox),
             notifications,
             inbound_limit: Arc::new(Semaphore::new(4)),
+            shutdown,
         });
-        if let (Some(listener), Some(keys)) = (listener, keys) {
-            tokio::spawn(listener.run(keys, particle.clone()));
-        }
-        if let Some(mut events) = events {
-            let peer_node = particle.clone();
-            tokio::spawn(async move {
-                while let Some(event) = events.recv().await {
-                    match event {
-                        ResonanceEvent::Detected(peer) => peer_node.on_detected(peer).await,
-                        ResonanceEvent::Lost(id) => {
-                            peer_node.field.write().expect("field lock").remove(&id);
-                            info!("peer resonance lost: {}", id.short());
-                        }
-                    }
-                }
-            });
-        }
+        particle.restart_resonator().await?;
+        tokio::spawn(listener.run(particle.keys.clone(), particle.clone()));
+        let pairing_node = particle.clone();
+        tokio::spawn(async move { pairing_node.pairing_watch().await });
         let static_node = particle.clone();
-        tokio::spawn(async move {
-            if static_node.keys.is_none() {
-                return;
-            }
-            let mut interval = tokio::time::interval(Duration::from_secs(30));
-            loop {
-                interval.tick().await;
-                for peer in &static_node.options.peer {
-                    if let Ok(addresses) = lookup_host(peer).await {
-                        for address in addresses {
-                            if static_node
-                                .field
-                                .read()
-                                .expect("field lock")
-                                .all()
-                                .iter()
-                                .any(|entry| {
-                                    entry.state == PeerState::Entangled
-                                        && entry.resonance.addrs.contains(&address.ip())
-                                        && entry.resonance.port == address.port()
-                                })
-                            {
-                                continue;
-                            }
-                            static_node.dial(address, None).await;
-                        }
-                    }
-                }
-            }
-        });
+        tokio::spawn(async move { static_node.static_peer_loop().await });
         info!(
             "particle identity: id={} name={} status={}",
             particle.manifest.particle_id.as_str(),
@@ -218,7 +192,7 @@ impl Particle {
                 "ephemeral"
             }
         );
-        if particle.keys.is_none() {
+        if particle.keys.read().expect("key slot lock").is_none() {
             info!("particle is unpaired; encrypted links are disabled");
         } else if !particle.options.no_mdns {
             info!(
@@ -233,7 +207,179 @@ impl Particle {
                 link_port
             );
         }
+        if let Some(warning) = particle.identity_warning() {
+            warn!("{warning}");
+        }
         Ok((particle, manifest))
+    }
+
+    fn identity_warning(&self) -> Option<String> {
+        let ephemeral = !self._identity.persistent;
+        if !ephemeral && !self.link_port_fallback {
+            return None;
+        }
+        let identity = if ephemeral { "ephemeral" } else { "persistent" };
+        let reason = match (ephemeral, self.link_port_fallback) {
+            (true, true) => "as a temporary particle using a fallback link port",
+            (true, false) => "as a temporary particle",
+            (false, true) => "using a fallback link port",
+            (false, false) => unreachable!(),
+        };
+        Some(format!(
+            "Another Entangle process on this machine holds the saved identity and/or port {}. This node is running {reason} (identity: {identity}; link port: {}). Close the other MCP client or old Entangle process, then reload.",
+            self.options.link_port, self.manifest.link_port
+        ))
+    }
+
+    fn advertisement(&self) -> Advertisement {
+        Advertisement {
+            particle_id: self.manifest.particle_id.clone(),
+            name: self.manifest.name.clone(),
+            port: self.manifest.link_port,
+            context: self.manifest.context.clone(),
+            group: self
+                .pairing_group
+                .read()
+                .expect("pairing group lock")
+                .clone(),
+            version: self.manifest.version.clone(),
+        }
+    }
+
+    async fn restart_resonator(self: &Arc<Self>) -> anyhow::Result<()> {
+        let mut resonator = self.resonator.lock().await;
+        if let Some(previous) = resonator.take() {
+            let _ = previous.shutdown();
+        }
+        if self.options.no_mdns {
+            return Ok(());
+        }
+        let (next, events) = Resonator::start(self.advertisement())?;
+        *resonator = Some(next);
+        drop(resonator);
+        self.spawn_resonance_events(events);
+        Ok(())
+    }
+
+    fn spawn_resonance_events(
+        self: &Arc<Self>,
+        mut events: tokio::sync::mpsc::Receiver<ResonanceEvent>,
+    ) {
+        let node = Arc::clone(self);
+        tokio::spawn(async move {
+            while let Some(event) = events.recv().await {
+                match event {
+                    ResonanceEvent::Detected(peer) => node.on_detected(peer).await,
+                    ResonanceEvent::Lost(id) => {
+                        node.field.write().expect("field lock").remove(&id);
+                        info!("peer resonance lost: {}", id.short());
+                    }
+                }
+            }
+        });
+    }
+
+    async fn pairing_watch(self: Arc<Self>) {
+        let mut shutdown = self.shutdown.subscribe();
+        let mut interval = tokio::time::interval(Duration::from_secs(2));
+        let mut unavailable_logged = false;
+        loop {
+            tokio::select! {
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
+                        break;
+                    }
+                }
+                _ = interval.tick() => {}
+            }
+            match pairing::load(&self.pairing_root) {
+                Ok(Some(key)) => {
+                    unavailable_logged = false;
+                    let current = self
+                        .active_pairing_key
+                        .read()
+                        .expect("pairing key lock")
+                        .to_owned();
+                    if current == Some(key) {
+                        continue;
+                    }
+                    if current.is_some() {
+                        warn!("pairing key changed; dropping entangled peers and refreshing discovery");
+                    }
+                    let psk = pairing::derive_psk(&key);
+                    *self.active_pairing_key.write().expect("pairing key lock") = Some(key);
+                    *self.keys.write().expect("key slot lock") = Some(Arc::new(LinkKeys {
+                        static_private: self._identity.static_private,
+                        psk,
+                    }));
+                    *self.pairing_group.write().expect("pairing group lock") =
+                        Some(pairing::group_id(&key));
+                    self.field.write().expect("field lock").clear();
+                    if let Err(error) = self.restart_resonator().await {
+                        warn!(%error, "unable to restart mDNS after pairing changed");
+                    }
+                    self.dial_static_peers().await;
+                }
+                Ok(None) => {
+                    let paired = self.keys.read().expect("key slot lock").is_some();
+                    if paired && !unavailable_logged {
+                        warn!("pairing.key was removed; keeping the active pairing");
+                        unavailable_logged = true;
+                    }
+                    if !paired {
+                        unavailable_logged = false;
+                    }
+                }
+                Err(error) => {
+                    if !unavailable_logged {
+                        warn!(%error, "pairing key is unavailable; keeping the active pairing");
+                        unavailable_logged = true;
+                    }
+                }
+            }
+        }
+    }
+
+    async fn static_peer_loop(self: Arc<Self>) {
+        let mut shutdown = self.shutdown.subscribe();
+        let mut interval = tokio::time::interval(Duration::from_secs(30));
+        loop {
+            tokio::select! {
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
+                        break;
+                    }
+                }
+                _ = interval.tick() => self.dial_static_peers().await,
+            }
+        }
+    }
+
+    async fn dial_static_peers(&self) {
+        if self.keys.read().expect("key slot lock").is_none() {
+            return;
+        }
+        for peer in &self.options.peer {
+            if let Ok(addresses) = lookup_host(peer).await {
+                for address in addresses {
+                    if self
+                        .field
+                        .read()
+                        .expect("field lock")
+                        .all()
+                        .iter()
+                        .any(|entry| {
+                            entry.state == PeerState::Entangled
+                                && entry.resonance.addrs.contains(&address.ip())
+                                && entry.resonance.port == address.port()
+                        })
+                    {
+                        continue;
+                    }
+                    self.dial(address, None).await;
+                }
+            }
+        }
     }
 
     /// Waits for Ctrl-C, used by the headless node command.
@@ -243,6 +389,7 @@ impl Particle {
 
     /// Unregisters this particle from mDNS.
     pub async fn shutdown(&self) {
+        let _ = self.shutdown.send(true);
         if let Some(resonator) = self.resonator.lock().await.take() {
             let _ = resonator.shutdown();
         }
@@ -256,9 +403,24 @@ impl Particle {
             .and_then(Value::as_bool)
             .unwrap_or(false);
         let mut local = serde_json::to_value(&self.manifest).expect("manifest serializes");
-        local["paired"] = json!(self.pairing_group.is_some());
-        local["pairing_group"] = json!(self.pairing_group);
-        if self.pairing_group.is_none() {
+        let paired = self.keys.read().expect("key slot lock").is_some();
+        let pairing_group = self
+            .pairing_group
+            .read()
+            .expect("pairing group lock")
+            .clone();
+        local["paired"] = json!(paired);
+        local["pairing_group"] = json!(pairing_group);
+        local["identity"] = json!(if self._identity.persistent {
+            "persistent"
+        } else {
+            "ephemeral"
+        });
+        local["link_port_fallback"] = json!(self.link_port_fallback);
+        if let Some(warning) = self.identity_warning() {
+            local["warning"] = json!(warning);
+        }
+        if !paired {
             local["hint"] = json!("Not paired: the human must run `entangle pair init` on one machine and `entangle pair join` on the others.");
         }
         json!({
@@ -329,7 +491,7 @@ impl Particle {
 
     /// Sends a JSON or file payload to an already-entangled peer.
     pub async fn sync_state(&self, args: Value) -> Result<Value, String> {
-        if self.keys.is_none() {
+        if self.keys.read().expect("key slot lock").is_none() {
             return Err(
                 "this particle is unpaired; pair it with a human-provided code first".into(),
             );
@@ -459,13 +621,12 @@ impl Particle {
         let socket = SocketAddr::new(peer_addr, peer.resonance.port);
         let label = args.get("label").and_then(Value::as_str).map(str::to_owned);
         let started = std::time::Instant::now();
-        let keys = self.keys.as_ref().expect("paired check above");
         let source = tokio::fs::File::open(&path)
             .await
             .map_err(|error| error.to_string())?;
         let result = entangle_link::offer(
             socket,
-            keys,
+            self.keys.clone(),
             SyncOffer {
                 from: self.manifest.particle_id.clone(),
                 sync_id: sync_id.clone(),
@@ -512,10 +673,15 @@ impl Particle {
             .write()
             .expect("field lock")
             .resonate(peer.clone());
-        let Some(group) = self.pairing_group.as_deref() else {
+        let Some(group) = self
+            .pairing_group
+            .read()
+            .expect("pairing group lock")
+            .clone()
+        else {
             return;
         };
-        if peer.group.as_deref() != Some(group) {
+        if peer.group.as_ref() != Some(&group) {
             return;
         }
         for address in &peer.addrs {
@@ -532,10 +698,16 @@ impl Particle {
     }
 
     async fn dial(&self, address: SocketAddr, discovery: Option<Resonance>) -> bool {
-        let Some(keys) = &self.keys else {
+        if self.keys.read().expect("key slot lock").is_none() {
             return false;
-        };
-        match entangle_link::handshake(address, keys, &self.manifest, Duration::from_secs(5)).await
+        }
+        match entangle_link::handshake(
+            address,
+            self.keys.clone(),
+            &self.manifest,
+            Duration::from_secs(5),
+        )
+        .await
         {
             Ok((manifest, remote_static)) if manifest.protocol == PROTOCOL_VERSION => {
                 if manifest.particle_id == self.manifest.particle_id {
@@ -545,10 +717,8 @@ impl Particle {
                     .field
                     .read()
                     .expect("field lock")
-                    .by_id(&manifest.particle_id)
-                    .is_some_and(|peer| {
-                        peer.state == PeerState::Entangled && peer.static_key != Some(remote_static)
-                    })
+                    .binding(&manifest.particle_id)
+                    .is_some_and(|bound_key| bound_key != remote_static)
                 {
                     warn!(
                         particle_id = %manifest.particle_id,
@@ -609,7 +779,7 @@ impl Particle {
                 .map_err(|_| "peer field lock poisoned".to_owned())?;
             let peer = field.by_id(&offer.from).filter(|peer| {
                 peer.state == PeerState::Entangled
-                    && peer.static_key == Some(peer_info.remote_static)
+                    && field.binding(&offer.from) == Some(peer_info.remote_static)
             });
             if peer.is_some() {
                 field.touch(&offer.from);
@@ -642,6 +812,7 @@ impl Particle {
         tokio::fs::create_dir_all(&directory)
             .await
             .map_err(|e| e.to_string())?;
+        let mut cleanup = PartialTransferGuard::new(directory.clone());
         let result: Result<String, String> = async {
             let path = directory.join(&name);
             let mut file = tokio::fs::File::create(&path)
@@ -692,12 +863,13 @@ impl Particle {
                 path: (offer.kind == StateKind::File).then_some(path),
                 text,
             };
-            if let Err(error) = inbox::persist(&self.data_dir.join("inbox"), &item).await {
-                warn!(
+            match inbox::persist(&self.data_dir.join("inbox"), &item).await {
+                Ok(()) => cleanup.disarm(),
+                Err(error) => warn!(
                     sync_id = %item.sync_id,
                     error = %error,
                     "unable to persist received inbox metadata"
-                );
+                ),
             }
             self.inbox.lock().await.push(item);
             if let Some(notifications) = &self.notifications {
@@ -716,9 +888,6 @@ impl Particle {
             Ok(hash)
         }
         .await;
-        if result.is_err() {
-            let _ = tokio::fs::remove_dir_all(directory).await;
-        }
         result
     }
 }
@@ -738,11 +907,10 @@ impl LinkHandler for Particle {
         }
         if manifest.particle_id != self.manifest.particle_id {
             let mut field = self.field.write().expect("field lock");
-            let existing = field.by_id(&manifest.particle_id);
-            if existing.as_ref().is_some_and(|record| {
-                record.state == PeerState::Entangled
-                    && record.static_key != Some(peer.remote_static)
-            }) {
+            if field
+                .binding(&manifest.particle_id)
+                .is_some_and(|bound_key| bound_key != peer.remote_static)
+            {
                 warn!(
                     particle_id = %manifest.particle_id,
                     "rejecting a manifest that claims an entangled particle with a different Noise static key"
@@ -751,6 +919,7 @@ impl LinkHandler for Particle {
                     "particle is already entangled with a different Noise static key".into(),
                 ));
             }
+            let existing = field.by_id(&manifest.particle_id);
             let resonance = Resonance {
                 particle_id: manifest.particle_id.clone(),
                 name: manifest.name.clone(),
@@ -790,17 +959,20 @@ impl LinkHandler for Particle {
 
 impl Particle {
     fn validate_offer(&self, peer_info: &PeerInfo, offer: &SyncOffer) -> Result<(), String> {
+        if !is_valid_sync_id(&offer.sync_id) {
+            return Err("offered sync_id is malformed".to_owned());
+        }
         let mut field = self
             .field
             .write()
             .map_err(|_| "peer field lock poisoned".to_owned())?;
+        if field.binding(&offer.from) != Some(peer_info.remote_static) {
+            return Err("sender key does not match the entangled particle".into());
+        }
         let peer = field
             .by_id(&offer.from)
             .filter(|peer| peer.state == PeerState::Entangled)
             .ok_or_else(|| "sender is not entangled; handshake first".to_owned())?;
-        if peer.static_key != Some(peer_info.remote_static) {
-            return Err("sender key does not match the entangled particle".into());
-        }
         let source_ip = peer_info.addr.ip();
         if !peer.resonance.addrs.contains(&source_ip) {
             debug!(
@@ -910,7 +1082,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unpaired_particle_does_not_listen_or_dial() {
+    async fn unpaired_particle_listens_but_does_not_dial() {
         let temp = tempfile::tempdir().unwrap();
         let target = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
         target.set_nonblocking(true).unwrap();
@@ -929,9 +1101,9 @@ mod tests {
         .unwrap();
         tokio::time::sleep(Duration::from_millis(100)).await;
 
-        assert!(particle.keys.is_none());
+        assert!(particle.keys.read().unwrap().is_none());
         assert!(particle.field.read().unwrap().all().is_empty());
-        assert!(std::net::TcpStream::connect(("127.0.0.1", port)).is_err());
+        assert!(std::net::TcpStream::connect(("127.0.0.1", port)).is_ok());
         assert!(matches!(
             target.accept(),
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
@@ -1048,6 +1220,185 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unpaired_particle_reloads_pairing_and_entangles() {
+        let temp = tempfile::tempdir().unwrap();
+        let root_a = temp.path().join("a");
+        let root_b = temp.path().join("b");
+        let key = pairing::initialize(&root_b, false).unwrap();
+        let a_port = free_port();
+        let b_port = port_other_than(a_port);
+        let (a, _) = Particle::start(
+            options(
+                "unpaired-a",
+                a_port,
+                root_a.clone(),
+                Some(format!("127.0.0.1:{b_port}")),
+            ),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(a.find_particles(&json!({}))["self"]["paired"], false);
+        let (b, _) = Particle::start(
+            options(
+                "paired-b",
+                b_port,
+                root_b,
+                Some(format!("127.0.0.1:{a_port}")),
+            ),
+            None,
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(
+            root_a.join("pairing.key"),
+            format!("{}\n", hex::encode(key)),
+        )
+        .await
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let paired = a.find_particles(&json!({}))["self"]["paired"] == true;
+                let entangled = a
+                    .field
+                    .read()
+                    .unwrap()
+                    .by_id(&b.manifest.particle_id)
+                    .is_some_and(|peer| peer.state == PeerState::Entangled);
+                if paired && entangled {
+                    break;
+                }
+                sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("pairing reload should dial a static peer within five seconds");
+        a.shutdown().await;
+        b.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn timed_out_partial_transfer_removes_payload_and_metadata() {
+        let temp = tempfile::tempdir().unwrap();
+        let root_a = temp.path().join("a");
+        let root_b = temp.path().join("b");
+        let key = pairing::initialize(&root_a, false).unwrap();
+        std::fs::create_dir_all(&root_b).unwrap();
+        std::fs::write(
+            root_b.join("pairing.key"),
+            format!("{}\n", hex::encode(key)),
+        )
+        .unwrap();
+        let a_port = free_port();
+        let b_port = port_other_than(a_port);
+        let (a, _) = Particle::start(
+            options(
+                "sender",
+                a_port,
+                root_a,
+                Some(format!("127.0.0.1:{b_port}")),
+            ),
+            None,
+        )
+        .await
+        .unwrap();
+        let (b, _) = Particle::start(
+            options(
+                "receiver",
+                b_port,
+                root_b.clone(),
+                Some(format!("127.0.0.1:{a_port}")),
+            ),
+            None,
+        )
+        .await
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let a_connected = a
+                    .field
+                    .read()
+                    .unwrap()
+                    .by_id(&b.manifest.particle_id)
+                    .is_some_and(|peer| peer.state == PeerState::Entangled);
+                let b_connected = b
+                    .field
+                    .read()
+                    .unwrap()
+                    .by_id(&a.manifest.particle_id)
+                    .is_some_and(|peer| peer.state == PeerState::Entangled);
+                if a_connected && b_connected {
+                    break;
+                }
+                sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        let sync_id = "fedcba9876543210fedcba9876543210";
+        let keys = a.keys.read().unwrap().clone().unwrap();
+        let mut stream = entangle_transport::connect(
+            SocketAddr::from(([127, 0, 0, 1], b_port)),
+            &keys,
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+        let frame = entangle_link::Frame::SyncOffer {
+            from: a.manifest.particle_id.clone(),
+            sync_id: sync_id.into(),
+            timeout_secs: 5,
+            kind: StateKind::File,
+            name: "partial.bin".into(),
+            size: 100,
+            sha256: "00".repeat(32),
+            label: None,
+        };
+        stream
+            .send(&serde_json::to_vec(&frame).unwrap())
+            .await
+            .unwrap();
+        let accepted = stream.recv(Duration::from_secs(2)).await.unwrap();
+        assert!(matches!(
+            serde_json::from_slice::<entangle_link::Frame>(&accepted).unwrap(),
+            entangle_link::Frame::SyncAccept { .. }
+        ));
+        stream.send(b"partial").await.unwrap();
+        sleep(Duration::from_secs(6)).await;
+        let inbox_dir = root_b.join(b.manifest.particle_id.short()).join("inbox");
+        assert!(!inbox_dir.join(sync_id).exists());
+        assert!(!inbox_dir.join(format!("{sync_id}.json")).exists());
+        a.shutdown().await;
+        b.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn concurrent_particle_reports_ephemeral_identity_and_port_fallback() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("shared");
+        let port = free_port();
+        let (first, _) = Particle::start(options("first", port, root.clone(), None), None)
+            .await
+            .unwrap();
+        let (second, manifest) = Particle::start(options("second", port, root, None), None)
+            .await
+            .unwrap();
+
+        let local = second.find_particles(&json!({}))["self"].clone();
+        assert_eq!(local["identity"], "ephemeral");
+        assert_eq!(local["link_port_fallback"], true);
+        assert_ne!(manifest.link_port, port);
+        assert!(local["warning"]
+            .as_str()
+            .is_some_and(|warning| warning.contains("temporary particle")));
+        assert!(local["hint"].is_string());
+
+        first.shutdown().await;
+        second.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn different_pairing_keys_cannot_handshake() {
         let temp = tempfile::tempdir().unwrap();
         let root_a = temp.path().join("a");
@@ -1089,7 +1440,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn offer_claiming_an_entangled_identity_with_another_key_is_rejected() {
+    async fn lost_peer_binding_rejects_hello_and_offer_from_another_key() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("node");
         pairing::initialize(&root, false).unwrap();
@@ -1105,7 +1456,7 @@ mod tests {
             addrs: vec!["127.0.0.1".parse().unwrap()],
             port: manifest.link_port,
             context: None,
-            group: particle.pairing_group.clone(),
+            group: particle.pairing_group.read().unwrap().clone(),
             proto: manifest.protocol,
         };
         particle
@@ -1113,6 +1464,33 @@ mod tests {
             .write()
             .unwrap()
             .entangle(resonance, manifest.clone(), [0x11; 32]);
+        let invalid_offer = SyncOffer {
+            from: id.clone(),
+            sync_id: "../x".into(),
+            timeout_secs: 60,
+            kind: StateKind::Json,
+            name: "payload.json".into(),
+            size: 0,
+            sha256: hex::encode(Sha256::digest([])),
+            label: None,
+        };
+        let matching_peer = PeerInfo {
+            addr: SocketAddr::from(([127, 0, 0, 1], 7337)),
+            remote_static: [0x11; 32],
+        };
+        let decision = particle
+            .on_offer(&matching_peer, invalid_offer)
+            .await
+            .unwrap();
+        assert!(matches!(
+            decision,
+            SyncDecision::Reject(reason) if reason.contains("sync_id is malformed")
+        ));
+        particle.field.write().unwrap().remove(&id);
+        assert_eq!(
+            particle.field.read().unwrap().binding(&id),
+            Some([0x11; 32])
+        );
         let hello_error = particle
             .on_hello(
                 &PeerInfo {

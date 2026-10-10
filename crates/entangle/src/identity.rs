@@ -18,14 +18,14 @@ pub struct Identity {
 }
 
 /// Claims the persistent identity for a data root, or generates an ephemeral one.
-pub fn claim(root: &Path) -> Identity {
+pub fn claim(root: &Path) -> std::io::Result<Identity> {
     if let Err(error) = fs::create_dir_all(root) {
         warn!(
             path = %root.display(),
             %error,
             "could not create identity data directory; using an ephemeral identity"
         );
-        return ephemeral();
+        return Ok(ephemeral());
     }
 
     let lock_path = root.join("identity.lock");
@@ -43,7 +43,7 @@ pub fn claim(root: &Path) -> Identity {
                 %error,
                 "could not open identity lock; using an ephemeral identity"
             );
-            return ephemeral();
+            return Ok(ephemeral());
         }
     };
 
@@ -60,7 +60,7 @@ pub fn claim(root: &Path) -> Identity {
                 "could not lock identity; using an ephemeral identity"
             );
         }
-        return ephemeral();
+        return Ok(ephemeral());
     }
 
     let identity_path = root.join("identity");
@@ -80,7 +80,7 @@ pub fn claim(root: &Path) -> Identity {
                 %error,
                 "could not read identity; using an ephemeral identity"
             );
-            return ephemeral();
+            return Ok(ephemeral());
         }
     }
 
@@ -99,19 +99,19 @@ pub fn claim(root: &Path) -> Identity {
             %error,
             "could not persist identity; using an ephemeral identity"
         );
-        return ephemeral();
+        return Ok(ephemeral());
     }
 
     persistent(id, lock, root)
 }
 
-fn persistent(id: ParticleId, lock: File, root: &Path) -> Identity {
-    Identity {
+fn persistent(id: ParticleId, lock: File, root: &Path) -> std::io::Result<Identity> {
+    Ok(Identity {
         id,
         persistent: true,
-        static_private: load_or_create_static(root),
+        static_private: load_or_create_static(root)?,
         _lock: Some(lock),
-    }
+    })
 }
 
 fn ephemeral() -> Identity {
@@ -123,8 +123,14 @@ fn ephemeral() -> Identity {
     }
 }
 
-fn load_or_create_static(root: &Path) -> [u8; 32] {
+fn load_or_create_static(root: &Path) -> std::io::Result<[u8; 32]> {
     let path = root.join("noise_static.key");
+    #[cfg(unix)]
+    match fs::metadata(&path) {
+        Ok(_) => repair_permissions(&path)?,
+        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
     match fs::read_to_string(&path) {
         Ok(contents) => {
             if contents.len() == 64
@@ -134,7 +140,7 @@ fn load_or_create_static(root: &Path) -> [u8; 32] {
             {
                 if let Ok(bytes) = hex::decode(contents) {
                     if let Ok(key) = <[u8; 32]>::try_from(bytes) {
-                        return key;
+                        return Ok(key);
                     }
                 }
             }
@@ -161,7 +167,18 @@ fn load_or_create_static(root: &Path) -> [u8; 32] {
             "could not persist Noise static key; using it for this process only"
         );
     }
-    key
+    Ok(key)
+}
+
+#[cfg(unix)]
+fn repair_permissions(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    if fs::metadata(path)?.permissions().mode() & 0o077 != 0 {
+        warn!(path = %path.display(), "repairing Noise static key permissions to 0600");
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
 }
 
 fn persist_static(path: &Path, key: &[u8; 32]) -> std::io::Result<()> {
@@ -195,7 +212,7 @@ mod tests {
     #[test]
     fn identity_is_persistent_across_claims() {
         let temp = tempfile::tempdir().unwrap();
-        let first = claim(temp.path());
+        let first = claim(temp.path()).unwrap();
         assert!(first.persistent);
         let id = first.id.clone();
         assert_eq!(
@@ -206,7 +223,7 @@ mod tests {
         );
 
         drop(first);
-        let second = claim(temp.path());
+        let second = claim(temp.path()).unwrap();
         assert!(second.persistent);
         assert_eq!(second.id, id);
     }
@@ -214,7 +231,7 @@ mod tests {
     #[test]
     fn noise_static_key_persists_across_claims() {
         let temp = tempfile::tempdir().unwrap();
-        let first = claim(temp.path());
+        let first = claim(temp.path()).unwrap();
         let key = first.static_private;
         let key_text = fs::read_to_string(temp.path().join("noise_static.key")).unwrap();
         assert_eq!(key_text.len(), 64);
@@ -223,7 +240,7 @@ mod tests {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)));
         drop(first);
 
-        let second = claim(temp.path());
+        let second = claim(temp.path()).unwrap();
         assert_eq!(second.static_private, key);
     }
 
@@ -233,7 +250,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let temp = tempfile::tempdir().unwrap();
-        let _identity = claim(temp.path());
+        let _identity = claim(temp.path()).unwrap();
         let mode = fs::metadata(temp.path().join("noise_static.key"))
             .unwrap()
             .permissions()
@@ -242,11 +259,31 @@ mod tests {
         assert_eq!(mode, 0o600);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn loading_noise_static_key_repairs_permissive_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let original = claim(temp.path()).unwrap();
+        let key = original.static_private;
+        drop(original);
+        let path = temp.path().join("noise_static.key");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+
+        let loaded = claim(temp.path()).unwrap();
+        assert_eq!(loaded.static_private, key);
+        assert_eq!(
+            fs::metadata(path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
     #[test]
     fn malformed_noise_static_key_is_regenerated() {
         let temp = tempfile::tempdir().unwrap();
         fs::write(temp.path().join("noise_static.key"), "broken").unwrap();
-        let identity = claim(temp.path());
+        let identity = claim(temp.path()).unwrap();
         let persisted = fs::read_to_string(temp.path().join("noise_static.key")).unwrap();
         assert_eq!(persisted.len(), 64);
         assert_eq!(hex::decode(persisted).unwrap(), identity.static_private);
@@ -255,12 +292,12 @@ mod tests {
     #[test]
     fn concurrent_claim_uses_an_ephemeral_identity_without_changing_file() {
         let temp = tempfile::tempdir().unwrap();
-        let first = claim(temp.path());
+        let first = claim(temp.path()).unwrap();
         assert!(first.persistent);
         let identity_path = temp.path().join("identity");
         let original_contents = fs::read_to_string(&identity_path).unwrap();
 
-        let second = claim(temp.path());
+        let second = claim(temp.path()).unwrap();
         assert!(!second.persistent);
         assert_ne!(second.id, first.id);
         assert_eq!(
@@ -275,7 +312,7 @@ mod tests {
         let identity_path = temp.path().join("identity");
         fs::write(&identity_path, "nope").unwrap();
 
-        let identity = claim(temp.path());
+        let identity = claim(temp.path()).unwrap();
         assert!(identity.persistent);
         assert_ne!(identity.id.as_str(), "nope");
         assert_eq!(

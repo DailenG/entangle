@@ -8,6 +8,8 @@ use std::{
     path::{Path, PathBuf},
 };
 use thiserror::Error;
+#[cfg(unix)]
+use tracing::warn;
 
 const GROUP_DOMAIN: &[u8] = b"entangle-pair-group-v1";
 const PSK_DOMAIN: &[u8] = b"entangle-pair-psk-v1";
@@ -121,6 +123,12 @@ fn key_path(data_root: &Path) -> PathBuf {
 }
 
 fn read_key(path: &Path) -> Result<Option<[u8; 32]>, PairingError> {
+    #[cfg(unix)]
+    match fs::metadata(path) {
+        Ok(_) => repair_permissions(path)?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
     let contents = match fs::read_to_string(path) {
         Ok(contents) => contents,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -135,6 +143,17 @@ fn read_key(path: &Path) -> Result<Option<[u8; 32]>, PairingError> {
         key[index] = (hex_value(pair[0])? << 4) | hex_value(pair[1])?;
     }
     Ok(Some(key))
+}
+
+#[cfg(unix)]
+fn repair_permissions(path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    if fs::metadata(path)?.permissions().mode() & 0o077 != 0 {
+        warn!(path = %path.display(), "repairing pairing key permissions to 0600");
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
 }
 
 fn write_key(path: &Path, key: &[u8; 32]) -> Result<(), PairingError> {
@@ -287,5 +306,22 @@ mod tests {
                 0o600
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn loading_pairing_key_repairs_permissive_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempdir().unwrap();
+        let key = initialize(directory.path(), false).unwrap();
+        let path = key_path(directory.path());
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+
+        assert_eq!(load(directory.path()).unwrap(), Some(key));
+        assert_eq!(
+            fs::metadata(path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
     }
 }
