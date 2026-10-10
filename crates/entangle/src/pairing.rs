@@ -131,7 +131,7 @@ fn read_key(path: &Path) -> Result<Option<[u8; 32]>, PairingError> {
         return Err(PairingError::MalformedKey);
     }
     let mut key = [0_u8; 32];
-    for (index, pair) in contents.as_bytes().chunks_exact(2).enumerate() {
+    for (index, pair) in contents.as_bytes().as_chunks::<2>().0.iter().enumerate() {
         key[index] = (hex_value(pair[0])? << 4) | hex_value(pair[1])?;
     }
     Ok(Some(key))
