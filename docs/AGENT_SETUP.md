@@ -9,6 +9,13 @@ using `sudo`, installing system packages, changing firewall rules, or editing
 a configuration file you did not create; show them the proposed diff first.
 Never request or repeat a pairing code.
 
+### Running commands on Windows
+
+On Windows, write each command or check to a temporary `.ps1` file, run it
+with `powershell.exe -NoProfile -ExecutionPolicy Bypass -File <path>`, then
+delete the file. Never pass inline `-Command` strings: the outer shell (often
+bash in omp) can mangle quotes and `$` variables.
+
 **Verify:** You understand the goal and ground rules before making changes.
 
 **If this fails:** Ask the human to clarify the goal or any ground rule before
@@ -24,7 +31,7 @@ proceeding.
    command -v entangle || true
    ```
 
-   On Windows PowerShell:
+   On Windows PowerShell, run these via a temporary `.ps1` script:
 
    ```powershell
    Get-CimInstance Win32_OperatingSystem | Select-Object Caption, OSArchitecture
@@ -50,7 +57,8 @@ proceeding.
    release (v0.1.0+).
    Wait for the human's approval before running either command.
 
-   On Windows PowerShell:
+   On Windows PowerShell, after the human approves, run this via a temporary
+   `.ps1` script:
 
    ```powershell
    irm https://raw.githubusercontent.com/DailenG/entangle/main/install.ps1 | iex
@@ -143,6 +151,8 @@ to the human. Never kill or stop processes to resolve it.
    sudo ufw allow 5353/udp
    ```
 
+   With the human's approval, run these via a temporary `.ps1` script:
+
    ```powershell
    New-NetFirewallRule -DisplayName "Entangle link" -Direction Inbound -Protocol TCP -LocalPort 7337 -Action Allow
    New-NetFirewallRule -DisplayName "Entangle mDNS" -Direction Inbound -Protocol UDP -LocalPort 5353 -Action Allow
@@ -163,9 +173,10 @@ to the human. Never kill or stop processes to resolve it.
 5. **Find Entangle's absolute path and register it in the MCP client you
    identified above.** GUI applications may not inherit your shell's `PATH`.
    On Linux/macOS, obtain the path with `command -v entangle`; on Windows,
-   obtain it with `(Get-Command entangle).Source`. Use that absolute path in
-   the `command` field below. Replace the example context with the value
-   approved by the human, or omit it if no shared context is needed.
+   obtain it with `(Get-Command entangle).Source` via a temporary `.ps1`
+   script. Use that absolute path in the `command` field below. Replace the
+   example context with the value approved by the human, or omit it if no
+   shared context is needed.
 
    **Claude Desktop** (`claude_desktop_config.json`):
 
