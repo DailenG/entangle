@@ -28,8 +28,7 @@ The installer requires no administrator or `sudo` rights. macOS/Linux installs
 into `$HOME/.local/bin` by default and prints a PATH hint if needed. Windows
 installs into `%LOCALAPPDATA%\Programs\entangle\bin` and adds that directory
 to the current user's PATH only. Prebuilt downloads support Linux x86_64 and
-aarch64, macOS Intel and Apple silicon, and Windows x86_64 (including ARM64
-through x64 emulation).
+aarch64, macOS Intel and Apple silicon, and Windows x86_64.
 
 Configure the installers with these environment variables:
 
