@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::{fmt, path::Path};
 
 /// Current version of the Entangle control protocol.
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// A process-unique particle identity rendered as 32 lowercase hexadecimal digits.
 #[derive(Clone, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
@@ -100,27 +100,6 @@ pub struct Manifest {
     pub max_payload_bytes: u64,
 }
 
-/// Connection information for a local croc relay.
-#[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
-pub struct RelayTicket {
-    /// Hostname or IP address reachable by the peer.
-    pub host: String,
-    /// Relay base port.
-    pub port: u16,
-    /// Relay password.
-    pub password: String,
-}
-
-impl fmt::Debug for RelayTicket {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("RelayTicket")
-            .field("host", &self.host)
-            .field("port", &self.port)
-            .field("password", &"[REDACTED]")
-            .finish()
-    }
-}
-
 /// Returns whether `id` is a 32-character lowercase hexadecimal sync ID.
 pub fn is_valid_sync_id(id: &str) -> bool {
     id.len() == 32
@@ -149,7 +128,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn manifest_and_ticket_roundtrip() {
+    fn manifest_roundtrip() {
         let id = ParticleId::generate();
         let manifest = Manifest {
             particle_id: id,
@@ -164,16 +143,6 @@ mod tests {
         };
         let json = serde_json::to_string(&manifest).unwrap();
         assert_eq!(serde_json::from_str::<Manifest>(&json).unwrap(), manifest);
-        let ticket = RelayTicket {
-            host: "127.0.0.1".into(),
-            port: 9109,
-            password: "secret".into(),
-        };
-        assert_eq!(
-            serde_json::from_str::<RelayTicket>(&serde_json::to_string(&ticket).unwrap()).unwrap(),
-            ticket
-        );
-        assert!(!format!("{ticket:?}").contains("secret"));
     }
 
     #[test]

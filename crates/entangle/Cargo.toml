@@ -17,8 +17,10 @@ anyhow.workspace = true
 chrono.workspace = true
 clap.workspace = true
 dirs.workspace = true
+data-encoding.workspace = true
 gethostname.workspace = true
 hex.workspace = true
+rand.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
@@ -26,6 +28,7 @@ tokio = { workspace = true, features = ["full"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true
 uuid.workspace = true
+thiserror.workspace = true
 
 [dev-dependencies]
 tempfile = "3.0"

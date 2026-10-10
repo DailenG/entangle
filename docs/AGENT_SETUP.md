@@ -3,12 +3,11 @@
 ## 0. Start here
 
 If you are an AI agent reading this, here's what you need to do. The goal is to
-have `entangle` and `croc` on `PATH`, Entangle registered as an MCP server in
-your own MCP client configuration, and `entangle scan` finding the other
-machine. Ask the human before using `sudo`, installing system packages,
-changing firewall rules, or editing a configuration file you did not create;
-show them the proposed diff first. Never send secrets or croc codes anywhere,
-and never use the public croc relay.
+have `entangle` on `PATH`, Entangle registered as an MCP server in your own MCP
+client configuration, and its paired peer discoverable. Ask the human before
+using `sudo`, installing system packages, changing firewall rules, or editing
+a configuration file you did not create; show them the proposed diff first.
+Never request or repeat a pairing code.
 
 **Verify:** You understand the goal and ground rules before making changes.
 
@@ -23,14 +22,13 @@ proceeding.
    uname -s
    uname -m
    command -v entangle || true
-   command -v croc || true
    ```
 
    On Windows PowerShell:
 
    ```powershell
    Get-CimInstance Win32_OperatingSystem | Select-Object Caption, OSArchitecture
-   Get-Command entangle,croc -ErrorAction SilentlyContinue
+   Get-Command entangle -ErrorAction SilentlyContinue
    ```
 
    Identify whether this agent is running through Claude Desktop, Claude Code,
@@ -43,14 +41,13 @@ proceeding.
    **If this fails:** Ask the human which client is hosting you and what
    operating system this machine uses.
 
-## 2. Install Entangle and croc
+## 2. Install Entangle
 
 2. **Explain the installer and ask the human before running it.** The
-   prebuilt installer downloads Entangle and, if no croc version 10 or newer
-   is available on `PATH`, croc v11.5.4. It installs into a user-level
-   directory without administrator rights. On Windows it also adds that
-   directory to the current user's PATH (not the system PATH). Prebuilt
-   binaries require a published release (v0.1.0+).
+   prebuilt installer downloads Entangle into a user-level directory without
+   administrator rights. On Windows it adds that directory to the current
+   user's PATH (not the system PATH). Prebuilt binaries require a published
+   release (v0.1.0+).
    Wait for the human's approval before running either command.
 
    On Windows PowerShell:
@@ -65,10 +62,9 @@ proceeding.
    curl -fsSL https://raw.githubusercontent.com/DailenG/entangle/main/install.sh | sh
    ```
 
-   `ENTANGLE_VERSION`, `ENTANGLE_INSTALL_DIR`, `ENTANGLE_DOWNLOAD_BASE`,
-   `ENTANGLE_SKIP_CROC`, `CROC_VERSION`, and `CROC_DOWNLOAD_BASE` can adjust
-   installer behavior; see [SETUP.md](SETUP.md) for their defaults and
-   details. The download-base overrides are intended for testing.
+   `ENTANGLE_VERSION`, `ENTANGLE_INSTALL_DIR`, and `ENTANGLE_DOWNLOAD_BASE`
+   can adjust installer behavior; see [SETUP.md](SETUP.md) for their defaults
+   and details. The download-base override is intended for testing.
 
    If no published release is available or the platform has no prebuilt
    binary, use the source fallback only if Cargo is already installed:
@@ -80,13 +76,24 @@ proceeding.
    If Rust/Cargo is missing, ask the human before installing `rustup` or
    changing the machine's toolchain.
 
-   **Verify:** Run `entangle --version`, `entangle --help`, and
-   `croc --version`; expect Entangle help listing `serve`, `node`, and `scan`,
-   and croc major version 10 or newer.
+   **Verify:** Run `entangle --version` and `entangle --help`; expect help
+   listing `serve`, `node`, `scan`, and `pair`.
 
    **If this fails:** Check the release availability, executable directory,
    and PATH. Report the first failing command; do not install system packages
    or change the toolchain without the human's approval.
+
+## Pairing (human step)
+
+Pairing is a human-only step. Do not run `entangle pair init`, `entangle pair
+show`, or `entangle pair join`; never request, display, or repeat the code.
+Ask the human to run `entangle pair init` on one device and `entangle pair
+join <code>` on the others in their own terminal. Then verify with
+`entangle pair status` or `find_entangled_particles.self.paired`. The code is
+a secret and must not be sent through Entangle or included in logs.
+
+Both devices must run version 0.2; it cannot communicate with 0.1.x peers.
+Upgrade both devices before pairing.
 
 ## 3. Use this machine's identity
 
@@ -119,27 +126,26 @@ proceeding.
 
 ## 4. Check network access
 
-4. **Review the required ports.** Entangle uses TCP `7337` for the link,
-   TCP `9109–9113` for its private croc relay, and UDP `5353` for mDNS. These
-   are defaults and can be changed with `--link-port` and `--relay-port`.
-   If Entangle reports a port conflict, do not stop or kill processes; report
-   the exact error text to the human.
+4. **Review the required ports.** Entangle uses TCP `7337` for the encrypted
+   link and UDP `5353` for mDNS. These are defaults; `--link-port` changes the
+   link port. If the configured link port is occupied, Entangle falls back to
+   an ephemeral port; static peer entries and firewall rules must allow that
+   port. Never kill a process; if a port-conflict error appears, report its
+   exact text to the human.
    Show firewall commands to the human and ask before running them:
 
    ```sh
    sudo ufw allow 7337/tcp
-   sudo ufw allow 9109:9113/tcp
    sudo ufw allow 5353/udp
    ```
 
    ```powershell
    New-NetFirewallRule -DisplayName "Entangle link" -Direction Inbound -Protocol TCP -LocalPort 7337 -Action Allow
-   New-NetFirewallRule -DisplayName "Entangle croc relay" -Direction Inbound -Protocol TCP -LocalPort 9109-9113 -Action Allow
    New-NetFirewallRule -DisplayName "Entangle mDNS" -Direction Inbound -Protocol UDP -LocalPort 5353 -Action Allow
    ```
 
-   On macOS, ask the human to approve incoming connections for Entangle and
-   croc in the system firewall if prompted.
+   On macOS, ask the human to approve incoming connections for Entangle in the
+   system firewall if prompted.
 
    **Verify:** With the human's approval, confirm the corresponding rules
    appear in the firewall's rules list. Do not claim a firewall rule was
@@ -239,8 +245,9 @@ proceeding.
    verified results from anything not checked:
 
    ```text
-   - croc version:
    - Entangle version:
+   - Paired (from pair status or find_entangled_particles.self):
+   - Pairing group:
    - Particle ID (from find_entangled_particles.self):
    - Particle name:
    - Context (or none):
@@ -291,5 +298,5 @@ proceeding.
    particle can observe the expected item before collapsing it.
 
    **If this fails:** Re-run `find_entangled_particles`; report the sync ID and
-   tool error without copying a croc secret into logs, chat, or another
+   tool error without copying pairing codes into logs, chat, or another
    channel.

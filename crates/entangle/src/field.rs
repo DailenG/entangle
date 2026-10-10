@@ -3,6 +3,7 @@
 use entangle_core::{Manifest, ParticleId};
 use entangle_resonance::Resonance;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::{collections::HashMap, net::IpAddr, time::Instant};
 
 /// Relationship state stored for a peer.
@@ -21,6 +22,8 @@ pub struct PeerRecord {
     pub resonance: Resonance,
     /// Full manifest, populated after a successful handshake.
     pub manifest: Option<Manifest>,
+    /// Noise static public key authenticated by that handshake.
+    pub static_key: Option<[u8; 32]>,
     /// Current relationship state.
     pub state: PeerState,
     /// Monotonic time at which this record was refreshed.
@@ -42,6 +45,7 @@ impl Field {
             .or_insert(PeerRecord {
                 resonance: resonance.clone(),
                 manifest: None,
+                static_key: None,
                 state: PeerState::Resonating,
                 last_seen: Instant::now(),
             });
@@ -50,7 +54,7 @@ impl Field {
     }
 
     /// Stores a validated manifest and marks the peer entangled.
-    pub fn entangle(&mut self, mut resonance: Resonance, manifest: Manifest) {
+    pub fn entangle(&mut self, mut resonance: Resonance, manifest: Manifest, static_key: [u8; 32]) {
         let id = resonance.particle_id.clone();
         if let Some(existing) = self.peers.get(&id) {
             for address in &existing.resonance.addrs {
@@ -64,6 +68,7 @@ impl Field {
             PeerRecord {
                 resonance,
                 manifest: Some(manifest),
+                static_key: Some(static_key),
                 state: PeerState::Entangled,
                 last_seen: Instant::now(),
             },
@@ -118,6 +123,9 @@ impl Field {
             .filter(|record| include_unentangled || record.state == PeerState::Entangled)
             .filter(|record| context.is_none_or(|value| record.resonance.context.as_deref() == Some(value)))
             .map(|record| {
+                let key_fingerprint = record
+                    .static_key
+                    .map(|key| hex::encode(Sha256::digest(key))[..16].to_owned());
                 json!({
                     "particle_id": record.resonance.particle_id.as_str(),
                     "name": record.resonance.name,
@@ -125,6 +133,7 @@ impl Field {
                     "addrs": record.resonance.addrs.iter().map(ToString::to_string).collect::<Vec<_>>(),
                     "port": record.resonance.port,
                     "context": record.resonance.context,
+                    "key_fingerprint": key_fingerprint,
                     "state": if record.state == PeerState::Entangled { "entangled" } else { "resonating" },
                     "manifest": record.manifest,
                     "last_seen_secs": record.last_seen.elapsed().as_secs()
@@ -169,6 +178,7 @@ mod tests {
             addrs: vec!["192.0.2.1".parse().unwrap()],
             port: 7337,
             context: None,
+            group: None,
             proto: PROTOCOL_VERSION,
         });
         field.entangle(
@@ -179,14 +189,20 @@ mod tests {
                 addrs: vec!["192.0.2.2".parse().unwrap()],
                 port: 7337,
                 context: None,
+                group: None,
                 proto: PROTOCOL_VERSION,
             },
             manifest(id.clone()),
+            [0x42; 32],
         );
         let peer = field.by_id(&id).unwrap();
         assert_eq!(peer.state, PeerState::Entangled);
         assert!(peer.resonance.addrs.contains(&"192.0.2.1".parse().unwrap()));
         assert!(peer.resonance.addrs.contains(&"192.0.2.2".parse().unwrap()));
+        assert_eq!(
+            field.view(None, false)[0]["key_fingerprint"],
+            hex::encode(Sha256::digest([0x42; 32]))[..16]
+        );
     }
 
     #[test]
@@ -201,6 +217,7 @@ mod tests {
             addrs: vec!["192.0.2.1".parse().unwrap()],
             port: 7337,
             context: None,
+            group: None,
             proto: PROTOCOL_VERSION,
         });
         let previous = field.by_id(&id).unwrap().last_seen;

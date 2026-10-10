@@ -3,7 +3,7 @@
     {
       "name": "find_entangled_particles",
       "title": "Find entangled particles",
-      "description": "List Entangle peers (particles) discovered on the local network via mDNS. Each particle reports its identity, address, capability manifest, and whether the handshake has completed (state = \"entangled\"). Only entangled particles can receive state syncs.",
+      "description": "List Entangle peers discovered via mDNS or static peers. `self` reports whether this machine is paired and its public pairing group; only entangled particles can receive state syncs.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -15,7 +15,16 @@
       "outputSchema": {
         "type": "object",
         "properties": {
-          "self": { "type": "object", "description": "This particle's own manifest." },
+          "self": {
+            "type": "object",
+            "description": "This particle's manifest and pairing status.",
+            "properties": {
+              "paired": { "type": "boolean" },
+              "pairing_group": { "type": ["string", "null"], "description": "Eight lowercase hex characters, or null when unpaired." },
+              "hint": { "type": "string", "description": "When unpaired: Not paired: the human must run `entangle pair init` on one machine and `entangle pair join` on the others." }
+            },
+            "required": ["paired", "pairing_group"]
+          },
           "particles": {
             "type": "array",
             "items": {
@@ -27,6 +36,7 @@
                 "addrs": { "type": "array", "items": { "type": "string" } },
                 "port": { "type": "integer" },
                 "context": { "type": ["string", "null"] },
+                "key_fingerprint": { "type": ["string", "null"], "description": "First 16 hex characters of SHA-256 of the authenticated Noise static public key." },
                 "state": { "type": "string", "enum": ["resonating", "entangled"] },
                 "manifest": { "type": ["object", "null"] },
                 "last_seen_secs": {
@@ -44,7 +54,7 @@
     {
       "name": "sync_entangled_state",
       "title": "Sync entangled state",
-      "description": "Send a JSON message or a single file to an entangled particle. A one-time secret is generated, the payload is transferred with croc over a relay on the local network, and the call returns once the receiver has verified the SHA-256 of what it got. Provide exactly one of `state` or `file_path`.",
+      "description": "Send a JSON message or a single file to an entangled particle over the pairing-key-authenticated encrypted link. The call returns once the receiver has verified the payload size and SHA-256. Provide exactly one of `state` or `file_path`.",
       "inputSchema": {
         "type": "object",
         "properties": {

@@ -6,7 +6,7 @@ its own machine, see [AGENT_SETUP.md](AGENT_SETUP.md).
 ## Prerequisites
 
 - A published Entangle release (v0.1.0+) for the prebuilt installers.
-- An internet connection for downloading Entangle and, if needed, croc.
+- An internet connection for downloading Entangle.
 - Rust stable toolchain with Cargo only if building from source or using the
   Cargo-install fallback.
 - A local network that permits the configured TCP ports; UDP multicast on
@@ -24,12 +24,10 @@ irm https://raw.githubusercontent.com/DailenG/entangle/main/install.ps1 | iex
 curl -fsSL https://raw.githubusercontent.com/DailenG/entangle/main/install.sh | sh
 ```
 
-The installer installs croc v11.5.4 by default if no croc version 10 or newer
-is available on `PATH`, and it requires no administrator or `sudo` rights.
-macOS/Linux installs into `$HOME/.local/bin` by default and prints a PATH hint
-if needed. Windows installs into `%LOCALAPPDATA%\Programs\entangle\bin` and
-adds that directory to the current user's PATH only. Set
-`ENTANGLE_SKIP_CROC=1` to skip croc.
+The installer requires no administrator or `sudo` rights. macOS/Linux installs
+into `$HOME/.local/bin` by default and prints a PATH hint if needed. Windows
+installs into `%LOCALAPPDATA%\Programs\entangle\bin` and adds that directory
+to the current user's PATH only.
 
 Configure the installers with these environment variables:
 
@@ -38,9 +36,6 @@ Configure the installers with these environment variables:
 | `ENTANGLE_VERSION` | `latest` | Select `latest` or a release tag such as `v0.1.0`. |
 | `ENTANGLE_INSTALL_DIR` | `$HOME/.local/bin` on Unix; `%LOCALAPPDATA%\Programs\entangle\bin` on Windows | User-writable installation directory. |
 | `ENTANGLE_DOWNLOAD_BASE` | GitHub latest/download or the selected tag's download URL | Override the Entangle archive and `SHA256SUMS` base URL; intended for testing. |
-| `ENTANGLE_SKIP_CROC` | unset | Set to `1` to skip croc installation. |
-| `CROC_VERSION` | `v11.5.4` | Select the pinned croc release tag. |
-| `CROC_DOWNLOAD_BASE` | Croc's GitHub release URL for `CROC_VERSION` | Override the croc archive/checksum base URL; intended for testing. |
 
 The installers verify SHA-256 checksums before extracting binaries. To install
 from Cargo instead, use:
@@ -58,21 +53,19 @@ cargo build --release
 ```
 
 The executable is `target/release/entangle` (or `target/release/entangle.exe`
-on Windows). Entangle locates croc in this order: an explicit `--croc` path,
-`CROC_PATH`, a `croc`/`croc.exe` beside the running Entangle executable, then
-`PATH`.
+on Windows).
 
 ## Firewall
 
-Allow inbound TCP 7337 for the control link and TCP 9109–9113 for the sender's
-private croc relay. Allow UDP 5353 for mDNS if automatic discovery is desired.
-Adjust these rules if you choose other link/relay ports.
+Allow inbound TCP 7337 for the encrypted link and UDP 5353 for mDNS if
+automatic discovery is desired. If the configured link port is busy, Entangle
+uses an ephemeral port; firewall rules and static peer entries must permit
+that port.
 
 On Ubuntu with UFW:
 
 ```sh
 sudo ufw allow 7337/tcp
-sudo ufw allow 9109:9113/tcp
 sudo ufw allow 5353/udp
 ```
 
@@ -80,13 +73,37 @@ On Windows PowerShell (run as Administrator):
 
 ```powershell
 New-NetFirewallRule -DisplayName "Entangle link" -Direction Inbound -Protocol TCP -LocalPort 7337 -Action Allow
-New-NetFirewallRule -DisplayName "Entangle croc relay" -Direction Inbound -Protocol TCP -LocalPort 9109-9113 -Action Allow
 New-NetFirewallRule -DisplayName "Entangle mDNS" -Direction Inbound -Protocol UDP -LocalPort 5353 -Action Allow
 ```
 
-On macOS, allow the Entangle and croc executables to accept incoming
-connections in the system firewall. Multicast behavior can also depend on the
-network interface and router configuration.
+On macOS, allow the Entangle executable to accept incoming connections in the
+system firewall. Multicast behavior can also depend on the network interface
+and router configuration.
+
+## Pairing
+
+Version 0.2 requires both devices to use the same pairing key and cannot
+communicate with version 0.1.x peers. Upgrade both devices before pairing.
+The pairing key is never advertised; mDNS publishes only its 8-character
+group ID.
+Migration: croc is no longer required by Entangle 0.2; remove an old
+installation if it was installed only for Entangle.
+
+On one device, a human runs:
+
+```sh
+entangle pair init
+```
+
+On each other device, a human enters the code directly into:
+
+```sh
+entangle pair join <code>
+```
+
+Treat the pairing code as a secret. Do not send it through Entangle, place it
+in MCP configuration, or give it to an agent. Check the paired state and
+public group ID with `entangle pair status`.
 
 ## Register as an MCP server
 
@@ -158,13 +175,11 @@ collapsed. Collapsing removes the inbox entry; received files remain on disk.
   isolation. Use `--peer host:7337` when multicast is blocked; `--peer` can be
   repeated and also accepts a resolvable hostname. For example,
   `ENTANGLE_PEER=host-a:7337,host-b:7337` provides a comma-separated list.
-- **croc is not found:** install croc 10+ or configure `--croc` / `CROC_PATH`.
-- **Port conflicts:** stale relays recorded by Entangle are reclaimed
-  automatically. If the configured link port is occupied, Entangle listens on
-  an ephemeral port; static `--peer` entries for this machine need that new
-  port. If the relay base is occupied, Entangle tries subsequent five-port
-  ranges. Firewall rules for the configured relay range may not cover the
-  selected range.
+- **Peers do not entangle:** confirm both machines report `paired: yes` and
+  the same pairing group. A pairing-key mismatch prevents the Noise handshake.
+- **Port conflicts:** if the configured link port is occupied, Entangle listens
+  on an ephemeral port. Static `--peer` entries for this machine and firewall
+  rules must allow the port it selected.
 - **Diagnostics:** logs are on stderr; use `--log-level debug` for more detail.
 - **Inbox files:** files are stored below the platform data directory in
   `entangle/<particle-short-id>/inbox/<sync-id>/`. Override the base with

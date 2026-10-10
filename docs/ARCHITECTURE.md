@@ -1,25 +1,41 @@
 # Architecture
 
-Entangle has a strict crate direction: protocol/data libraries remain
-independent and only the binary composes them.
+Entangle keeps discovery independent from encrypted transport. The binary
+composes the protocol and platform crates.
 
 ## Crates and dependency rule
 
 | Crate | Responsibility |
 | --- | --- |
-| `entangle-core` | Particle IDs, manifests, payload kinds, relay tickets, safe names |
+| `entangle-core` | Particle IDs, manifests, payload kinds, safe names |
 | `entangle-resonance` | mDNS advertisement, browsing, and discovery events |
-| `entangle-transport` | croc executable, process-owned relay, send/receive handles |
-| `entangle-link` | TCP NDJSON control protocol, Hello, sync negotiation |
+| `entangle-transport` | Noise XXpsk3 secure streams and encrypted message framing |
+| `entangle-link` | Encrypted Hello, sync negotiation, and bounded payload streams |
 | `entangle-mcp` | MCP JSON-RPC over stdio and tool backend abstraction |
 | `entangle` | CLI and `Particle` orchestration that composes the libraries |
 
-`entangle-resonance`, `entangle-transport`, and `entangle-link` depend on at
-most `entangle-core`. Transport never depends on discovery or link, and
-discovery never depends on transfer code. `entangle-mcp` depends on no other
-Entangle crate. Only the `entangle` binary depends on all of these modules. The
-orchestrator is the sole location that associates a discovered peer with a
-fresh croc secret and local relay ticket.
+`entangle-resonance` has no dependency on transport. It publishes the particle
+ID, protocol, name, version, optional context, and optional public pairing
+group (`grp`) in mDNS TXT records. The pairing key itself is never advertised.
+
+## Pairing and link
+
+Both devices must use the same 32-byte pairing key. Its human-entered code is
+RFC 4648 Base32 without padding, prefixed with `ENT1-` and grouped in
+four-character chunks. The public group ID is the first 8 hex characters of
+`SHA-256("entangle-pair-group-v1" || key)`; the Noise PSK is
+`SHA-256("entangle-pair-psk-v1" || key)`.
+The pairing key is stored at `<data_root>/pairing.key`; each persistent
+particle's 32-byte Noise static private key is stored as 64 lowercase hex
+characters at `<data_root>/noise_static.key`. Ephemeral identities keep their
+static key in memory only. On Unix, key files are mode 0600.
+
+Each TCP connection begins with a three-message
+`Noise_XXpsk3_25519_ChaChaPoly_BLAKE2s` handshake. JSON control frames are
+individual encrypted Noise messages, bounded to 60 KiB. An accepted sync
+streams exactly the declared payload size in encrypted messages; each receive
+chunk has a five-second idle timeout. The receiver verifies the byte count and
+SHA-256 before adding the item to its inbox.
 
 ## Execution flow
 
@@ -28,64 +44,33 @@ sequenceDiagram
     participant A as Particle A / MCP client
     participant MD as mDNS
     participant B as Particle B
-    participant R as A's private croc relay
-    A->>MD: advertise particle + browse
+    A->>MD: advertise public group ID + browse
     MD-->>A: Resonance event for B
-    A->>B: TCP Hello(manifest)
-    B-->>A: TCP Hello(manifest)
-    A->>R: start relay on configured local ports
-    A->>B: SyncOffer(from, timeout_secs, ticket, one-time secret, hash, size)
-    B-->>A: SyncAccept
-    B->>R: croc receive using secret from private ticket
-    A->>R: croc send using secret from private ticket
-    R-->>B: encrypted payload
-    B->>B: verify filename, size, SHA-256; index inbox
-    B-->>A: SyncComplete(verified SHA-256)
-    B-->>A: MCP notifications/message
-    A-->>A: MCP tool returns delivered result
+    A->>B: Noise XXpsk3 handshake
+    A->>B: encrypted Hello(manifest)
+    B-->>A: encrypted Hello(manifest)
+    A->>B: encrypted SyncOffer(from, size, hash)
+    B-->>A: encrypted SyncAccept
+    A->>B: encrypted payload chunks
+    B->>B: verify size/hash; persist inbox metadata
+    B-->>A: encrypted SyncComplete
+    B-->>A: MCP notification
 ```
 
-## Wire protocol
-
-The mDNS service is `_entangle._tcp.local.`. TXT records contain only `id`,
-`proto`, `name`, optional `ctx`, and `ver`; the full manifest is sent over the
-link because DNS TXT records are size-limited. The manifest includes accepted
-payload kinds, tool names, context, link port, and payload limit.
-
-Link control messages are UTF-8 JSON objects terminated by a newline, one
-frame per short-lived TCP connection. The maximum frame is 64 KiB. Hello
-exchanges manifests; SyncOffer carries the sender particle ID (`from`), transfer
-ID, sanitized filename, kind, size, SHA-256, optional label, relay ticket,
-one-time secret, and `timeout_secs` for the payload transfer. The receiver
-accepts or rejects, then sends SyncComplete only after checking the received
-bytes. SyncFailed identifies a failed receive.
-
-Hello, SyncOffer, and SyncAccept reads use a short idle timeout. The final
-SyncComplete/SyncFailed read is bounded by the sender's overall operation
-timeout instead, so a long croc transfer does not fail merely because no link
-frame arrives while the payload is moving. The receiver also uses
-`timeout_secs` to bound its croc receive.
-
-MCP uses JSON-RPC 2.0 with newline-delimited messages on stdio. Logs are sent
-to stderr; stdout belongs exclusively to MCP. Tool schemas in
-`schemas/mcp-tools.json` are the source of truth.
+The 0.2 protocol is not wire-compatible with 0.1.x; upgrade both devices
+before pairing. MCP continues to use JSON-RPC 2.0 with newline-delimited
+messages on stdio. Logs go to stderr; stdout belongs exclusively to MCP.
 
 ## Security model and limitations
 
-Payload bytes travel using croc's encrypted transfer protocol through a relay
-owned by the sender on the local network. Entangle explicitly supplies that
-relay's host, port, and password, avoiding the public relay and public fallback.
-The one-time transfer secret is never put in process arguments; it is passed to
-croc through `CROC_SECRET`.
+Noise encrypts and authenticates the link using the pairing-derived PSK, and
+each peer's static public key is bound to its claimed particle ID for the
+current process. This release does not provide persistent peer pinning across
+restarts or peer approval. It is not post-quantum secure beyond the PSK mixing.
+The optional `--context` value is a project label, not an authorization
+boundary; pairing is the access control.
+Pairing codes are secrets: transfer them only between humans, never through
+Entangle or to an agent. Keep the key file private and use only devices trusted
+with the same pairing key.
 
-**The current TCP control channel is plaintext.** A LAN observer able to sniff
-the SyncOffer can see the one-time secret and relay password. croc's PAKE and
-end-to-end payload encryption protect payload contents from parties that do
-not see the offer; they do not hide the offer from a LAN sniffer. The first
-version does not authenticate peer identities beyond possession of a live
-particle connection and does not protect the manifest/control messages.
-
-Use trusted local networks and short-lived secrets. A future protocol version
-should add Noise or TLS-PSK pairing for the control link. Other limits include
-multicast dependence for automatic discovery, a process-local inbox index,
-and no resume protocol for interrupted transfers.
+Further work is tracked in [issue #10](https://github.com/DailenG/entangle/issues/10).

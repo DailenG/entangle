@@ -4,12 +4,13 @@
 
 Entangle is a local-first MCP server for letting two LLM agents on the same
 LAN discover one another, exchange capability manifests, and transfer JSON or
-files through a private croc relay. The control channel coordinates each sync;
-the payload is transferred separately and verified with SHA-256.
+files through a pairing-key-authenticated Noise link. Control frames and
+payload chunks are encrypted end-to-end and payloads are verified with
+SHA-256.
 
 Entangle uses mDNS for automatic discovery and a configurable static-peer
-fallback for networks that block multicast. No public croc relay is configured
-or used by the application.
+fallback for networks that block multicast. Discovery metadata includes only
+the public pairing-group ID, never the pairing key.
 
 ## Glossary
 
@@ -35,10 +36,9 @@ irm https://raw.githubusercontent.com/DailenG/entangle/main/install.ps1 | iex
 curl -fsSL https://raw.githubusercontent.com/DailenG/entangle/main/install.sh | sh
 ```
 
-The installer downloads croc v11.5.4 by default if no croc version 10 or newer
-is available on `PATH`. It needs no administrator rights; on Windows it
-updates your user PATH. Prebuilt binaries require a published release
-(v0.1.0+). For other platforms or a source build, use
+It needs no administrator rights; on Windows it updates your user PATH.
+Prebuilt binaries require a published release (v0.1.0+). For other platforms
+or a source build, use
 `cargo install --git https://github.com/DailenG/entangle entangle` or build
 from a checkout. Installer environment overrides are documented in
 [docs/SETUP.md](docs/SETUP.md).
@@ -52,10 +52,13 @@ entangle scan
 Register the binary as an MCP stdio server in your agent client. The default
 name is `<hostname>-<first 4 hex of the particle ID>`; the ID is saved in the
 data directory and stays stable across restarts. `--name` is optional. Use the
-same `--context` on devices working on the same project. A second Entangle
-server using the same data directory gets a temporary ID while the first
-server is running. See [docs/SETUP.md](docs/SETUP.md) for installation,
-firewall, client configuration, and a two-machine smoke test.
+same `--context` on devices working on the same project. Pair the devices
+before they can connect: a human runs `entangle pair init` on one device and
+`entangle pair join <code>` on the others. Pairing codes are secrets and must
+only be exchanged by the humans. A second Entangle server using the same data
+directory gets a temporary ID while the first server is running. See
+[docs/SETUP.md](docs/SETUP.md) for pairing, firewall, client configuration,
+and a two-machine smoke test.
 
 The MCP tools are `find_entangled_particles`, `sync_entangled_state`, and
 `observe_entangled_states`. The standalone commands are `entangle serve`
@@ -64,9 +67,8 @@ The MCP tools are `find_entangled_particles`, `sync_entangled_state`, and
 ## Design and security
 
 The crate boundaries, message flow, wire format, and security limitations are
-documented in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). The v0 control
-channel is plaintext TCP on the LAN, so a network observer can see a one-time
-transfer secret in the offer. Do not treat the local network as trusted.
+documented in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). Version 0.2 is not
+wire-compatible with 0.1.x; upgrade both devices before pairing.
 
 ## License
 

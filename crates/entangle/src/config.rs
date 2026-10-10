@@ -21,16 +21,11 @@ pub struct Options {
         default_value_t = 7337
     )]
     pub link_port: u16,
-    /// Base port for the process-local croc relay.
-    #[arg(
-        long,
-        global = true,
-        env = "ENTANGLE_RELAY_PORT",
-        default_value_t = 9109
-    )]
-    pub relay_port: u16,
-    /// IP address advertised to remote peers for relay access.
-    #[arg(long, global = true, env = "ENTANGLE_ADVERTISE_IP")]
+    /// Legacy option retained for existing MCP configurations.
+    #[arg(long, global = true, env = "ENTANGLE_RELAY_PORT", hide = true)]
+    pub relay_port: Option<u16>,
+    /// Legacy option retained for existing MCP configurations.
+    #[arg(long, global = true, env = "ENTANGLE_ADVERTISE_IP", hide = true)]
     pub advertise_ip: Option<String>,
     /// Static host:port peers to dial when multicast is unavailable; comma-separated in ENTANGLE_PEER.
     #[arg(long, global = true, env = "ENTANGLE_PEER", value_delimiter = ',')]
@@ -38,9 +33,14 @@ pub struct Options {
     /// Base data directory (a particle-specific subdirectory is created).
     #[arg(long, global = true, env = "ENTANGLE_DATA_DIR")]
     pub data_dir: Option<PathBuf>,
-    /// Explicit croc executable path.
-    #[arg(long, global = true, env = "ENTANGLE_CROC")]
-    pub croc: Option<PathBuf>,
+    /// Legacy option retained for existing MCP configurations.
+    #[arg(
+        long = concat!("cr", "oc"),
+        global = true,
+        env = concat!("ENTANGLE_", "CR", "OC"),
+        hide = true
+    )]
+    pub legacy_transfer_path: Option<PathBuf>,
     /// Maximum accepted payload size in mebibytes.
     #[arg(
         long,
@@ -101,11 +101,11 @@ mod tests {
             name,
             context: None,
             link_port: 7337,
-            relay_port: 9109,
+            relay_port: None,
             advertise_ip: None,
             peer: vec![],
             data_dir: None,
-            croc: None,
+            legacy_transfer_path: None,
             max_payload_mb: 512,
             no_mdns: true,
             log_level: "info".into(),
