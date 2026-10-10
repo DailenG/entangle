@@ -9,6 +9,30 @@ using `sudo`, installing system packages, changing firewall rules, or editing
 a configuration file you did not create; show them the proposed diff first.
 Never request or repeat a pairing code.
 
+### Running commands on Windows
+
+On Windows, write each command or check to a temporary `.ps1` file, run it
+with `powershell.exe -NoProfile -ExecutionPolicy Bypass -File <path>`, then
+delete the file. Never pass inline `-Command` strings: the outer shell (often
+bash in omp) can mangle quotes and `$` variables.
+
+In Windows PowerShell 5.1, module cmdlets may be unavailable in spawned
+processes. For SHA-256, set `$path` to the file and use .NET rather than
+`Get-FileHash`:
+
+```powershell
+$s=[System.Security.Cryptography.SHA256]::Create(); $f=[IO.File]::OpenRead($path); -join ($s.ComputeHash($f) | ForEach-Object { $_.ToString('x2') }); $f.Dispose()
+```
+
+If another cmdlet is reported as not recognized, import its module by full path
+and retry. For example, use the Utility module for `Get-FileHash` and friends,
+or the Management module for `Get-Process` and `Get-Item`:
+
+```powershell
+Import-Module "$PSHOME\Modules\Microsoft.PowerShell.Utility\Microsoft.PowerShell.Utility.psd1"
+Import-Module "$PSHOME\Modules\Microsoft.PowerShell.Management\Microsoft.PowerShell.Management.psd1"
+```
+
 **Verify:** You understand the goal and ground rules before making changes.
 
 **If this fails:** Ask the human to clarify the goal or any ground rule before
@@ -24,7 +48,7 @@ proceeding.
    command -v entangle || true
    ```
 
-   On Windows PowerShell:
+   On Windows PowerShell, run these via a temporary `.ps1` script:
 
    ```powershell
    Get-CimInstance Win32_OperatingSystem | Select-Object Caption, OSArchitecture
@@ -50,7 +74,8 @@ proceeding.
    release (v0.1.0+).
    Wait for the human's approval before running either command.
 
-   On Windows PowerShell:
+   On Windows PowerShell, after the human approves, run this via a temporary
+   `.ps1` script:
 
    ```powershell
    irm https://raw.githubusercontent.com/DailenG/entangle/main/install.ps1 | iex
@@ -94,6 +119,10 @@ a secret and must not be sent through Entangle or included in logs.
 
 Both devices must run version 0.2; it cannot communicate with 0.1.x peers.
 Upgrade both devices before pairing.
+Pairing-key changes take effect without a client reload; upgrading the Entangle
+binary still requires restarting or reloading the MCP client.
+If `find_entangled_particles.self.warning` is present, report its text verbatim
+to the human. Never kill or stop processes to resolve it.
 
 ## 3. Use this machine's identity
 
@@ -139,6 +168,8 @@ Upgrade both devices before pairing.
    sudo ufw allow 5353/udp
    ```
 
+   With the human's approval, run these via a temporary `.ps1` script:
+
    ```powershell
    New-NetFirewallRule -DisplayName "Entangle link" -Direction Inbound -Protocol TCP -LocalPort 7337 -Action Allow
    New-NetFirewallRule -DisplayName "Entangle mDNS" -Direction Inbound -Protocol UDP -LocalPort 5353 -Action Allow
@@ -159,9 +190,10 @@ Upgrade both devices before pairing.
 5. **Find Entangle's absolute path and register it in the MCP client you
    identified above.** GUI applications may not inherit your shell's `PATH`.
    On Linux/macOS, obtain the path with `command -v entangle`; on Windows,
-   obtain it with `(Get-Command entangle).Source`. Use that absolute path in
-   the `command` field below. Replace the example context with the value
-   approved by the human, or omit it if no shared context is needed.
+   obtain it with `(Get-Command entangle).Source` via a temporary `.ps1`
+   script. Use that absolute path in the `command` field below. Replace the
+   example context with the value approved by the human, or omit it if no
+   shared context is needed.
 
    **Claude Desktop** (`claude_desktop_config.json`):
 

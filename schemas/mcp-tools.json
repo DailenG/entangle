@@ -3,7 +3,7 @@
     {
       "name": "find_entangled_particles",
       "title": "Find entangled particles",
-      "description": "List Entangle peers discovered via mDNS or static peers. `self` reports whether this machine is paired and its public pairing group; only entangled particles can receive state syncs.",
+      "description": "List Entangle peers discovered via mDNS or static peers. `self` reports live pairing, identity persistence, and link-port fallback status; only entangled particles can receive state syncs.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -21,9 +21,12 @@
             "properties": {
               "paired": { "type": "boolean" },
               "pairing_group": { "type": ["string", "null"], "description": "Eight lowercase hex characters, or null when unpaired." },
+              "identity": { "type": "string", "enum": ["persistent", "ephemeral"], "description": "Whether this process holds the saved particle identity or is using a temporary one." },
+              "link_port_fallback": { "type": "boolean", "description": "True when the configured link port was occupied and this process bound an ephemeral port instead." },
+              "warning": { "type": "string", "description": "Startup warning for an ephemeral identity or fallback link port; report it verbatim to the human." },
               "hint": { "type": "string", "description": "When unpaired: Not paired: the human must run `entangle pair init` on one machine and `entangle pair join` on the others." }
             },
-            "required": ["paired", "pairing_group"]
+            "required": ["paired", "pairing_group", "identity", "link_port_fallback"]
           },
           "particles": {
             "type": "array",

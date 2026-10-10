@@ -146,6 +146,7 @@ try {
         Write-Output 'Added the install directory to your user PATH; restart your terminal to pick it up.'
     }
     Write-Output 'Reload or restart your MCP client so it runs this version.'
+    Write-Output 'Pairing-key changes take effect without a client reload; binary upgrades require one.'
     Write-Output 'Pair this machine: run `entangle pair init` on your first machine, then `entangle pair join <code>` here.'
 } finally {
     Remove-Item -LiteralPath $tempDir -Recurse -Force -ErrorAction SilentlyContinue

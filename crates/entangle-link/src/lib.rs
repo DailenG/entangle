@@ -2,7 +2,7 @@
 
 use async_trait::async_trait;
 use entangle_core::{Manifest, ParticleId, StateKind};
-use entangle_transport::{self, LinkKeys, SecureStream, TransportError, MAX_PLAINTEXT};
+use entangle_transport::{self, KeySlot, LinkKeys, SecureStream, TransportError, MAX_PLAINTEXT};
 use serde::{Deserialize, Serialize};
 use std::{io, net::SocketAddr, time::Duration};
 use thiserror::Error;
@@ -239,7 +239,7 @@ impl LinkListener {
     /// Accepts peers and completes each Noise handshake in its own task.
     pub async fn run(
         self,
-        keys: std::sync::Arc<LinkKeys>,
+        keys: KeySlot,
         handler: std::sync::Arc<dyn LinkHandler>,
     ) -> Result<(), LinkError> {
         loop {
@@ -247,6 +247,9 @@ impl LinkListener {
             let keys = std::sync::Arc::clone(&keys);
             let handler = std::sync::Arc::clone(&handler);
             tokio::spawn(async move {
+                let Some(keys) = keys.read().ok().and_then(|keys| keys.clone()) else {
+                    return;
+                };
                 let Ok(stream) = entangle_transport::accept(stream, &keys, HANDSHAKE_TIMEOUT).await
                 else {
                     return;
@@ -264,12 +267,13 @@ impl LinkListener {
 /// Connects to a peer, exchanges manifests, and returns its static key.
 pub async fn handshake(
     addr: SocketAddr,
-    keys: &LinkKeys,
+    keys: KeySlot,
     manifest: &Manifest,
     duration: Duration,
 ) -> Result<(Manifest, [u8; 32]), LinkError> {
+    let keys = current_keys(&keys)?;
     timeout(duration, async {
-        let mut stream = entangle_transport::connect(addr, keys, duration).await?;
+        let mut stream = entangle_transport::connect(addr, &keys, duration).await?;
         write_frame(
             &mut stream,
             &Frame::Hello {
@@ -302,7 +306,7 @@ pub async fn handshake(
 /// Sends a sync offer, streams exactly its declared bytes, and waits for completion.
 pub async fn offer<R>(
     addr: SocketAddr,
-    keys: &LinkKeys,
+    keys: KeySlot,
     offer: SyncOffer,
     mut source: R,
     duration: Duration,
@@ -310,8 +314,9 @@ pub async fn offer<R>(
 where
     R: AsyncRead + Unpin + Send,
 {
+    let keys = current_keys(&keys)?;
     timeout(duration, async {
-        let mut stream = entangle_transport::connect(addr, keys, duration).await?;
+        let mut stream = entangle_transport::connect(addr, &keys, duration).await?;
         let sync_id = offer.sync_id.clone();
         write_frame(&mut stream, &offer.clone().into()).await?;
         match read_frame(&mut stream).await? {
@@ -340,6 +345,13 @@ where
     .map_err(|_| LinkError::Timeout)?
 }
 
+fn current_keys(keys: &KeySlot) -> Result<std::sync::Arc<LinkKeys>, LinkError> {
+    keys.read()
+        .map_err(|_| LinkError::Handler("link key slot lock is poisoned".into()))?
+        .clone()
+        .ok_or_else(|| LinkError::Handler("this particle is unpaired".into()))
+}
+
 async fn send_payload<R: AsyncRead + Unpin>(
     stream: &mut SecureStream,
     source: &mut R,
@@ -362,13 +374,6 @@ async fn send_payload<R: AsyncRead + Unpin>(
         }
         stream.send(&chunk).await?;
         sent += length as u64;
-    }
-    let mut extra = [0_u8; 1];
-    if source.read(&mut extra).await? != 0 {
-        return Err(LinkError::PayloadSize {
-            expected: size,
-            actual: size.saturating_add(1),
-        });
     }
     Ok(())
 }
@@ -490,6 +495,10 @@ mod tests {
         }
     }
 
+    fn key_slot(keys: &LinkKeys) -> KeySlot {
+        Arc::new(std::sync::RwLock::new(Some(Arc::new(keys.clone()))))
+    }
+
     struct AcceptingHandler {
         manifest: Manifest,
         received: Arc<Mutex<Vec<u8>>>,
@@ -563,7 +572,7 @@ mod tests {
         let (listener, port) = LinkListener::bind("127.0.0.1:0".parse().unwrap())
             .await
             .unwrap();
-        let keys = Arc::new(key);
+        let keys = key_slot(&key);
         let task = tokio::spawn(async move {
             let _ = listener.run(keys, handler).await;
         });
@@ -596,16 +605,17 @@ mod tests {
             }),
         )
         .await;
-        let (peer, remote_static) = handshake(address, &key, &manifest(), Duration::from_secs(2))
-            .await
-            .unwrap();
+        let (peer, remote_static) =
+            handshake(address, key_slot(&key), &manifest(), Duration::from_secs(2))
+                .await
+                .unwrap();
         assert_eq!(peer, expected);
         assert_ne!(remote_static, [0; 32]);
 
         let payload = vec![0x5a; 210 * 1024];
         let outcome = offer(
             address,
-            &key,
+            key_slot(&key),
             make_offer(payload.len()),
             &payload[..],
             Duration::from_secs(5),
@@ -636,13 +646,44 @@ mod tests {
         .await;
         let result = offer(
             address,
-            &key,
+            key_slot(&key),
             make_offer(5),
             &b"abc"[..],
             Duration::from_secs(2),
         )
         .await;
         assert!(matches!(result, Err(LinkError::PayloadSize { .. })));
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn sender_ignores_bytes_beyond_the_offered_size() {
+        let key = keys();
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let (address, task) = start_listener(
+            key.clone(),
+            Arc::new(AcceptingHandler {
+                manifest: manifest(),
+                received: Arc::clone(&received),
+            }),
+        )
+        .await;
+        let outcome = offer(
+            address,
+            key_slot(&key),
+            make_offer(3),
+            &b"abcdef"[..],
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            outcome,
+            OfferOutcome::Complete {
+                sha256: "verified".into()
+            }
+        );
+        assert_eq!(*received.lock().unwrap(), b"abc".to_vec());
         task.abort();
     }
 
@@ -683,7 +724,7 @@ mod tests {
             start_listener(key.clone(), Arc::new(RejectingHandler(manifest()))).await;
         let outcome = offer(
             address,
-            &key,
+            key_slot(&key),
             make_offer(0),
             &b""[..],
             Duration::from_secs(2),
@@ -701,7 +742,13 @@ mod tests {
         client_key.psk[0] ^= 0x80;
         let (address, task) =
             start_listener(server_key, Arc::new(RejectingHandler(manifest()))).await;
-        let result = handshake(address, &client_key, &manifest(), Duration::from_secs(2)).await;
+        let result = handshake(
+            address,
+            key_slot(&client_key),
+            &manifest(),
+            Duration::from_secs(2),
+        )
+        .await;
         assert!(matches!(
             result,
             Err(LinkError::Transport(TransportError::Handshake(_)))
