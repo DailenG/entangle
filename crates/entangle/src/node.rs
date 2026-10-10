@@ -18,11 +18,16 @@ use entangle_transport::{KeySlot, LinkKeys};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{
+    collections::HashSet,
     net::SocketAddr,
     path::{Path, PathBuf},
-    sync::{Arc, RwLock},
+    sync::{
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc, Mutex as StdMutex, RwLock,
+    },
     time::Duration,
 };
+use tokio::task::JoinHandle;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::lookup_host,
@@ -60,6 +65,24 @@ impl Drop for PartialTransferGuard {
     }
 }
 
+struct InFlightGuard<'a> {
+    sync_id: String,
+    in_flight: &'a StdMutex<HashSet<String>>,
+}
+
+impl Drop for InFlightGuard<'_> {
+    fn drop(&mut self) {
+        match self.in_flight.lock() {
+            Ok(mut in_flight) => {
+                in_flight.remove(&self.sync_id);
+            }
+            Err(error) => {
+                error.into_inner().remove(&self.sync_id);
+            }
+        }
+    }
+}
+
 /// A single running Entangle process and its stateful local services.
 pub struct Particle {
     /// This process manifest.
@@ -74,7 +97,11 @@ pub struct Particle {
     pairing_root: PathBuf,
     data_dir: PathBuf,
     resonator: Mutex<Option<Resonator>>,
+    resonance_task: Mutex<Option<JoinHandle<()>>>,
+    discovery_generation: AtomicU64,
+    discovery_failure_logged: AtomicBool,
     inbox: Mutex<Vec<InboxItem>>,
+    in_flight: StdMutex<HashSet<String>>,
     notifications: Option<mpsc::Sender<Value>>,
     inbound_limit: Arc<Semaphore>,
     shutdown: tokio::sync::watch::Sender<bool>,
@@ -171,12 +198,18 @@ impl Particle {
             pairing_root: root,
             data_dir,
             resonator: Mutex::new(None),
+            resonance_task: Mutex::new(None),
+            discovery_generation: AtomicU64::new(0),
+            discovery_failure_logged: AtomicBool::new(false),
             inbox: Mutex::new(persisted_inbox),
+            in_flight: StdMutex::new(HashSet::new()),
             notifications,
             inbound_limit: Arc::new(Semaphore::new(4)),
             shutdown,
         });
-        particle.restart_resonator().await?;
+        if let Err(error) = particle.restart_resonator().await {
+            particle.log_discovery_failure(&error);
+        }
         tokio::spawn(listener.run(particle.keys.clone(), particle.clone()));
         let pairing_node = particle.clone();
         tokio::spawn(async move { pairing_node.pairing_watch().await });
@@ -247,6 +280,11 @@ impl Particle {
     }
 
     async fn restart_resonator(self: &Arc<Self>) -> anyhow::Result<()> {
+        let generation = self.discovery_generation.fetch_add(1, Ordering::SeqCst) + 1;
+        let mut resonance_task = self.resonance_task.lock().await;
+        if let Some(previous) = resonance_task.take() {
+            previous.abort();
+        }
         let mut resonator = self.resonator.lock().await;
         if let Some(previous) = resonator.take() {
             let _ = previous.shutdown();
@@ -257,17 +295,23 @@ impl Particle {
         let (next, events) = Resonator::start(self.advertisement())?;
         *resonator = Some(next);
         drop(resonator);
-        self.spawn_resonance_events(events);
+        *resonance_task = Some(self.spawn_resonance_events(events, generation));
+        self.discovery_failure_logged
+            .store(false, Ordering::Relaxed);
         Ok(())
     }
 
     fn spawn_resonance_events(
         self: &Arc<Self>,
         mut events: tokio::sync::mpsc::Receiver<ResonanceEvent>,
-    ) {
+        generation: u64,
+    ) -> JoinHandle<()> {
         let node = Arc::clone(self);
         tokio::spawn(async move {
             while let Some(event) = events.recv().await {
+                if node.discovery_generation.load(Ordering::SeqCst) != generation {
+                    break;
+                }
                 match event {
                     ResonanceEvent::Detected(peer) => node.on_detected(peer).await,
                     ResonanceEvent::Lost(id) => {
@@ -276,7 +320,15 @@ impl Particle {
                     }
                 }
             }
-        });
+        })
+    }
+
+    fn log_discovery_failure(&self, error: &anyhow::Error) {
+        if !self.discovery_failure_logged.swap(true, Ordering::Relaxed) {
+            warn!(%error, "unable to start mDNS discovery; it will be retried");
+        } else {
+            debug!(%error, "mDNS discovery restart failed; it will be retried");
+        }
     }
 
     async fn pairing_watch(self: Arc<Self>) {
@@ -292,6 +344,7 @@ impl Particle {
                 }
                 _ = interval.tick() => {}
             }
+            let mut key_changed = false;
             match pairing::load(&self.pairing_root) {
                 Ok(Some(key)) => {
                     unavailable_logged = false;
@@ -300,25 +353,21 @@ impl Particle {
                         .read()
                         .expect("pairing key lock")
                         .to_owned();
-                    if current == Some(key) {
-                        continue;
+                    key_changed = current != Some(key);
+                    if key_changed {
+                        if current.is_some() {
+                            warn!("pairing key changed; dropping entangled peers and refreshing discovery");
+                        }
+                        let psk = pairing::derive_psk(&key);
+                        *self.active_pairing_key.write().expect("pairing key lock") = Some(key);
+                        *self.keys.write().expect("key slot lock") = Some(Arc::new(LinkKeys {
+                            static_private: self._identity.static_private,
+                            psk,
+                        }));
+                        *self.pairing_group.write().expect("pairing group lock") =
+                            Some(pairing::group_id(&key));
+                        self.field.write().expect("field lock").clear();
                     }
-                    if current.is_some() {
-                        warn!("pairing key changed; dropping entangled peers and refreshing discovery");
-                    }
-                    let psk = pairing::derive_psk(&key);
-                    *self.active_pairing_key.write().expect("pairing key lock") = Some(key);
-                    *self.keys.write().expect("key slot lock") = Some(Arc::new(LinkKeys {
-                        static_private: self._identity.static_private,
-                        psk,
-                    }));
-                    *self.pairing_group.write().expect("pairing group lock") =
-                        Some(pairing::group_id(&key));
-                    self.field.write().expect("field lock").clear();
-                    if let Err(error) = self.restart_resonator().await {
-                        warn!(%error, "unable to restart mDNS after pairing changed");
-                    }
-                    self.dial_static_peers().await;
                 }
                 Ok(None) => {
                     let paired = self.keys.read().expect("key slot lock").is_some();
@@ -336,6 +385,18 @@ impl Particle {
                         unavailable_logged = true;
                     }
                 }
+            }
+            let paired = self.keys.read().expect("key slot lock").is_some();
+            if paired && !self.options.no_mdns {
+                let discovery_down = self.resonator.lock().await.is_none();
+                if key_changed || discovery_down {
+                    if let Err(error) = self.restart_resonator().await {
+                        self.log_discovery_failure(&error);
+                    }
+                }
+            }
+            if key_changed {
+                self.dial_static_peers().await;
             }
         }
     }
@@ -390,6 +451,10 @@ impl Particle {
     /// Unregisters this particle from mDNS.
     pub async fn shutdown(&self) {
         let _ = self.shutdown.send(true);
+        self.discovery_generation.fetch_add(1, Ordering::SeqCst);
+        if let Some(task) = self.resonance_task.lock().await.take() {
+            task.abort();
+        }
         if let Some(resonator) = self.resonator.lock().await.take() {
             let _ = resonator.shutdown();
         }
@@ -765,6 +830,10 @@ impl Particle {
         offer: SyncOffer,
         payload: &mut PayloadReader<'_>,
     ) -> Result<String, String> {
+        let _in_flight = InFlightGuard {
+            sync_id: offer.sync_id.clone(),
+            in_flight: &self.in_flight,
+        };
         if !is_valid_sync_id(&offer.sync_id) {
             return Err("offered sync_id is malformed".to_owned());
         }
@@ -863,14 +932,17 @@ impl Particle {
                 path: (offer.kind == StateKind::File).then_some(path),
                 text,
             };
-            match inbox::persist(&self.data_dir.join("inbox"), &item).await {
-                Ok(()) => cleanup.disarm(),
-                Err(error) => warn!(
+            if let Err(error) = inbox::persist(&self.data_dir.join("inbox"), &item).await {
+                warn!(
                     sync_id = %item.sync_id,
                     error = %error,
                     "unable to persist received inbox metadata"
-                ),
+                );
+                return Err(format!(
+                    "unable to persist received inbox metadata: {error}"
+                ));
             }
+            cleanup.disarm();
             self.inbox.lock().await.push(item);
             if let Some(notifications) = &self.notifications {
                 let _ = notifications
@@ -940,7 +1012,7 @@ impl LinkHandler for Particle {
         peer: &PeerInfo,
         offer: SyncOffer,
     ) -> std::result::Result<SyncDecision, LinkError> {
-        let result = self.validate_offer(peer, &offer);
+        let result = self.validate_offer(peer, &offer).await;
         Ok(match result {
             Ok(()) => SyncDecision::Accept,
             Err(reason) => SyncDecision::Reject(reason),
@@ -958,31 +1030,32 @@ impl LinkHandler for Particle {
 }
 
 impl Particle {
-    fn validate_offer(&self, peer_info: &PeerInfo, offer: &SyncOffer) -> Result<(), String> {
+    async fn validate_offer(&self, peer_info: &PeerInfo, offer: &SyncOffer) -> Result<(), String> {
         if !is_valid_sync_id(&offer.sync_id) {
             return Err("offered sync_id is malformed".to_owned());
         }
-        let mut field = self
-            .field
-            .write()
-            .map_err(|_| "peer field lock poisoned".to_owned())?;
-        if field.binding(&offer.from) != Some(peer_info.remote_static) {
-            return Err("sender key does not match the entangled particle".into());
+        {
+            let mut field = self
+                .field
+                .write()
+                .map_err(|_| "peer field lock poisoned".to_owned())?;
+            if field.binding(&offer.from) != Some(peer_info.remote_static) {
+                return Err("sender key does not match the entangled particle".into());
+            }
+            let peer = field
+                .by_id(&offer.from)
+                .filter(|peer| peer.state == PeerState::Entangled)
+                .ok_or_else(|| "sender is not entangled; handshake first".to_owned())?;
+            let source_ip = peer_info.addr.ip();
+            if !peer.resonance.addrs.contains(&source_ip) {
+                debug!(
+                    particle_id = %offer.from,
+                    source_ip = %source_ip,
+                    "offer arrived from an address not listed for the sender"
+                );
+                field.add_address(&offer.from, source_ip);
+            }
         }
-        let peer = field
-            .by_id(&offer.from)
-            .filter(|peer| peer.state == PeerState::Entangled)
-            .ok_or_else(|| "sender is not entangled; handshake first".to_owned())?;
-        let source_ip = peer_info.addr.ip();
-        if !peer.resonance.addrs.contains(&source_ip) {
-            debug!(
-                particle_id = %offer.from,
-                source_ip = %source_ip,
-                "offer arrived from an address not listed for the sender"
-            );
-            field.add_address(&offer.from, source_ip);
-        }
-        drop(field);
         if !self.manifest.accepts.contains(&offer.kind) {
             return Err(format!(
                 "this particle does not accept {} payloads",
@@ -1002,6 +1075,23 @@ impl Particle {
         {
             return Err("offer label exceeds 200 characters".into());
         }
+        let inbox = self.inbox.lock().await;
+        if inbox.iter().any(|item| item.sync_id == offer.sync_id) {
+            return Err("sync_id already in use".into());
+        }
+        let mut in_flight = self
+            .in_flight
+            .lock()
+            .map_err(|_| "in-flight transfer lock poisoned".to_owned())?;
+        if in_flight.contains(&offer.sync_id) {
+            return Err("sync_id already in use".into());
+        }
+        match std::fs::symlink_metadata(self.data_dir.join("inbox").join(&offer.sync_id)) {
+            Ok(_) => return Err("sync_id already in use".into()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(format!("could not inspect sync_id path: {error}")),
+        }
+        in_flight.insert(offer.sync_id.clone());
         Ok(())
     }
 }
@@ -1126,6 +1216,7 @@ mod tests {
         pairing::join(&root_b, &pairing::encode_code(&key), false).unwrap();
         let a_port = free_port();
         let b_port = port_other_than(a_port);
+        let (notification_tx, mut notification_rx) = mpsc::channel(8);
         let (b, _) = Particle::start(
             options(
                 "particle-b",
@@ -1133,7 +1224,7 @@ mod tests {
                 root_b,
                 Some(format!("127.0.0.1:{a_port}")),
             ),
-            None,
+            Some(notification_tx),
         )
         .await
         .unwrap();
@@ -1205,6 +1296,82 @@ mod tests {
             .find(|item| item["kind"] == "file")
             .unwrap();
         assert_eq!(file_item["text"], "native transport file");
+        let duplicate_id = file_item["sync_id"].as_str().unwrap();
+        let original_file = b
+            .data_dir
+            .join("inbox")
+            .join(duplicate_id)
+            .join("source.txt");
+        assert!(original_file.exists());
+        let decision = b
+            .on_offer(
+                &PeerInfo {
+                    addr: SocketAddr::from(([127, 0, 0, 1], a.manifest.link_port)),
+                    remote_static: entangle_transport::public_key(&a._identity.static_private),
+                },
+                SyncOffer {
+                    from: a.manifest.particle_id.clone(),
+                    sync_id: duplicate_id.to_owned(),
+                    timeout_secs: 60,
+                    kind: StateKind::File,
+                    name: "source.txt".into(),
+                    size: b"native transport file".len() as u64,
+                    sha256: file_item["sha256"].as_str().unwrap().into(),
+                    label: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            decision,
+            SyncDecision::Reject(reason) if reason == "sync_id already in use"
+        ));
+        assert!(original_file.exists());
+        while notification_rx.try_recv().is_ok() {}
+
+        let failed_id = "d00dd00dd00dd00dd00dd00dd00dd00d";
+        let inbox_dir = b.data_dir.join("inbox");
+        tokio::fs::create_dir(inbox_dir.join(format!("{failed_id}.json")))
+            .await
+            .unwrap();
+        let failed_payload = b"{\"persist\":\"failure\"}";
+        let failed_source = temp.path().join("failure.json");
+        tokio::fs::write(&failed_source, failed_payload)
+            .await
+            .unwrap();
+        let failed_offer = entangle_link::offer(
+            SocketAddr::from(([127, 0, 0, 1], b_port)),
+            a.keys.clone(),
+            SyncOffer {
+                from: a.manifest.particle_id.clone(),
+                sync_id: failed_id.into(),
+                timeout_secs: 60,
+                kind: StateKind::Json,
+                name: "failure.json".into(),
+                size: failed_payload.len() as u64,
+                sha256: hex::encode(Sha256::digest(failed_payload)),
+                label: None,
+            },
+            tokio::fs::File::open(failed_source).await.unwrap(),
+            Duration::from_secs(15),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            failed_offer,
+            entangle_link::OfferOutcome::Failed(reason)
+                if reason.contains("unable to persist received inbox metadata")
+        ));
+        assert!(!inbox_dir.join(failed_id).exists());
+        assert!(!inbox_dir.join(format!("{failed_id}.json.tmp")).exists());
+        assert!(!b
+            .inbox
+            .lock()
+            .await
+            .iter()
+            .any(|item| item.sync_id == failed_id));
+        assert!(notification_rx.try_recv().is_err());
+        assert!(!b.in_flight.lock().unwrap().contains(failed_id));
         assert_eq!(
             b.field
                 .read()
@@ -1522,6 +1689,7 @@ mod tests {
                 },
                 &offer,
             )
+            .await
             .unwrap_err();
         assert_eq!(error, "sender key does not match the entangled particle");
         particle.shutdown().await;

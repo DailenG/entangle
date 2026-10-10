@@ -44,8 +44,15 @@ pub async fn persist(inbox_dir: &Path, item: &InboxItem) -> io::Result<()> {
     let contents = serde_json::to_vec(item)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
 
-    tokio::fs::write(&temporary, contents).await?;
-    tokio::fs::rename(temporary, metadata).await
+    let result = async {
+        tokio::fs::write(&temporary, contents).await?;
+        tokio::fs::rename(&temporary, metadata).await
+    }
+    .await;
+    if result.is_err() {
+        let _ = tokio::fs::remove_file(temporary).await;
+    }
+    result
 }
 
 /// Removes an inbox item's metadata without deleting its payload files.

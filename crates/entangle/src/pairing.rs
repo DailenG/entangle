@@ -32,6 +32,9 @@ pub enum PairingError {
     /// A pairing key file exists but does not contain a valid key.
     #[error("the pairing key file is malformed; use --force to replace it")]
     MalformedKey,
+    /// The pairing key path is not a regular file.
+    #[error("the pairing key path is not a regular file")]
+    NotRegularFile,
     /// An operation requires a pairing key that is not present.
     #[error("this machine is not paired")]
     NotPaired,
@@ -123,10 +126,13 @@ fn key_path(data_root: &Path) -> PathBuf {
 }
 
 fn read_key(path: &Path) -> Result<Option<[u8; 32]>, PairingError> {
-    #[cfg(unix)]
-    match fs::metadata(path) {
-        Ok(_) => repair_permissions(path)?,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_file() => {
+            #[cfg(unix)]
+            repair_permissions(path)?;
+        }
+        Ok(_) => return Err(PairingError::NotRegularFile),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error.into()),
     }
     let contents = match fs::read_to_string(path) {
@@ -146,10 +152,14 @@ fn read_key(path: &Path) -> Result<Option<[u8; 32]>, PairingError> {
 }
 
 #[cfg(unix)]
-fn repair_permissions(path: &Path) -> io::Result<()> {
+fn repair_permissions(path: &Path) -> Result<(), PairingError> {
     use std::os::unix::fs::PermissionsExt;
 
-    if fs::metadata(path)?.permissions().mode() & 0o077 != 0 {
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_file() {
+        return Err(PairingError::NotRegularFile);
+    }
+    if metadata.permissions().mode() & 0o077 != 0 {
         warn!(path = %path.display(), "repairing pairing key permissions to 0600");
         fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
     }
@@ -322,6 +332,27 @@ mod tests {
         assert_eq!(
             fs::metadata(path).unwrap().permissions().mode() & 0o777,
             0o600
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_pairing_key_is_rejected_without_changing_target_permissions() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let directory = tempdir().unwrap();
+        let target = directory.path().join("target.key");
+        fs::write(&target, hex_encode(&[0x47; 32])).unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o644)).unwrap();
+        symlink(&target, key_path(directory.path())).unwrap();
+
+        assert!(matches!(
+            load(directory.path()),
+            Err(PairingError::NotRegularFile)
+        ));
+        assert_eq!(
+            fs::metadata(target).unwrap().permissions().mode() & 0o777,
+            0o644
         );
     }
 }

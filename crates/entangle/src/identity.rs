@@ -7,7 +7,19 @@ use std::{
     io::{ErrorKind, Write},
     path::Path,
 };
+use thiserror::Error;
 use tracing::{info, warn};
+
+/// Error while loading or repairing the persistent identity.
+#[derive(Debug, Error)]
+pub enum IdentityError {
+    /// A required identity file operation failed.
+    #[error("identity key I/O failed: {0}")]
+    Io(#[from] std::io::Error),
+    /// The Noise static key path is not a regular file.
+    #[error("the Noise static key path is not a regular file")]
+    NotRegularFile,
+}
 
 /// The identity claimed by this process and the lock keeping it exclusive.
 pub struct Identity {
@@ -18,7 +30,7 @@ pub struct Identity {
 }
 
 /// Claims the persistent identity for a data root, or generates an ephemeral one.
-pub fn claim(root: &Path) -> std::io::Result<Identity> {
+pub fn claim(root: &Path) -> Result<Identity, IdentityError> {
     if let Err(error) = fs::create_dir_all(root) {
         warn!(
             path = %root.display(),
@@ -105,7 +117,7 @@ pub fn claim(root: &Path) -> std::io::Result<Identity> {
     persistent(id, lock, root)
 }
 
-fn persistent(id: ParticleId, lock: File, root: &Path) -> std::io::Result<Identity> {
+fn persistent(id: ParticleId, lock: File, root: &Path) -> Result<Identity, IdentityError> {
     Ok(Identity {
         id,
         persistent: true,
@@ -123,13 +135,16 @@ fn ephemeral() -> Identity {
     }
 }
 
-fn load_or_create_static(root: &Path) -> std::io::Result<[u8; 32]> {
+fn load_or_create_static(root: &Path) -> Result<[u8; 32], IdentityError> {
     let path = root.join("noise_static.key");
-    #[cfg(unix)]
-    match fs::metadata(&path) {
-        Ok(_) => repair_permissions(&path)?,
+    match fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.file_type().is_file() => {
+            #[cfg(unix)]
+            repair_permissions(&path)?;
+        }
+        Ok(_) => return Err(IdentityError::NotRegularFile),
         Err(error) if error.kind() == ErrorKind::NotFound => {}
-        Err(error) => return Err(error),
+        Err(error) => return Err(error.into()),
     }
     match fs::read_to_string(&path) {
         Ok(contents) => {
@@ -171,10 +186,14 @@ fn load_or_create_static(root: &Path) -> std::io::Result<[u8; 32]> {
 }
 
 #[cfg(unix)]
-fn repair_permissions(path: &Path) -> std::io::Result<()> {
+fn repair_permissions(path: &Path) -> Result<(), IdentityError> {
     use std::os::unix::fs::PermissionsExt;
 
-    if fs::metadata(path)?.permissions().mode() & 0o077 != 0 {
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_file() {
+        return Err(IdentityError::NotRegularFile);
+    }
+    if metadata.permissions().mode() & 0o077 != 0 {
         warn!(path = %path.display(), "repairing Noise static key permissions to 0600");
         fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
     }
@@ -276,6 +295,30 @@ mod tests {
         assert_eq!(
             fs::metadata(path).unwrap().permissions().mode() & 0o777,
             0o600
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_noise_static_key_is_rejected_without_changing_target_permissions() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let temp = tempfile::tempdir().unwrap();
+        let identity = claim(temp.path()).unwrap();
+        drop(identity);
+        fs::remove_file(temp.path().join("noise_static.key")).unwrap();
+        let target = temp.path().join("target.key");
+        fs::write(&target, hex::encode([0x5a; 32])).unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o644)).unwrap();
+        symlink(&target, temp.path().join("noise_static.key")).unwrap();
+
+        assert!(matches!(
+            claim(temp.path()),
+            Err(IdentityError::NotRegularFile)
+        ));
+        assert_eq!(
+            fs::metadata(target).unwrap().permissions().mode() & 0o777,
+            0o644
         );
     }
 
