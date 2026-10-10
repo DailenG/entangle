@@ -171,3 +171,4 @@ case ":${PATH:-}:" in
     *":$install_dir:"*) ;;
     *) printf "Add Entangle to PATH with: export PATH=\"%s:\$PATH\"\n" "$install_dir" ;;
 esac
+printf 'Reload or restart your MCP client so it runs this version.\n'
