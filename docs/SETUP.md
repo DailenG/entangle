@@ -149,6 +149,9 @@ are written separately to stderr.
    received file path, then optionally set `collapse: true` to consume the
    inbox entry.
 
+Received items survive Entangle restarts and MCP client reloads until they are
+collapsed. Collapsing removes the inbox entry; received files remain on disk.
+
 ## Troubleshooting
 
 - **No peers appear:** check UDP 5353, multicast/VLAN policy, and Wi-Fi client
