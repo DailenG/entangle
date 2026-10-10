@@ -43,6 +43,12 @@ jobs:
             binary: entangle
             archive: tar.gz
             asset: entangle-x86_64-unknown-linux-gnu.tar.gz
+          - os: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+            rustflags: ""
+            binary: entangle
+            archive: tar.gz
+            asset: entangle-aarch64-unknown-linux-gnu.tar.gz
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -124,4 +130,5 @@ jobs:
             dist/entangle-aarch64-apple-darwin.tar.gz
             dist/entangle-x86_64-apple-darwin.tar.gz
             dist/entangle-x86_64-unknown-linux-gnu.tar.gz
+            dist/entangle-aarch64-unknown-linux-gnu.tar.gz
             dist/SHA256SUMS

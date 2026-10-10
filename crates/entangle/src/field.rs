@@ -55,8 +55,18 @@ impl Field {
     }
 
     /// Stores a validated manifest and marks the peer entangled.
-    pub fn entangle(&mut self, mut resonance: Resonance, manifest: Manifest, static_key: [u8; 32]) {
+    #[must_use]
+    pub fn entangle(
+        &mut self,
+        mut resonance: Resonance,
+        manifest: Manifest,
+        static_key: [u8; 32],
+    ) -> bool {
         let id = resonance.particle_id.clone();
+        let newly_entangled = !self
+            .peers
+            .get(&id)
+            .is_some_and(|existing| existing.state == PeerState::Entangled);
         self.bindings.insert(id.clone(), static_key);
         if let Some(existing) = self.peers.get(&id) {
             for address in &existing.resonance.addrs {
@@ -75,6 +85,7 @@ impl Field {
                 last_seen: Instant::now(),
             },
         );
+        newly_entangled
     }
 
     /// Removes a peer which disappeared from mDNS.
@@ -194,7 +205,7 @@ mod tests {
             group: None,
             proto: PROTOCOL_VERSION,
         });
-        field.entangle(
+        assert!(field.entangle(
             Resonance {
                 particle_id: id.clone(),
                 name: "peer".into(),
@@ -207,7 +218,7 @@ mod tests {
             },
             manifest(id.clone()),
             [0x42; 32],
-        );
+        ));
         let peer = field.by_id(&id).unwrap();
         assert_eq!(peer.state, PeerState::Entangled);
         assert!(peer.resonance.addrs.contains(&"192.0.2.1".parse().unwrap()));
@@ -216,6 +227,29 @@ mod tests {
             field.view(None, false)[0]["key_fingerprint"],
             hex::encode(Sha256::digest([0x42; 32]))[..16]
         );
+    }
+
+    #[test]
+    fn entangle_reports_only_state_transitions() {
+        let id = ParticleId::generate();
+        let mut field = Field::default();
+        let resonance = || Resonance {
+            particle_id: id.clone(),
+            name: "peer".into(),
+            hostname: "peer.local.".into(),
+            addrs: vec!["192.0.2.1".parse().unwrap()],
+            port: 7337,
+            context: None,
+            group: None,
+            proto: PROTOCOL_VERSION,
+        };
+
+        assert!(field.entangle(resonance(), manifest(id.clone()), [0x42; 32]));
+        assert!(!field.entangle(resonance(), manifest(id.clone()), [0x42; 32]));
+
+        field.remove(&id);
+        field.resonate(resonance());
+        assert!(field.entangle(resonance(), manifest(id.clone()), [0x42; 32]));
     }
 
     #[test]

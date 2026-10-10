@@ -801,16 +801,24 @@ impl Particle {
                     group: None,
                     proto: manifest.protocol,
                 });
-                self.field.write().expect("field lock").entangle(
+                let newly_entangled = self.field.write().expect("field lock").entangle(
                     resonance,
                     manifest.clone(),
                     remote_static,
                 );
-                info!(
-                    "peer entangled: {} ({})",
-                    manifest.name,
-                    manifest.particle_id.short()
-                );
+                if newly_entangled {
+                    info!(
+                        "peer entangled: {} ({})",
+                        manifest.name,
+                        manifest.particle_id.short()
+                    );
+                } else {
+                    debug!(
+                        "peer entangled: {} ({})",
+                        manifest.name,
+                        manifest.particle_id.short()
+                    );
+                }
                 true
             }
             Ok((manifest, _)) => {
@@ -1002,7 +1010,14 @@ impl LinkHandler for Particle {
                 group: existing.and_then(|record| record.resonance.group),
                 proto: manifest.protocol,
             };
-            field.entangle(resonance, manifest, peer.remote_static);
+            let peer_name = manifest.name.clone();
+            let particle_id = manifest.particle_id.clone();
+            let newly_entangled = field.entangle(resonance, manifest, peer.remote_static);
+            if newly_entangled {
+                info!("peer entangled: {} ({})", peer_name, particle_id.short());
+            } else {
+                debug!("peer entangled: {} ({})", peer_name, particle_id.short());
+            }
         }
         Ok(self.manifest.clone())
     }
@@ -1626,11 +1641,11 @@ mod tests {
             group: particle.pairing_group.read().unwrap().clone(),
             proto: manifest.protocol,
         };
-        particle
+        assert!(particle
             .field
             .write()
             .unwrap()
-            .entangle(resonance, manifest.clone(), [0x11; 32]);
+            .entangle(resonance, manifest.clone(), [0x11; 32]));
         let invalid_offer = SyncOffer {
             from: id.clone(),
             sync_id: "../x".into(),

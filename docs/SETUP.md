@@ -27,7 +27,9 @@ curl -fsSL https://raw.githubusercontent.com/DailenG/entangle/main/install.sh | 
 The installer requires no administrator or `sudo` rights. macOS/Linux installs
 into `$HOME/.local/bin` by default and prints a PATH hint if needed. Windows
 installs into `%LOCALAPPDATA%\Programs\entangle\bin` and adds that directory
-to the current user's PATH only.
+to the current user's PATH only. Prebuilt downloads support Linux x86_64 and
+aarch64, macOS Intel and Apple silicon, and Windows x86_64 (including ARM64
+through x64 emulation).
 
 Configure the installers with these environment variables:
 
@@ -167,6 +169,9 @@ are written separately to stderr.
 4. Ask agent B to call `observe_entangled_states`. Check the JSON value or
    received file path, then optionally set `collapse: true` to consume the
    inbox entry.
+
+The response's `remaining` count is the number of items still in the inbox
+after the call (after collapse, if requested).
 
 Received items survive Entangle restarts and MCP client reloads until they are
 collapsed. Collapsing removes the inbox entry; received files remain on disk.
