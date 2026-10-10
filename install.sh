@@ -20,6 +20,9 @@ case "$system/$machine" in
     Linux/x86_64|Linux/amd64)
         target=x86_64-unknown-linux-gnu
         ;;
+    Linux/aarch64|Linux/arm64)
+        target=aarch64-unknown-linux-gnu
+        ;;
     *)
         printf 'Unsupported platform %s/%s. Install from source with: cargo install --git https://github.com/DailenG/entangle entangle\n' "$system" "$machine" >&2
         exit 1
@@ -102,4 +105,11 @@ case ":${PATH:-}:" in
 esac
 printf 'Reload or restart your MCP client so it runs this version.\n'
 printf 'Pairing-key changes take effect without a client reload; binary upgrades require one.\n'
-printf 'Pair this machine: run `entangle pair init` on your first machine, then `entangle pair join <code>` here.\n'
+pair_status=$("$install_dir/entangle" pair status 2>/dev/null) || pair_status=
+paired=$(printf '%s\n' "$pair_status" | awk '$1 == "paired:" { print $2; exit }')
+group=$(printf '%s\n' "$pair_status" | awk '$1 == "group:" { print $2; exit }')
+if [ "$paired" = yes ] && [ -n "$group" ] && [ "$group" != none ]; then
+    printf 'Already paired (group %s); no pairing needed.\n' "$group"
+else
+    printf "Pair this machine: run \`entangle pair init\` on your first machine, then \`entangle pair join <code>\` here.\n"
+fi

@@ -147,7 +147,28 @@ try {
     }
     Write-Output 'Reload or restart your MCP client so it runs this version.'
     Write-Output 'Pairing-key changes take effect without a client reload; binary upgrades require one.'
-    Write-Output 'Pair this machine: run `entangle pair init` on your first machine, then `entangle pair join <code>` here.'
+    $pairStatusOutput = @()
+    $pairStatusSucceeded = $false
+    try {
+        $pairStatusOutput = @(& $binaryPath pair status 2>$null)
+        $pairStatusSucceeded = $LASTEXITCODE -eq 0
+    } catch {
+        $pairStatusOutput = @()
+    }
+    $paired = $false
+    $pairingGroup = $null
+    foreach ($line in $pairStatusOutput) {
+        if ($line -match '^paired: yes$') {
+            $paired = $true
+        } elseif ($line -match '^group: (.+)$') {
+            $pairingGroup = $matches[1]
+        }
+    }
+    if ($pairStatusSucceeded -and $paired -and $pairingGroup -and $pairingGroup -ne 'none') {
+        Write-Output "Already paired (group $pairingGroup); no pairing needed."
+    } else {
+        Write-Output 'Pair this machine: run `entangle pair init` on your first machine, then `entangle pair join <code>` here.'
+    }
 } finally {
     Remove-Item -LiteralPath $tempDir -Recurse -Force -ErrorAction SilentlyContinue
 }

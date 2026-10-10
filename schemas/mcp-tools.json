@@ -120,7 +120,10 @@
               "required": ["sync_id", "from_particle_id", "kind", "received_at", "bytes", "sha256"]
             }
           },
-          "remaining": { "type": "integer" }
+          "remaining": {
+            "type": "integer",
+            "description": "Items still in the inbox after this call (after collapse, if requested)."
+          }
         },
         "required": ["states", "remaining"]
       }

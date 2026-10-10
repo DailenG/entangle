@@ -13,7 +13,7 @@ use std::{
 };
 use thiserror::Error;
 use tokio::sync::mpsc as tokio_mpsc;
-use tracing::info;
+use tracing::{debug, info};
 
 /// mDNS service name used by all Entangle particles.
 pub const SERVICE_TYPE: &str = "_entangle._tcp.local.";
@@ -181,12 +181,21 @@ fn bridge_events(
         let outgoing = match event {
             ServiceEvent::ServiceResolved(info) => match decode_service(&info) {
                 Ok(peer) if peer.particle_id != own_id => {
-                    fullnames.insert(info.fullname.clone(), peer.particle_id.clone());
-                    info!(
-                        "peer detected: {} ({})",
-                        peer.name,
-                        peer.particle_id.short()
-                    );
+                    let previous =
+                        fullnames.insert(info.fullname.clone(), peer.particle_id.clone());
+                    if previous.as_ref() != Some(&peer.particle_id) {
+                        info!(
+                            "peer detected: {} ({})",
+                            peer.name,
+                            peer.particle_id.short()
+                        );
+                    } else {
+                        debug!(
+                            "peer detected: {} ({})",
+                            peer.name,
+                            peer.particle_id.short()
+                        );
+                    }
                     Some(ResonanceEvent::Detected(peer))
                 }
                 _ => None,
