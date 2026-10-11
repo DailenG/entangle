@@ -18,7 +18,7 @@ the public pairing-group ID, never the pairing key.
 | --- | --- |
 | Particle | A running Entangle process with a persistent identity |
 | Resonance | Local network discovery through mDNS |
-| Entangled | A peer whose capability manifest completed the Hello handshake |
+| Entangled | A peer approved by the human on this machine and allowed to sync |
 | State sync | A JSON message or one-file transfer between entangled peers |
 | Observe | Read received state syncs from the local inbox |
 | Collapse | Consume observed inbox entries; received files remain on disk |
@@ -67,8 +67,9 @@ The MCP tools are `find_entangled_particles`, `sync_entangled_state`, and
 ## Design and security
 
 The crate boundaries, message flow, wire format, and security limitations are
-documented in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). Version 0.2 is not
-wire-compatible with 0.1.x; upgrade both devices before pairing.
+documented in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). Version 0.3 is not
+wire-compatible with 0.1.x or 0.2.x; upgrade all devices before pairing and
+approve each peer once on every machine.
 
 ## License
 

@@ -19,6 +19,9 @@ pub enum IdentityError {
     /// The Noise static key path is not a regular file.
     #[error("the Noise static key path is not a regular file")]
     NotRegularFile,
+    /// The persisted identity or Noise static key is malformed.
+    #[error("the persistent identity data is malformed")]
+    MalformedPersistentIdentity,
 }
 
 /// The identity claimed by this process and the lock keeping it exclusive.
@@ -115,6 +118,46 @@ pub fn claim(root: &Path) -> Result<Identity, IdentityError> {
     }
 
     persistent(id, lock, root)
+}
+
+/// Reads a saved identity without acquiring its process lock or creating files.
+pub fn read_saved(root: &Path) -> Result<Option<(ParticleId, [u8; 32])>, IdentityError> {
+    let identity_path = root.join("identity");
+    match fs::symlink_metadata(&identity_path) {
+        Ok(metadata) if metadata.file_type().is_file() => {}
+        Ok(_) => return Err(IdentityError::MalformedPersistentIdentity),
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    }
+    let identity_contents = fs::read_to_string(&identity_path)?;
+    let id = ParticleId::parse(identity_contents.trim().to_owned())
+        .map_err(|_| IdentityError::MalformedPersistentIdentity)?;
+
+    let key_path = root.join("noise_static.key");
+    match fs::symlink_metadata(&key_path) {
+        Ok(metadata) if metadata.file_type().is_file() => {
+            #[cfg(unix)]
+            repair_permissions(&key_path)?;
+        }
+        Ok(_) => return Err(IdentityError::NotRegularFile),
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            return Ok(None);
+        }
+        Err(error) => return Err(error.into()),
+    }
+    let key_text = fs::read_to_string(&key_path)?;
+    if key_text.len() != 64
+        || !key_text
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(IdentityError::MalformedPersistentIdentity);
+    }
+    let key = hex::decode(key_text)
+        .map_err(|_| IdentityError::MalformedPersistentIdentity)?
+        .try_into()
+        .map_err(|_| IdentityError::MalformedPersistentIdentity)?;
+    Ok(Some((id, key)))
 }
 
 fn persistent(id: ParticleId, lock: File, root: &Path) -> Result<Identity, IdentityError> {

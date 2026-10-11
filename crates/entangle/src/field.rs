@@ -11,6 +11,8 @@ use std::{collections::HashMap, net::IpAddr, time::Instant};
 pub enum PeerState {
     /// The peer was discovered but its Hello handshake has not completed.
     Resonating,
+    /// The peer authenticated but still needs local human approval.
+    Pending,
     /// The peer exchanged compatible manifests.
     Entangled,
 }
@@ -88,9 +90,48 @@ impl Field {
         newly_entangled
     }
 
+    /// Stores an authenticated peer without granting it sync permission.
+    #[must_use]
+    pub fn pend(
+        &mut self,
+        mut resonance: Resonance,
+        manifest: Manifest,
+        static_key: [u8; 32],
+    ) -> bool {
+        let id = resonance.particle_id.clone();
+        let newly_pending = !self
+            .peers
+            .get(&id)
+            .is_some_and(|existing| existing.state == PeerState::Pending);
+        self.bindings.insert(id.clone(), static_key);
+        if let Some(existing) = self.peers.get(&id) {
+            for address in &existing.resonance.addrs {
+                if !resonance.addrs.contains(address) {
+                    resonance.addrs.push(*address);
+                }
+            }
+        }
+        self.peers.insert(
+            id,
+            PeerRecord {
+                resonance,
+                manifest: Some(manifest),
+                static_key: Some(static_key),
+                state: PeerState::Pending,
+                last_seen: Instant::now(),
+            },
+        );
+        newly_pending
+    }
+
     /// Removes a peer which disappeared from mDNS.
     pub fn remove(&mut self, id: &ParticleId) {
         self.peers.remove(id);
+    }
+
+    /// Removes an explicit trust binding after local approval is revoked.
+    pub fn unbind(&mut self, id: &ParticleId) {
+        self.bindings.remove(id);
     }
 
     /// Returns the static key first authenticated for this particle ID.
@@ -150,7 +191,12 @@ impl Field {
                 let key_fingerprint = record
                     .static_key
                     .map(|key| hex::encode(Sha256::digest(key))[..16].to_owned());
-                json!({
+                let state = match record.state {
+                    PeerState::Resonating => "resonating",
+                    PeerState::Pending => "pending",
+                    PeerState::Entangled => "entangled",
+                };
+                let mut view = json!({
                     "particle_id": record.resonance.particle_id.as_str(),
                     "name": record.resonance.name,
                     "hostname": record.resonance.hostname,
@@ -158,10 +204,15 @@ impl Field {
                     "port": record.resonance.port,
                     "context": record.resonance.context,
                     "key_fingerprint": key_fingerprint,
-                    "state": if record.state == PeerState::Entangled { "entangled" } else { "resonating" },
+                    "state": state,
                     "manifest": record.manifest,
                     "last_seen_secs": record.last_seen.elapsed().as_secs()
-                })
+                });
+                if record.state == PeerState::Pending {
+                    view["approval"] =
+                        json!("Waiting for the human to run `entangle peer approve` on this machine.");
+                }
+                view
             })
             .collect()
     }
