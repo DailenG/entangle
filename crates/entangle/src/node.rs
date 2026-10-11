@@ -1476,11 +1476,11 @@ impl Particle {
         let mut established = None;
         if let Some(socket) = direct_socket {
             match self
-                .sync_handshake(&Route::Direct(socket), &peer, remote_key)
+                .sync_handshake(&Route::Direct(socket), remote_key)
                 .await
             {
                 Ok(stream) => established = Some((stream, "direct")),
-                Err(error) => debug!(%error, "direct link handshake failed before sync offer"),
+                Err(error) => debug!(%error, "direct Noise connection failed before sync offer"),
             }
         }
         if established.is_none() {
@@ -1501,10 +1501,10 @@ impl Particle {
                     dialer,
                     target: remote_key,
                 }));
-                match self.sync_handshake(&route, &peer, remote_key).await {
+                match self.sync_handshake(&route, remote_key).await {
                     Ok(stream) => established = Some((stream, "repeater")),
                     Err(error) => {
-                        debug!(%error, "repeater link handshake failed before sync offer")
+                        debug!(%error, "repeater Noise connection failed before sync offer")
                     }
                 }
             }
@@ -1570,23 +1570,13 @@ impl Particle {
     async fn sync_handshake(
         &self,
         route: &Route,
-        peer: &PeerRecord,
         expected_static: [u8; 32],
     ) -> Result<SecureStream, String> {
-        let (manifest, remote_static, stream) = entangle_link::handshake_stream(
-            route,
-            self.keys.clone(),
-            &self.manifest,
-            Duration::from_secs(5),
-        )
-        .await
-        .map_err(|error| error.to_string())?;
-        if manifest.protocol != PROTOCOL_VERSION
-            || manifest.particle_id != peer.resonance.particle_id
-        {
-            return Err("remote particle identity did not match the selected peer".into());
-        }
-        if remote_static != expected_static {
+        let stream =
+            entangle_link::connect_secure(route, self.keys.clone(), Duration::from_secs(5))
+                .await
+                .map_err(|error| error.to_string())?;
+        if stream.remote_static() != expected_static {
             return Err("remote Noise static key did not match the bound peer key".into());
         }
         Ok(stream)
@@ -2744,7 +2734,6 @@ mod tests {
         let failed_offer = entangle_link::offer(
             &Route::Direct(SocketAddr::from(([127, 0, 0, 1], b_port))),
             a.keys.clone(),
-            &a.manifest,
             SyncOffer {
                 from: a.manifest.particle_id.clone(),
                 sync_id: failed_id.into(),

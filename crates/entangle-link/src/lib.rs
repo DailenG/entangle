@@ -334,6 +334,18 @@ pub async fn serve_io(
     serve_connection(stream, peer, handler).await
 }
 
+/// Opens a route and completes only the Noise handshake, without sending Hello.
+pub async fn connect_secure(
+    route: &Route,
+    keys: KeySlot,
+    duration: Duration,
+) -> Result<SecureStream, LinkError> {
+    let keys = current_keys(&keys)?;
+    timeout(duration, connect_route(route, &keys, duration))
+        .await
+        .map_err(|_| LinkError::Timeout)?
+}
+
 /// Connects to a peer, exchanges manifests, and returns its static key.
 pub async fn handshake(
     route: &Route,
@@ -423,7 +435,6 @@ pub async fn recv_verify(stream: &mut SecureStream) -> Result<VerifyMessage, Lin
 pub async fn offer<R>(
     route: &Route,
     keys: KeySlot,
-    manifest: &Manifest,
     offer: SyncOffer,
     source: R,
     duration: Duration,
@@ -431,7 +442,7 @@ pub async fn offer<R>(
 where
     R: AsyncRead + Unpin + Send,
 {
-    let (_, _, stream) = handshake_stream(route, keys, manifest, duration).await?;
+    let stream = connect_secure(route, keys, duration).await?;
     offer_on(stream, offer, source, duration).await
 }
 
@@ -550,10 +561,7 @@ async fn serve_connection(
                             .await?;
                         write_frame(&mut stream, &response.into()).await?;
                     }
-                    frame => match offer_from_frame(frame) {
-                        Ok(offer) => return serve_offer(&mut stream, &peer, &handler, offer).await,
-                        Err(frame) => return Err(LinkError::Unexpected(format!("{frame:?}"))),
-                    },
+                    frame => return Err(LinkError::Unexpected(format!("{frame:?}"))),
                 }
             }
             Ok(())
@@ -856,7 +864,6 @@ mod tests {
         let outcome = offer(
             &route,
             key_slot(&key),
-            &manifest(),
             make_offer(payload.len()),
             &payload[..],
             Duration::from_secs(5),
@@ -903,7 +910,6 @@ mod tests {
         let outcome = offer(
             &route,
             key_slot(&key),
-            &manifest(),
             sync_offer,
             &payload[..],
             Duration::from_secs(5),
@@ -918,7 +924,7 @@ mod tests {
             }
         );
         assert_eq!(*received.lock().unwrap(), payload);
-        assert_eq!(*relayed.lock().unwrap(), vec![true, true, true]);
+        assert_eq!(*relayed.lock().unwrap(), vec![true, true]);
     }
 
     #[tokio::test]
@@ -963,6 +969,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sync_offer_after_hello_is_rejected_to_preserve_wire_compatibility() {
+        let key = keys();
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let (address, task) = start_listener(
+            key.clone(),
+            Arc::new(accepting_handler(manifest(), Arc::clone(&received))),
+        )
+        .await;
+        let route = Route::Direct(address);
+        let (_, _, stream) =
+            handshake_stream(&route, key_slot(&key), &manifest(), Duration::from_secs(2))
+                .await
+                .unwrap();
+
+        let result = offer_on(stream, make_offer(1), &b"x"[..], Duration::from_secs(2)).await;
+        assert!(result.is_err());
+        assert!(received.lock().unwrap().is_empty());
+        task.abort();
+    }
+
+    #[tokio::test]
     async fn source_shorter_than_offer_size_fails() {
         let key = keys();
         let received = Arc::new(Mutex::new(Vec::new()));
@@ -975,7 +1002,6 @@ mod tests {
         let result = offer(
             &route,
             key_slot(&key),
-            &manifest(),
             make_offer(5),
             &b"abc"[..],
             Duration::from_secs(2),
@@ -998,7 +1024,6 @@ mod tests {
         let outcome = offer(
             &route,
             key_slot(&key),
-            &manifest(),
             make_offer(3),
             &b"abcdef"[..],
             Duration::from_secs(2),
@@ -1051,7 +1076,6 @@ mod tests {
         let outcome = offer(
             &route,
             key_slot(&key),
-            &manifest(),
             make_offer(0),
             &b""[..],
             Duration::from_secs(2),
