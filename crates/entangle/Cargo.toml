@@ -16,6 +16,7 @@ async-trait.workspace = true
 anyhow.workspace = true
 chrono.workspace = true
 clap.workspace = true
+crossterm = "0.28.1"
 dirs.workspace = true
 data-encoding.workspace = true
 gethostname.workspace = true

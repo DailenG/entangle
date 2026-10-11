@@ -180,9 +180,10 @@ after the call (after collapse, if requested).
 All machines must run 0.3 before they can communicate; the protocol is not
 compatible with 0.2.x. Each peer must be approved once on each machine. On
 machine B, run `entangle peer verify` and compare its card with machine A.
-On A, run `entangle peer approve` and choose the matching set; A then shows
-its card. On B, run `entangle peer approve` and choose A's card. Approval is
-human-only; agents must not perform these commands or relay the emoji.
+On A, run `entangle peer approve` and press the number for the matching set; A
+then shows its card. On B, run `entangle peer approve` and press the number for
+A's card. Approval is human-only; agents must not perform these commands or
+relay the emoji.
 
 Use `entangle peer revoke <peer>` to revoke an approval. Use
 `entangle peer forget <peer>` to remove saved approval, denial, and

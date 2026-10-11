@@ -4,6 +4,10 @@ use crate::{identity, trust};
 use anyhow::{anyhow, bail, Result};
 use chrono::{SecondsFormat, Utc};
 use clap::Subcommand;
+use crossterm::{
+    event::{read, Event, KeyCode, KeyEventKind, KeyModifiers},
+    terminal::{disable_raw_mode, enable_raw_mode},
+};
 use entangle_core::sas;
 use rand::seq::SliceRandom;
 use serde::Serialize;
@@ -53,6 +57,64 @@ fn human_only(command: &PeerCommand) -> bool {
             | PeerCommand::Revoke { .. }
             | PeerCommand::Forget { .. }
     )
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum KeyOutcome {
+    Pick(u8),
+    Cancel,
+    Invalid,
+    Ignore,
+}
+
+fn classify_key(code: KeyCode, modifiers: KeyModifiers) -> KeyOutcome {
+    match code {
+        KeyCode::Esc => KeyOutcome::Cancel,
+        KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => KeyOutcome::Cancel,
+        KeyCode::Char('1') => KeyOutcome::Pick(1),
+        KeyCode::Char('2') => KeyOutcome::Pick(2),
+        KeyCode::Char('3') => KeyOutcome::Pick(3),
+        KeyCode::Char('4') => KeyOutcome::Pick(4),
+        KeyCode::Char('5') => KeyOutcome::Pick(5),
+        _ => KeyOutcome::Invalid,
+    }
+}
+
+fn classify_event(event: Event) -> KeyOutcome {
+    match event {
+        Event::Key(key) if key.kind == KeyEventKind::Press => classify_key(key.code, key.modifiers),
+        _ => KeyOutcome::Ignore,
+    }
+}
+
+struct RawModeGuard;
+
+impl RawModeGuard {
+    fn enter() -> io::Result<Self> {
+        enable_raw_mode()?;
+        Ok(Self)
+    }
+}
+
+impl Drop for RawModeGuard {
+    fn drop(&mut self) {
+        let _ = disable_raw_mode();
+    }
+}
+
+fn read_approval_key() -> Result<KeyOutcome> {
+    let _raw_mode = RawModeGuard::enter()?;
+    loop {
+        match classify_event(read()?) {
+            KeyOutcome::Ignore => continue,
+            outcome => return Ok(outcome),
+        }
+    }
+}
+
+fn cancel_approval(output: &mut dyn Write) -> Result<i32> {
+    writeln!(output, "\r\nCancelled; nothing was approved or denied.")?;
+    Ok(1)
 }
 
 pub fn run(
@@ -313,23 +375,25 @@ fn approve(
         writeln!(output, "{}) {}", index + 1, sas::render(*option))?;
     }
     writeln!(output, "5) none of these")?;
-    let mut input = String::new();
-    let mut choice = None;
-    for _ in 0..3 {
-        write!(output, "Choose 1-5: ")?;
+    let mut invalid_keys = 0;
+    let choice = loop {
+        write!(output, "Press 1-5: ")?;
         output.flush()?;
-        input.clear();
-        io::stdin().read_line(&mut input)?;
-        match input.trim().parse::<usize>() {
-            Ok(value @ 1..=5) => {
-                choice = Some(value);
-                break;
+        match read_approval_key()? {
+            KeyOutcome::Pick(value) => {
+                writeln!(output, "{value}")?;
+                break usize::from(value);
             }
-            _ => writeln!(output, "Please enter a number from 1 to 5.")?,
+            KeyOutcome::Cancel => return cancel_approval(output),
+            KeyOutcome::Invalid => {
+                invalid_keys += 1;
+                writeln!(output, "\r\nPress a number from 1 to 5.")?;
+                if invalid_keys == 3 {
+                    return cancel_approval(output);
+                }
+            }
+            KeyOutcome::Ignore => unreachable!("ignored events are filtered by read_approval_key"),
         }
-    }
-    let Some(choice) = choice else {
-        bail!("too many invalid selections");
     };
     let key: [u8; 32] = hex::decode(&record.remote_key)?
         .try_into()
@@ -431,6 +495,44 @@ fn forget(data_root: &Path, query: &str, output: &mut dyn Write) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn approval_keypresses_select_digits_one_through_five() {
+        for (code, selection) in [
+            (KeyCode::Char('1'), 1),
+            (KeyCode::Char('2'), 2),
+            (KeyCode::Char('3'), 3),
+            (KeyCode::Char('4'), 4),
+            (KeyCode::Char('5'), 5),
+        ] {
+            assert_eq!(
+                classify_key(code, KeyModifiers::NONE),
+                KeyOutcome::Pick(selection)
+            );
+        }
+    }
+
+    #[test]
+    fn approval_keypresses_cancel_or_reject_other_keys() {
+        assert_eq!(
+            classify_key(KeyCode::Esc, KeyModifiers::NONE),
+            KeyOutcome::Cancel
+        );
+        assert_eq!(
+            classify_key(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            KeyOutcome::Cancel
+        );
+        for code in [
+            KeyCode::Char('0'),
+            KeyCode::Char('6'),
+            KeyCode::Char('a'),
+            KeyCode::Char('c'),
+            KeyCode::Char('z'),
+            KeyCode::Enter,
+        ] {
+            assert_eq!(classify_key(code, KeyModifiers::NONE), KeyOutcome::Invalid);
+        }
+    }
 
     #[test]
     fn verification_records_are_scoped_to_the_saved_identity_key() {
