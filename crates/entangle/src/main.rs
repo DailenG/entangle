@@ -6,7 +6,9 @@ mod identity;
 mod inbox;
 mod node;
 mod pairing;
+mod peer;
 mod tools;
+mod trust;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -46,6 +48,11 @@ enum Command {
     Pair {
         #[command(subcommand)]
         command: PairCommand,
+    },
+    /// Inspect and manage locally approved peers.
+    Peer {
+        #[command(subcommand)]
+        command: peer::PeerCommand,
     },
 }
 
@@ -119,6 +126,17 @@ async fn main() -> Result<()> {
             }
         }
         Command::Pair { command } => run_pairing(cli.options.data_root(), command)?,
+        Command::Peer { command } => {
+            let data_root = cli.options.data_root();
+            let local_name = identity::read_saved(&data_root)
+                .ok()
+                .flatten()
+                .map(|(id, _)| cli.options.particle_name(&id));
+            let exit_code = peer::run(command, &data_root, local_name.as_deref())?;
+            if exit_code != 0 {
+                std::process::exit(exit_code);
+            }
+        }
         Command::Node => {
             let (node, _) = node::Particle::start(cli.options, None).await?;
             node.wait_for_shutdown().await;

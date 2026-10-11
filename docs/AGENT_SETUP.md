@@ -117,12 +117,18 @@ join <code>` on the others in their own terminal. Then verify with
 `entangle pair status` or `find_entangled_particles.self.paired`. The code is
 a secret and must not be sent through Entangle or included in logs.
 
-Both devices must run version 0.2; it cannot communicate with 0.1.x peers.
-Upgrade both devices before pairing.
+Both devices must run version 0.3; it cannot communicate with 0.2.x or 0.1.x
+peers. Upgrade all devices before pairing.
 Pairing-key changes take effect without a client reload; upgrading the Entangle
 binary still requires restarting or reloading the MCP client.
 If `find_entangled_particles.self.warning` is present, report its text verbatim
 to the human. Never kill or stop processes to resolve it.
+
+Peer approval is human-only. You may run `entangle peer list` and
+`entangle peer emoji`; never run `peer verify`, `peer approve`, `peer deny`,
+`peer revoke`, or `peer forget`. Never relay or describe the emoji to the
+human. If a peer is pending, tell the human to run `entangle peer approve` on
+this machine and compare the cards themselves.
 
 ## 3. Use this machine's identity
 
@@ -264,8 +270,8 @@ to the human. Never kill or stop processes to resolve it.
    ```
 
    **Verify:** `entangle scan` shows the other particle, and
-   `find_entangled_particles` returns this particle's manifest under `self`
-   and the remote particle with state `entangled` after its Hello handshake.
+   `find_entangled_particles` returns this particle's manifest under `self`;
+   remote peers remain `pending` until the human approves them on this machine.
 
    **If this fails:** Check that the other node is running, both machines use
    the intended ports, and the network permits the traffic above. Ask the

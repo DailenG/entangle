@@ -82,6 +82,36 @@ pub enum Frame {
         /// Human-readable failure reason.
         reason: String,
     },
+    /// Commit/reveal verification message exchanged after Hello.
+    Verify {
+        /// Committer's lowercase hex commitment.
+        commitment: Option<String>,
+        /// Revealer's lowercase hex nonce.
+        nonce: Option<String>,
+        /// Committer's lowercase hex nonce reveal.
+        reveal: Option<String>,
+    },
+}
+
+/// Optional values carried by one peer-verification round.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct VerifyMessage {
+    /// Committer's lowercase hex commitment.
+    pub commitment: Option<String>,
+    /// Revealer's lowercase hex nonce.
+    pub nonce: Option<String>,
+    /// Committer's lowercase hex nonce reveal.
+    pub reveal: Option<String>,
+}
+
+impl From<VerifyMessage> for Frame {
+    fn from(message: VerifyMessage) -> Self {
+        Self::Verify {
+            commitment: message.commitment,
+            nonce: message.nonce,
+            reveal: message.reveal,
+        }
+    }
 }
 
 /// State-sync offer contents excluding the serde enum wrapper.
@@ -211,6 +241,13 @@ pub trait LinkHandler: Send + Sync + 'static {
     /// Validates an incoming manifest and returns this particle's manifest.
     async fn on_hello(&self, peer: &PeerInfo, manifest: Manifest) -> Result<Manifest, LinkError>;
 
+    /// Ingests and responds to a verification round on the Hello connection.
+    async fn on_verify(
+        &self,
+        peer: &PeerInfo,
+        message: VerifyMessage,
+    ) -> Result<VerifyMessage, LinkError>;
+
     /// Validates an incoming offer before the listener acknowledges it.
     async fn on_offer(&self, peer: &PeerInfo, offer: SyncOffer) -> Result<SyncDecision, LinkError>;
 
@@ -271,6 +308,17 @@ pub async fn handshake(
     manifest: &Manifest,
     duration: Duration,
 ) -> Result<(Manifest, [u8; 32]), LinkError> {
+    let (manifest, remote_static, _) = handshake_stream(addr, keys, manifest, duration).await?;
+    Ok((manifest, remote_static))
+}
+
+/// Connects, exchanges manifests, and returns the authenticated stream for Verify rounds.
+pub async fn handshake_stream(
+    addr: SocketAddr,
+    keys: KeySlot,
+    manifest: &Manifest,
+    duration: Duration,
+) -> Result<(Manifest, [u8; 32], SecureStream), LinkError> {
     let keys = current_keys(&keys)?;
     timeout(duration, async {
         let mut stream = entangle_transport::connect(addr, &keys, duration).await?;
@@ -282,7 +330,10 @@ pub async fn handshake(
         )
         .await?;
         match read_frame(&mut stream).await {
-            Ok(Frame::Hello { manifest }) => Ok((manifest, stream.remote_static())),
+            Ok(Frame::Hello { manifest }) => {
+                let remote_static = stream.remote_static();
+                Ok((manifest, remote_static, stream))
+            }
             Ok(frame) => Err(LinkError::Unexpected(format!("{frame:?}"))),
             Err(LinkError::Transport(TransportError::Io(error)))
                 if matches!(
@@ -301,6 +352,38 @@ pub async fn handshake(
     })
     .await
     .map_err(|_| LinkError::Timeout)?
+}
+
+/// Sends one Verify message over the already-authenticated Hello stream.
+pub async fn send_verify(
+    stream: &mut SecureStream,
+    message: &VerifyMessage,
+) -> Result<(), LinkError> {
+    write_frame(
+        stream,
+        &Frame::Verify {
+            commitment: message.commitment.clone(),
+            nonce: message.nonce.clone(),
+            reveal: message.reveal.clone(),
+        },
+    )
+    .await
+}
+
+/// Receives one Verify message over the already-authenticated Hello stream.
+pub async fn recv_verify(stream: &mut SecureStream) -> Result<VerifyMessage, LinkError> {
+    match read_frame(stream).await? {
+        Frame::Verify {
+            commitment,
+            nonce,
+            reveal,
+        } => Ok(VerifyMessage {
+            commitment,
+            nonce,
+            reveal,
+        }),
+        frame => Err(LinkError::Unexpected(format!("{frame:?}"))),
+    }
 }
 
 /// Sends a sync offer, streams exactly its declared bytes, and waits for completion.
@@ -386,7 +469,30 @@ async fn serve_connection(
     match read_frame(&mut stream).await? {
         Frame::Hello { manifest } => {
             let own = handler.on_hello(&peer, manifest).await?;
-            write_frame(&mut stream, &Frame::Hello { manifest: own }).await
+            write_frame(&mut stream, &Frame::Hello { manifest: own }).await?;
+            for _ in 0..4 {
+                match read_frame(&mut stream).await? {
+                    Frame::Verify {
+                        commitment,
+                        nonce,
+                        reveal,
+                    } => {
+                        let response = handler
+                            .on_verify(
+                                &peer,
+                                VerifyMessage {
+                                    commitment,
+                                    nonce,
+                                    reveal,
+                                },
+                            )
+                            .await?;
+                        write_frame(&mut stream, &response.into()).await?;
+                    }
+                    frame => return Err(LinkError::Unexpected(format!("{frame:?}"))),
+                }
+            }
+            Ok(())
         }
         Frame::SyncOffer {
             from,
@@ -514,6 +620,14 @@ mod tests {
             Ok(self.manifest.clone())
         }
 
+        async fn on_verify(
+            &self,
+            _peer: &PeerInfo,
+            message: VerifyMessage,
+        ) -> Result<VerifyMessage, LinkError> {
+            Ok(message)
+        }
+
         async fn on_offer(
             &self,
             _peer: &PeerInfo,
@@ -545,6 +659,14 @@ mod tests {
             _manifest: Manifest,
         ) -> Result<Manifest, LinkError> {
             Ok(self.0.clone())
+        }
+
+        async fn on_verify(
+            &self,
+            _peer: &PeerInfo,
+            message: VerifyMessage,
+        ) -> Result<VerifyMessage, LinkError> {
+            Ok(message)
         }
 
         async fn on_offer(
@@ -629,6 +751,46 @@ mod tests {
             }
         );
         assert_eq!(*received.lock().unwrap(), payload);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn hello_connection_supports_four_verify_rounds() {
+        let key = keys();
+        let expected = manifest();
+        let (address, task) = start_listener(
+            key.clone(),
+            Arc::new(AcceptingHandler {
+                manifest: expected.clone(),
+                received: Arc::new(Mutex::new(Vec::new())),
+            }),
+        )
+        .await;
+        let (peer, remote_static, mut stream) =
+            handshake_stream(address, key_slot(&key), &manifest(), Duration::from_secs(2))
+                .await
+                .unwrap();
+        assert_eq!(peer, expected);
+        assert_ne!(remote_static, [0; 32]);
+
+        for index in 0..4 {
+            let message = VerifyMessage {
+                commitment: Some(format!("{index:064x}")),
+                nonce: None,
+                reveal: None,
+            };
+            write_frame(&mut stream, &message.clone().into())
+                .await
+                .unwrap();
+            assert_eq!(
+                read_frame(&mut stream).await.unwrap(),
+                Frame::Verify {
+                    commitment: message.commitment,
+                    nonce: message.nonce,
+                    reveal: message.reveal,
+                }
+            );
+        }
         task.abort();
     }
 

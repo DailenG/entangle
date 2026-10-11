@@ -4,8 +4,10 @@ use rand::{rngs::OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 use std::{fmt, path::Path};
 
+pub mod sas;
+
 /// Current version of the Entangle control protocol.
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// A process-unique particle identity rendered as 32 lowercase hexadecimal digits.
 #[derive(Clone, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]

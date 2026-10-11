@@ -37,6 +37,33 @@ streams exactly the declared payload size in encrypted messages; each receive
 chunk has a five-second idle timeout. The receiver verifies the byte count and
 SHA-256 before adding the item to its inbox.
 
+## Human peer approval
+
+Protocol version 3 separates authentication from authorization. A valid
+pairing-key Noise handshake places a previously unapproved peer in `pending`;
+neither side may sync until its local operator approves that peer. Approved
+particle IDs are pinned to their Noise static public keys. Decisions live in
+`<data_root>/peers/trust.json`; node-owned commit/reveal state is kept in
+`<data_root>/peers/verify/<particle_id>.json`. Unix directories and files use
+private permissions, and writes are atomic.
+
+The lower static public key is the committer and the higher is the revealer.
+The committer first commits to a random nonce with
+`SHA-256("entangle-sas-commit-v1" || nonce_c || key_c || key_r)`. Only after
+the revealer's nonce is received does the committer reveal its nonce. Both
+derive three 6-bit emoji indices from
+`SHA-256("entangle-sas-v1" || version || key_c || key_r || nonce_c || nonce_r)`.
+Commit-then-reveal prevents either peer from grinding its nonce in response to
+the other's; an active attacker who already knows the pairing key has a
+1-in-262,144 chance of making all three displayed emoji match by chance.
+Operators compare the set out of band before approving.
+
+Approval is local to each machine. `peer verify` displays this machine's card;
+the human uses `peer approve` on both devices. Agents may inspect `peer list`
+and `peer emoji`, but approval, denial, revocation, and forgetting are
+human-only operations. An ephemeral identity never reads or writes the trust
+store and cannot persist peer approval.
+
 ## Execution flow
 
 ```mermaid
@@ -57,18 +84,17 @@ sequenceDiagram
     B-->>A: MCP notification
 ```
 
-The 0.2 protocol is not wire-compatible with 0.1.x; upgrade both devices
+The protocol is not wire-compatible with 0.1.x or 0.2.x; upgrade all devices
 before pairing. MCP continues to use JSON-RPC 2.0 with newline-delimited
 messages on stdio. Logs go to stderr; stdout belongs exclusively to MCP.
 
 ## Security model and limitations
 
-Noise encrypts and authenticates the link using the pairing-derived PSK, and
-each peer's static public key is bound to its claimed particle ID for the
-current process. This release does not provide persistent peer pinning across
-restarts or peer approval. It is not post-quantum secure beyond the PSK mixing.
-The optional `--context` value is a project label, not an authorization
-boundary; pairing is the access control.
+Noise encrypts and authenticates the link using the pairing-derived PSK.
+Approved static keys are pinned to particle IDs across restarts. A first
+contact remains pending until a human compares and approves the SAS. The
+optional `--context` value is a project label, not an authorization boundary.
+It is not post-quantum secure beyond the PSK mixing.
 Pairing codes are secrets: transfer them only between humans, never through
 Entangle or to an agent. Keep the key file private and use only devices trusted
 with the same pairing key.

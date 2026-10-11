@@ -83,8 +83,9 @@ and router configuration.
 
 ## Pairing
 
-Version 0.2 requires both devices to use the same pairing key and cannot
-communicate with version 0.1.x peers. Upgrade both devices before pairing.
+Version 0.3 requires all devices to use the same pairing key and cannot
+communicate with version 0.2.x or 0.1.x peers. Upgrade all devices before
+pairing and approve every peer once on each machine.
 The pairing key is never advertised; mDNS publishes only its 8-character
 group ID.
 Migration: croc is no longer required by Entangle 0.2; remove an old
@@ -163,14 +164,30 @@ are written separately to stderr.
 1. Start the configured MCP server on both devices and check that both
    processes stay running.
 2. Run `entangle scan` on each device. The other particle should appear.
-3. Ask agent A to call `find_entangled_particles`, then send a small JSON
+3. A human approves each peer on both machines using the flow below. Agents
+   must not compare or relay the verification emoji.
+4. Ask agent A to call `find_entangled_particles`, then send a small JSON
    value or file with `sync_entangled_state`.
-4. Ask agent B to call `observe_entangled_states`. Check the JSON value or
+5. Ask agent B to call `observe_entangled_states`. Check the JSON value or
    received file path, then optionally set `collapse: true` to consume the
    inbox entry.
 
 The response's `remaining` count is the number of items still in the inbox
 after the call (after collapse, if requested).
+
+## Human peer approval
+
+All machines must run 0.3 before they can communicate; the protocol is not
+compatible with 0.2.x. Each peer must be approved once on each machine. On
+machine B, run `entangle peer verify` and compare its card with machine A.
+On A, run `entangle peer approve` and choose the matching set; A then shows
+its card. On B, run `entangle peer approve` and choose A's card. Approval is
+human-only; agents must not perform these commands or relay the emoji.
+
+Use `entangle peer revoke <peer>` to revoke an approval. Use
+`entangle peer forget <peer>` to remove saved approval, denial, and
+verification state before starting over. Agents may run `entangle peer list`
+and `entangle peer emoji` only.
 
 Received items survive Entangle restarts and MCP client reloads until they are
 collapsed. Collapsing removes the inbox entry; received files remain on disk.
