@@ -2250,7 +2250,14 @@ mod tests {
     }
 
     fn canonical_temp_root(temp: &tempfile::TempDir) -> PathBuf {
-        temp.path().canonicalize().unwrap()
+        #[cfg(target_os = "macos")]
+        {
+            temp.path().canonicalize().unwrap()
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            temp.path().to_path_buf()
+        }
     }
 
     fn port_other_than(other: u16) -> u16 {
@@ -3489,6 +3496,9 @@ mod tests {
         for particle in [&a, &b] {
             particle.reconnect_base_ms.store(100, Ordering::Relaxed);
             particle.reconnect_cap_ms.store(400, Ordering::Relaxed);
+            particle
+                .repeater_directory_poll_ms
+                .store(100, Ordering::Relaxed);
         }
         wait_for_repeater(&a, &b).await;
         approve_pair(&a, &b, &root_a, &root_b).await;
