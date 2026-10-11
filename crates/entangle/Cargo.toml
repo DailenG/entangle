@@ -12,6 +12,7 @@ entangle-resonance = { path = "../entangle-resonance" }
 entangle-transport = { path = "../entangle-transport" }
 entangle-link = { path = "../entangle-link" }
 entangle-mcp = { path = "../entangle-mcp" }
+entangle-repeater = { path = "../entangle-repeater" }
 async-trait.workspace = true
 anyhow.workspace = true
 chrono.workspace = true

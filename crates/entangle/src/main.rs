@@ -7,6 +7,7 @@ mod inbox;
 mod node;
 mod pairing;
 mod peer;
+mod repeater;
 mod tools;
 mod trust;
 
@@ -57,6 +58,11 @@ enum Command {
     Peer {
         #[command(subcommand)]
         command: peer::PeerCommand,
+    },
+    /// Manage Quantum Repeater host and device enrollment.
+    Repeater {
+        #[command(subcommand)]
+        command: repeater::RepeaterCommand,
     },
 }
 
@@ -155,6 +161,13 @@ async fn run() -> Result<()> {
                 .map(|(id, _)| cli.options.particle_name(&id));
             let mut output = io::stdout().lock();
             let exit_code = peer::run(command, &data_root, local_name.as_deref(), &mut output)?;
+            if exit_code != 0 {
+                std::process::exit(exit_code);
+            }
+        }
+        Command::Repeater { command } => {
+            let mut output = io::stdout().lock();
+            let exit_code = repeater::run(command, &cli.options, &mut output).await?;
             if exit_code != 0 {
                 std::process::exit(exit_code);
             }
