@@ -350,19 +350,31 @@ fn reject_symlink_components(path: &Path) -> Result<(), StoreError> {
 mod tests {
     use super::*;
 
+    fn test_root_path(path: &Path) -> PathBuf {
+        #[cfg(target_os = "macos")]
+        {
+            path.canonicalize().unwrap()
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            path.to_path_buf()
+        }
+    }
+
     #[test]
     fn creates_private_host_key() {
         let root = tempfile::tempdir().unwrap();
-        let store = Store::new(root.path());
+        let root_path = test_root_path(root.path());
+        let store = Store::new(&root_path);
         let key = store.key().unwrap();
         assert_eq!(store.key().unwrap(), key);
-        let text = fs::read_to_string(root.path().join("repeater.key")).unwrap();
+        let text = fs::read_to_string(root_path.join("repeater.key")).unwrap();
         assert_eq!(text.trim().len(), 64);
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             assert_eq!(
-                fs::metadata(root.path().join("repeater.key"))
+                fs::metadata(root_path.join("repeater.key"))
                     .unwrap()
                     .permissions()
                     .mode()
@@ -379,19 +391,21 @@ mod tests {
 
         let root = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
-        fs::write(outside.path().join("devices.json"), b"{\"devices\":{}}").unwrap();
+        let root_path = test_root_path(root.path());
+        let outside_path = test_root_path(outside.path());
+        fs::write(outside_path.join("devices.json"), b"{\"devices\":{}}").unwrap();
         symlink(
-            outside.path().join("devices.json"),
-            root.path().join("devices.json"),
+            outside_path.join("devices.json"),
+            root_path.join("devices.json"),
         )
         .unwrap();
         assert!(matches!(
-            Store::new(root.path()).devices(),
+            Store::new(&root_path).devices(),
             Err(StoreError::UnsafePath)
         ));
 
-        let link = root.path().join("linked-root");
-        symlink(outside.path(), &link).unwrap();
+        let link = root_path.join("linked-root");
+        symlink(&outside_path, &link).unwrap();
         assert!(matches!(
             Store::new(link).devices(),
             Err(StoreError::UnsafePath)

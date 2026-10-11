@@ -29,7 +29,7 @@ const NOISE: &str = "Noise_IK_25519_ChaChaPoly_BLAKE2s";
 pub enum ClientError {
     /// WebSocket transport failure.
     #[error("repeater WebSocket failed: {0}")]
-    WebSocket(#[from] tokio_tungstenite::tungstenite::Error),
+    WebSocket(#[source] Box<tokio_tungstenite::tungstenite::Error>),
     /// Socket I/O failure.
     #[error("repeater I/O failed: {0}")]
     Io(#[from] io::Error),
@@ -42,6 +42,12 @@ pub enum ClientError {
     /// A protocol JSON payload could not be encoded or decoded.
     #[error("repeater JSON failed: {0}")]
     Json(#[from] serde_json::Error),
+}
+
+impl From<tokio_tungstenite::tungstenite::Error> for ClientError {
+    fn from(error: tokio_tungstenite::tungstenite::Error) -> Self {
+        Self::WebSocket(Box::new(error))
+    }
 }
 
 type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;

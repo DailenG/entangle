@@ -192,8 +192,24 @@ fn noise_params() -> NoiseParams {
 /// Binds the configured WebSocket endpoint and serves until Ctrl+C.
 pub async fn serve(config: ServerConfig) -> Result<(), ServerError> {
     let listener = TcpListener::bind(config.listen).await?;
+    serve_with_listener(listener, config.path, config.root).await
+}
+
+#[cfg(test)]
+pub(crate) async fn serve_on_listener(
+    listener: TcpListener,
+    config: ServerConfig,
+) -> Result<(), ServerError> {
+    serve_with_listener(listener, config.path, config.root).await
+}
+
+async fn serve_with_listener(
+    listener: TcpListener,
+    path: String,
+    root: PathBuf,
+) -> Result<(), ServerError> {
     let shared = Arc::new(Shared {
-        store: Arc::new(Store::new(config.root)),
+        store: Arc::new(Store::new(root)),
         peers: Arc::new(Mutex::new(HashMap::new())),
         links: Arc::new(Mutex::new(HashMap::new())),
         handshake_limiter: StdMutex::new(HandshakeLimiter::default()),
@@ -213,7 +229,7 @@ pub async fn serve(config: ServerConfig) -> Result<(), ServerError> {
                 return Ok(());
             }
         };
-        let path = config.path.clone();
+        let path = path.clone();
         let shared = Arc::clone(&shared);
         tokio::spawn(async move {
             let mut stream = BufStream::new(stream);

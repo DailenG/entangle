@@ -8,7 +8,7 @@ use entangle_transport::{self, LinkKeys};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::json;
 use sha2::{Digest, Sha256};
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use std::{net::SocketAddr, path::Path, sync::Arc, time::Duration};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
@@ -19,6 +19,7 @@ use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 struct TestServer {
     _root: tempfile::TempDir,
+    root_path: std::path::PathBuf,
     url: String,
     public: [u8; 32],
     handle: JoinHandle<Result<(), server::ServerError>>,
@@ -30,21 +31,36 @@ impl Drop for TestServer {
     }
 }
 
+fn test_root_path(path: &Path) -> std::path::PathBuf {
+    #[cfg(target_os = "macos")]
+    {
+        path.canonicalize().unwrap()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        path.to_path_buf()
+    }
+}
+
 async fn start_server() -> TestServer {
     let root = tempfile::tempdir().unwrap();
-    let store = Store::new(root.path());
+    let root_path = test_root_path(root.path());
+    let store = Store::new(&root_path);
     let private = store.key().unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    drop(listener);
-    let handle = tokio::spawn(server::serve(ServerConfig {
-        listen: addr,
-        path: "/entangle".into(),
-        root: root.path().to_owned(),
-    }));
+    let handle = tokio::spawn(server::serve_on_listener(
+        listener,
+        ServerConfig {
+            listen: addr,
+            path: "/entangle".into(),
+            root: root_path.clone(),
+        },
+    ));
     tokio::time::sleep(Duration::from_millis(30)).await;
     TestServer {
         _root: root,
+        root_path,
         url: format!("ws://{addr}/entangle"),
         public: entangle_transport::public_key(&private),
         handle,
@@ -89,7 +105,7 @@ async fn rejected_without_msg2(
 }
 
 fn server_store(server: &TestServer) -> Store {
-    Store::new(server._root.path())
+    Store::new(&server.root_path)
 }
 
 async fn open_sessions(
