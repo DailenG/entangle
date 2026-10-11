@@ -1,6 +1,6 @@
 //! Host and device administration for the Quantum Repeater.
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use clap::Subcommand;
 use entangle_repeater::{client, invite, server, store::Store};
 use rand::RngCore;
@@ -111,6 +111,26 @@ pub(crate) fn websocket_host(url: &str) -> Result<&str> {
     Ok(host)
 }
 
+fn short_fingerprint(public: &[u8; 32]) -> String {
+    hex::encode(sha2::Sha256::digest(public))[..8].to_owned()
+}
+
+fn join_summary(host: &str, repeater_public: &[u8; 32], device_public: &[u8; 32]) -> String {
+    format!(
+        "Joined the Quantum Repeater at {host} (repeater fingerprint {}).\nThis device's fingerprint: {} (listed by `entangle repeater devices` on the host).\nA running Entangle node connects within 30 seconds; check with `entangle repeater status`.",
+        short_fingerprint(repeater_public),
+        short_fingerprint(device_public)
+    )
+}
+
+fn leave_summary(removed: bool) -> &'static str {
+    if removed {
+        "Left the Quantum Repeater: removed this device's saved configuration. The host keeps this device enrolled until it is revoked there."
+    } else {
+        "This device has not joined a Quantum Repeater; nothing to remove."
+    }
+}
+
 pub(crate) fn read_config(path: &Path) -> Result<Option<RepeaterConfig>> {
     let Some(bytes) = read_regular_file(path)? else {
         return Ok(None);
@@ -144,7 +164,7 @@ pub async fn run(
             writeln!(
                 output,
                 "repeater key fingerprint: {}",
-                hex::encode(sha2::Sha256::digest(public))[..8].to_owned()
+                short_fingerprint(&public)
             )?;
             output.flush()?;
             server::serve(server::ServerConfig {
@@ -187,7 +207,7 @@ pub async fn run(
                 writeln!(
                     output,
                     "{} {} {}",
-                    hex::encode(sha2::Sha256::digest(public))[..8].to_owned(),
+                    short_fingerprint(&public),
                     device.label.unwrap_or_default(),
                     if device.revoked { "revoked" } else { "active" }
                 )?;
@@ -209,10 +229,9 @@ pub async fn run(
                 .keys()
                 .filter(|key| {
                     hex::decode(key)
-                        .map(|bytes| {
-                            hex::encode(sha2::Sha256::digest(bytes))[..8].starts_with(&fingerprint)
-                        })
-                        .unwrap_or(false)
+                        .ok()
+                        .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
+                        .is_some_and(|public| short_fingerprint(&public).starts_with(&fingerprint))
                 })
                 .cloned()
                 .collect::<Vec<_>>();
@@ -224,7 +243,7 @@ pub async fn run(
         }
         RepeaterCommand::Join { code } => {
             let parsed = invite::decode(&code)?;
-            websocket_host(&parsed.url)?;
+            let host = websocket_host(&parsed.url)?.to_owned();
             let root = options.data_root();
             let static_private = match crate::identity::read_saved(&root)? {
                 Some((_, static_private)) => static_private,
@@ -236,6 +255,7 @@ pub async fn run(
                     identity.static_private
                 }
             };
+            let device_public = entangle_transport::public_key(&static_private);
             client::enroll(
                 &parsed.url,
                 static_private,
@@ -243,12 +263,19 @@ pub async fn run(
                 parsed.secret,
                 None,
             )
-            .await?;
+            .await
+            .with_context(|| format!("could not join the Quantum Repeater at {host}"))?;
             let config = RepeaterConfig {
                 url: parsed.url,
                 repeater_public_key: hex::encode(parsed.repeater_public_key),
             };
-            write_private_json(&options.data_root().join("repeater.json"), &config)?;
+            write_private_json(&options.data_root().join("repeater.json"), &config)
+                .with_context(|| format!("could not join the Quantum Repeater at {host}"))?;
+            writeln!(
+                output,
+                "{}",
+                join_summary(&host, &parsed.repeater_public_key, &device_public)
+            )?;
         }
         RepeaterCommand::Status => {
             let path = options.data_root().join("repeater.json");
@@ -262,7 +289,7 @@ pub async fn run(
                 writeln!(
                     output,
                     "repeater fingerprint: {}",
-                    hex::encode(sha2::Sha256::digest(public))[..8].to_owned()
+                    short_fingerprint(&public)
                 )?;
             } else {
                 writeln!(output, "configured: no")?;
@@ -271,12 +298,16 @@ pub async fn run(
         RepeaterCommand::Leave => {
             let path = options.data_root().join("repeater.json");
             reject_symlink_components(&path)?;
-            match fs::symlink_metadata(&path) {
-                Ok(meta) if meta.file_type().is_file() => fs::remove_file(path)?,
+            let summary = match fs::symlink_metadata(&path) {
+                Ok(meta) if meta.file_type().is_file() => {
+                    fs::remove_file(path)?;
+                    leave_summary(true)
+                }
                 Ok(_) => bail!("repeater configuration is not a regular file"),
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => leave_summary(false),
                 Err(error) => return Err(error.into()),
-            }
+            };
+            writeln!(output, "{summary}")?;
         }
     }
     Ok(0)
@@ -375,4 +406,46 @@ fn reject_symlink_components(path: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{join_summary, leave_summary, short_fingerprint};
+
+    #[test]
+    fn repeater_short_fingerprint_matches_known_sha256() {
+        assert_eq!(short_fingerprint(&[0; 32]), "66687aad");
+    }
+
+    #[test]
+    fn repeater_join_summary_reports_both_fingerprints() {
+        let repeater_public = [0; 32];
+        let device_public = [1; 32];
+        let repeater_fingerprint = short_fingerprint(&repeater_public);
+        let device_fingerprint = short_fingerprint(&device_public);
+
+        let summary = join_summary("relay.example", &repeater_public, &device_public);
+        assert_eq!(
+            summary,
+            format!(
+                "Joined the Quantum Repeater at relay.example (repeater fingerprint {repeater_fingerprint}).\nThis device's fingerprint: {device_fingerprint} (listed by `entangle repeater devices` on the host).\nA running Entangle node connects within 30 seconds; check with `entangle repeater status`."
+            )
+        );
+        assert_eq!(
+            summary,
+            "Joined the Quantum Repeater at relay.example (repeater fingerprint 66687aad).\nThis device's fingerprint: 72cd6e84 (listed by `entangle repeater devices` on the host).\nA running Entangle node connects within 30 seconds; check with `entangle repeater status`."
+        );
+    }
+
+    #[test]
+    fn repeater_leave_summary_covers_removed_and_missing_config() {
+        assert_eq!(
+            leave_summary(true),
+            "Left the Quantum Repeater: removed this device's saved configuration. The host keeps this device enrolled until it is revoked there."
+        );
+        assert_eq!(
+            leave_summary(false),
+            "This device has not joined a Quantum Repeater; nothing to remove."
+        );
+    }
 }

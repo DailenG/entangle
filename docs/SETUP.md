@@ -225,6 +225,10 @@ entangle repeater join <code>
 entangle repeater status
 ```
 
+On success, `join` prints the repeater host, both fingerprints, and a reminder
+that the node connects within 30 seconds; the host can confirm enrollment with
+`entangle repeater devices`.
+
 The host can inspect enrolled device fingerprints with
 `entangle repeater devices` and revoke a device by fingerprint prefix with
 `entangle repeater revoke <fingerprint>`. On a device,
