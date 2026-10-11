@@ -173,6 +173,40 @@ async fn split_dialer_lists_peers_and_reports_incoming_sources() {
 }
 
 #[tokio::test]
+async fn incoming_burst_does_not_block_list_or_close_the_session() {
+    let server = start_server().await;
+    let a_private = entangle_transport::generate_static();
+    let b_private = entangle_transport::generate_static();
+    enroll(&server, a_private, [41; 32]).await;
+    enroll(&server, b_private, [42; 32]).await;
+    let (a, b) = open_sessions(&server, a_private, "aaaaaaaa", b_private, "aaaaaaaa").await;
+    let b_public = b.static_public;
+    let (a_dialer, _a_incoming) = a.split();
+    let (b_dialer, b_incoming) = b.split();
+
+    let mut streams = Vec::new();
+    for _ in 0..40 {
+        streams.push(a_dialer.open(b_public).await.unwrap());
+    }
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while b_incoming.queued() < 32 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("incoming queue should fill without blocking the reader");
+
+    let directory = tokio::time::timeout(Duration::from_secs(2), b_dialer.list())
+        .await
+        .expect("LIST must not wait for incoming-stream acceptance")
+        .unwrap();
+    assert_eq!(directory.len(), 1);
+    assert!(!a_dialer.is_closed());
+    assert!(!b_dialer.is_closed());
+    drop(streams);
+}
+
+#[tokio::test]
 async fn sessions_route_large_streams_and_isolate_groups() {
     let server = start_server().await;
     let a_private = entangle_transport::generate_static();

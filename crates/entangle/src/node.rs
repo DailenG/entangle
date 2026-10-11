@@ -17,7 +17,7 @@ use entangle_link::{
 };
 use entangle_repeater::{client as repeater_client, RepeaterDialer};
 use entangle_resonance::{Advertisement, Resonance, ResonanceEvent, Resonator};
-use entangle_transport::{BoxedIo, KeySlot, LinkKeys};
+use entangle_transport::{BoxedIo, KeySlot, LinkKeys, SecureStream};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{
@@ -34,7 +34,7 @@ use std::{
 use tokio::task::JoinHandle;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::{lookup_host, TcpStream},
+    net::lookup_host,
     sync::{mpsc, Mutex, Semaphore},
     time::sleep,
 };
@@ -801,11 +801,11 @@ impl Particle {
                 }
             };
             info!(host, fingerprint, "connected to repeater");
-            let (dialer, mut incoming) = client.split();
+            let (dialer, incoming) = client.split();
             *self.repeater.write().expect("repeater dialer lock") = Some(dialer.clone());
             failures = 0;
             let session_ended = self
-                .run_repeater_session(&dialer, &mut incoming, &config, &group, &mut shutdown)
+                .run_repeater_session(&dialer, incoming, &config, &group, &mut shutdown)
                 .await;
             self.clear_repeater();
             if !session_ended || *shutdown.borrow() {
@@ -825,14 +825,11 @@ impl Particle {
     async fn run_repeater_session(
         self: &Arc<Self>,
         dialer: &RepeaterDialer,
-        incoming: &mut repeater_client::IncomingStreams,
+        incoming: repeater_client::IncomingStreams,
         config: &crate::repeater::RepeaterConfig,
         group: &str,
         shutdown: &mut tokio::sync::watch::Receiver<bool>,
     ) -> bool {
-        if self.refresh_relay_directory(dialer).await.is_err() {
-            return true;
-        }
         let directory_poll = Duration::from_millis(
             self.repeater_directory_poll_ms
                 .load(Ordering::Relaxed)
@@ -845,65 +842,37 @@ impl Particle {
             REPEATER_CONFIG_POLL,
         );
         let mut health_poll = tokio::time::interval(Duration::from_secs(1));
+        let accept_node = self.clone();
+        let accept_dialer = dialer.clone();
+        let mut accept_task = tokio::spawn(async move {
+            accept_node
+                .accept_repeater_streams(accept_dialer, incoming)
+                .await;
+        });
+        if self.refresh_relay_directory(dialer).await.is_err() {
+            accept_task.abort();
+            let _ = accept_task.await;
+            return true;
+        }
+        let mut session_ended = true;
+        let mut accept_task_finished = false;
         loop {
             tokio::select! {
                 changed = shutdown.changed() => {
                     if changed.is_err() || *shutdown.borrow() {
-                        return false;
+                        session_ended = false;
+                        break;
                     }
                 }
-                incoming_stream = incoming.accept() => {
-                    let Some(incoming_stream) = incoming_stream else {
-                        debug!("repeater incoming stream receiver closed");
-                        return true;
-                    };
-                    let local_key = entangle_transport::public_key(&self._identity.static_private);
-                    let source_fingerprint = hex::encode(&Sha256::digest(incoming_stream.source)[..4]);
-                    let serve_fingerprint = source_fingerprint.clone();
-                    let known_in_session_directory = self
-                        .relay_directory
-                        .lock()
-                        .expect("relay directory lock")
-                        .contains(&incoming_stream.source);
-                    debug!(source_fingerprint, "accepted incoming repeater stream");
-                    if incoming_stream.source != local_key {
-                        self.relay_directory
-                            .lock()
-                            .expect("relay directory lock")
-                        .insert(incoming_stream.source);
-                    }
-                    let stream = incoming_stream.stream.into_io();
-                    let node: Arc<dyn LinkHandler> = self.clone();
-                    let keys = self.keys.clone();
-                    tokio::spawn(async move {
-                        let result = entangle_link::serve_io(
-                            stream,
-                            RELAY_PLACEHOLDER,
-                            true,
-                            keys,
-                            node,
-                        )
-                        .await;
-                        match result {
-                            Ok(()) => debug!(source_fingerprint = serve_fingerprint, "relayed peer link ended"),
-                            Err(error) => debug!(source_fingerprint = serve_fingerprint, %error, "relayed peer link failed"),
-                        }
-                    });
-                    if !known_in_session_directory && incoming_stream.source != local_key {
-                        let node = self.clone();
-                        let dialer = dialer.clone();
-                        tokio::spawn(async move {
-                            debug!(source_fingerprint, "refreshing directory for peer missing from the current repeater session");
-                            if let Err(error) = node.refresh_relay_directory(&dialer).await {
-                                debug!(%error, "repeater directory refresh after incoming stream failed");
-                            }
-                        });
-                    }
+                _ = &mut accept_task => {
+                    accept_task_finished = true;
+                    debug!("repeater incoming stream accept task ended");
+                    break;
                 }
                 _ = directory_poll.tick() => {
                     if let Err(error) = self.refresh_relay_directory(dialer).await {
                         debug!(%error, "repeater directory LIST failed");
-                        return true;
+                        break;
                     }
                 }
                 _ = config_poll.tick() => {
@@ -912,7 +881,7 @@ impl Particle {
                             && current.repeater_public_key == config.repeater_public_key => {}
                         _ => {
                             debug!("repeater configuration changed or became unreadable");
-                            return true;
+                            break;
                         }
                     }
                 }
@@ -923,9 +892,73 @@ impl Particle {
                     let group_changed = current_group.as_deref() != Some(group);
                     if closed || !paired || group_changed {
                         debug!(closed, paired, group_changed, "repeater session health check failed");
-                        return true;
+                        break;
                     }
                 }
+            }
+        }
+        if !accept_task_finished {
+            accept_task.abort();
+            let _ = accept_task.await;
+        }
+        session_ended
+    }
+
+    async fn accept_repeater_streams(
+        self: Arc<Self>,
+        dialer: RepeaterDialer,
+        mut incoming: repeater_client::IncomingStreams,
+    ) {
+        loop {
+            let Some(incoming_stream) = incoming.accept().await else {
+                debug!("repeater incoming stream receiver closed");
+                return;
+            };
+            let local_key = entangle_transport::public_key(&self._identity.static_private);
+            let source_fingerprint = hex::encode(&Sha256::digest(incoming_stream.source)[..4]);
+            let serve_fingerprint = source_fingerprint.clone();
+            let known_in_session_directory = self
+                .relay_directory
+                .lock()
+                .expect("relay directory lock")
+                .contains(&incoming_stream.source);
+            debug!(source_fingerprint, "accepted incoming repeater stream");
+            if incoming_stream.source != local_key {
+                self.relay_directory
+                    .lock()
+                    .expect("relay directory lock")
+                    .insert(incoming_stream.source);
+            }
+            let stream = incoming_stream.stream.into_io();
+            let node: Arc<dyn LinkHandler> = self.clone();
+            let keys = self.keys.clone();
+            tokio::spawn(async move {
+                let result =
+                    entangle_link::serve_io(stream, RELAY_PLACEHOLDER, true, keys, node).await;
+                match result {
+                    Ok(()) => debug!(
+                        source_fingerprint = serve_fingerprint,
+                        "relayed peer link ended"
+                    ),
+                    Err(error) => debug!(
+                        source_fingerprint = serve_fingerprint,
+                        %error,
+                        "relayed peer link failed"
+                    ),
+                }
+            });
+            if !known_in_session_directory && incoming_stream.source != local_key {
+                let node = self.clone();
+                let dialer = dialer.clone();
+                tokio::spawn(async move {
+                    debug!(
+                        source_fingerprint,
+                        "refreshing directory for peer missing from the current repeater session"
+                    );
+                    if let Err(error) = node.refresh_relay_directory(&dialer).await {
+                        debug!(%error, "repeater directory refresh after incoming stream failed");
+                    }
+                });
             }
         }
     }
@@ -1421,36 +1454,36 @@ impl Particle {
                 target.max_payload_bytes
             ));
         }
-        let remote_key = peer
-            .static_key
+        let remote_key = self
+            .field
+            .read()
+            .map_err(|_| "peer field lock poisoned".to_owned())?
+            .binding(&peer.resonance.particle_id)
+            .filter(|bound| peer.static_key == Some(*bound))
             .ok_or_else(|| "peer has no authenticated static key".to_owned())?;
-        let direct_socket = if self.options.relay_only {
+        let started = std::time::Instant::now();
+        let direct_socket = if self.options.relay_only || peer.resonance.port == 0 {
             None
         } else {
-            let peer_addr = peer
-                .resonance
+            peer.resonance
                 .addrs
                 .iter()
-                .find(|ip| !ip.is_loopback())
-                .or_else(|| peer.resonance.addrs.first())
-                .copied();
-            if let Some(address) = peer_addr {
-                let socket = SocketAddr::new(address, peer.resonance.port);
-                match tokio::time::timeout(Duration::from_secs(2), TcpStream::connect(socket)).await
-                {
-                    Ok(Ok(probe)) => {
-                        drop(probe);
-                        Some(socket)
-                    }
-                    _ => None,
-                }
-            } else {
-                None
-            }
+                .find(|ip| !ip.is_loopback() && !ip.is_unspecified())
+                .or_else(|| peer.resonance.addrs.iter().find(|ip| !ip.is_unspecified()))
+                .copied()
+                .map(|address| SocketAddr::new(address, peer.resonance.port))
         };
-        let (route, link_path) = if let Some(socket) = direct_socket {
-            (Route::Direct(socket), "direct")
-        } else {
+        let mut established = None;
+        if let Some(socket) = direct_socket {
+            match self
+                .sync_handshake(&Route::Direct(socket), &peer, remote_key)
+                .await
+            {
+                Ok(stream) => established = Some((stream, "direct")),
+                Err(error) => debug!(%error, "direct link handshake failed before sync offer"),
+            }
+        }
+        if established.is_none() {
             let dialer = self
                 .repeater
                 .read()
@@ -1464,35 +1497,37 @@ impl Particle {
                 .expect("relay directory lock")
                 .contains(&remote_key);
             if let Some(dialer) = dialer.filter(|_| listed) {
-                (
-                    Route::Tunnel(Arc::new(RepeaterOpener {
-                        dialer,
-                        target: remote_key,
-                    })),
-                    "repeater",
-                )
-            } else {
-                let hint = if self.repeater_configured.load(Ordering::Relaxed) {
-                    "configure and connect both peers to the repeater, then retry"
-                } else {
-                    "configure a Quantum Repeater with `entangle repeater join` to enable relay fallback"
-                };
-                let reason = if peer.resonance.addrs.is_empty() {
-                    "peer has no usable address"
-                } else {
-                    "peer is unreachable over a direct link"
-                };
-                return Err(format!("{reason}; {hint}"));
+                let route = Route::Tunnel(Arc::new(RepeaterOpener {
+                    dialer,
+                    target: remote_key,
+                }));
+                match self.sync_handshake(&route, &peer, remote_key).await {
+                    Ok(stream) => established = Some((stream, "repeater")),
+                    Err(error) => {
+                        debug!(%error, "repeater link handshake failed before sync offer")
+                    }
+                }
             }
+        }
+        let Some((stream, link_path)) = established else {
+            let hint = if self.repeater_configured.load(Ordering::Relaxed) {
+                "configure and connect both peers to the repeater, then retry"
+            } else {
+                "configure a Quantum Repeater with `entangle repeater join` to enable relay fallback"
+            };
+            let reason = if direct_socket.is_none() {
+                "peer has no usable direct address"
+            } else {
+                "peer could not be authenticated over a direct link"
+            };
+            return Err(format!("{reason}; {hint}"));
         };
         let label = args.get("label").and_then(Value::as_str).map(str::to_owned);
-        let started = std::time::Instant::now();
         let source = tokio::fs::File::open(&path)
             .await
             .map_err(|error| format!("could not open payload {}: {error}", path.display()))?;
-        let result = entangle_link::offer(
-            &route,
-            self.keys.clone(),
+        let result = entangle_link::offer_on(
+            stream,
             SyncOffer {
                 from: self.manifest.particle_id.clone(),
                 sync_id: sync_id.clone(),
@@ -1530,6 +1565,31 @@ impl Particle {
             "path": link_path,
             "elapsed_ms": started.elapsed().as_millis()
         }))
+    }
+
+    async fn sync_handshake(
+        &self,
+        route: &Route,
+        peer: &PeerRecord,
+        expected_static: [u8; 32],
+    ) -> Result<SecureStream, String> {
+        let (manifest, remote_static, stream) = entangle_link::handshake_stream(
+            route,
+            self.keys.clone(),
+            &self.manifest,
+            Duration::from_secs(5),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+        if manifest.protocol != PROTOCOL_VERSION
+            || manifest.particle_id != peer.resonance.particle_id
+        {
+            return Err("remote particle identity did not match the selected peer".into());
+        }
+        if remote_static != expected_static {
+            return Err("remote Noise static key did not match the bound peer key".into());
+        }
+        Ok(stream)
     }
 
     async fn on_detected(&self, peer: Resonance) {
@@ -2129,10 +2189,7 @@ impl Particle {
                 .field
                 .write()
                 .map_err(|_| "peer field lock poisoned".to_owned())?;
-            if field
-                .binding(&offer.from)
-                .is_some_and(|bound| bound != peer_info.remote_static)
-            {
+            if field.binding(&offer.from) != Some(peer_info.remote_static) {
                 return Err("sender key does not match the entangled particle".into());
             }
             let peer = field
@@ -2687,6 +2744,7 @@ mod tests {
         let failed_offer = entangle_link::offer(
             &Route::Direct(SocketAddr::from(([127, 0, 0, 1], b_port))),
             a.keys.clone(),
+            &a.manifest,
             SyncOffer {
                 from: a.manifest.particle_id.clone(),
                 sync_id: failed_id.into(),
@@ -3101,6 +3159,87 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unbound_static_key_cannot_receive_sync_accept_for_approved_particle() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("receiver");
+        pairing::initialize(&root, false).unwrap();
+        let port = free_port();
+        let (particle, _) = Particle::start(options("receiver", port, root.clone(), None), None)
+            .await
+            .unwrap();
+        let id = ParticleId::generate();
+        let manifest = peer_manifest(id.clone());
+        let resonance = Resonance {
+            particle_id: id.clone(),
+            name: manifest.name.clone(),
+            hostname: "peer.local.".into(),
+            addrs: vec![],
+            port: manifest.link_port,
+            context: None,
+            group: particle.pairing_group.read().unwrap().clone(),
+            proto: manifest.protocol,
+        };
+        assert!(particle
+            .field
+            .write()
+            .unwrap()
+            .entangle(resonance, manifest, [0x11; 32]));
+        particle.field.write().unwrap().unbind(&id);
+
+        let receiver_keys = particle
+            .keys
+            .read()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .as_ref()
+            .clone();
+        let attacker_keys = LinkKeys {
+            static_private: entangle_transport::generate_static(),
+            psk: receiver_keys.psk,
+        };
+        let mut stream = entangle_transport::connect(
+            SocketAddr::from(([127, 0, 0, 1], port)),
+            &attacker_keys,
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+        let sync_id = "0123456789abcdef0123456789abcdef";
+        entangle_link::write_frame(
+            &mut stream,
+            &entangle_link::Frame::SyncOffer {
+                from: id.clone(),
+                sync_id: sync_id.into(),
+                timeout_secs: 60,
+                kind: StateKind::Json,
+                name: "forged.json".into(),
+                size: 0,
+                sha256: hex::encode(Sha256::digest([])),
+                label: None,
+            },
+        )
+        .await
+        .unwrap();
+        let reply = entangle_link::read_frame(&mut stream).await.unwrap();
+        assert!(matches!(
+            reply,
+            entangle_link::Frame::SyncReject {
+                sync_id: rejected,
+                reason
+            } if rejected == sync_id && reason.contains("sender key")
+        ));
+        assert!(!particle.data_dir.join("inbox").join(sync_id).exists());
+        assert!(!particle
+            .inbox
+            .lock()
+            .await
+            .iter()
+            .any(|item| item.sync_id == sync_id));
+        particle.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn denied_and_changed_keys_are_rejected_and_revocation_blocks_hello() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("node");
@@ -3401,6 +3540,64 @@ mod tests {
         assert_eq!(peer["path"], "repeater");
         assert_eq!(peer["addrs"], json!([]));
 
+        a.shutdown().await;
+        b.shutdown().await;
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn failed_direct_noise_handshake_falls_back_to_repeater_before_offer() {
+        let temp = tempfile::tempdir().unwrap();
+        let temp_root = canonical_temp_root(&temp);
+        let root_a = temp_root.join("a");
+        let root_b = temp_root.join("b");
+        let repeater_root = temp_root.join("repeater");
+        let (server, _, _) =
+            prepare_test_repeater_pair(&root_a, &root_b, &repeater_root, free_port()).await;
+        let options_a = options("particle-a", free_port(), root_a.clone(), None);
+        let mut options_b = options("particle-b", 0, root_b.clone(), None);
+        options_b.relay_only = true;
+        let (a, _) = Particle::start(options_a, None).await.unwrap();
+        let (b, _) = Particle::start(options_b, None).await.unwrap();
+        wait_for_repeater(&a, &b).await;
+        approve_pair(&a, &b, &root_a, &root_b).await;
+
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let dead_direct_addr = listener.local_addr().unwrap();
+        let unrelated_listener = tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let _ = socket.write_all(b"not a Noise response").await;
+            }
+        });
+        let mut advertised = a
+            .field
+            .read()
+            .unwrap()
+            .by_id(&b.manifest.particle_id)
+            .unwrap()
+            .resonance;
+        advertised.hostname = "127.0.0.1".into();
+        advertised.addrs = vec![dead_direct_addr.ip()];
+        advertised.port = dead_direct_addr.port();
+        a.field.write().unwrap().resonate(advertised);
+
+        let result = a
+            .sync_state(json!({
+                "particle_id": b.manifest.particle_id.as_str(),
+                "state": {"route": "authenticated fallback"},
+                "timeout_secs": 60
+            }))
+            .await
+            .unwrap();
+        assert_eq!(result["path"], "repeater");
+
+        unrelated_listener.abort();
         a.shutdown().await;
         b.shutdown().await;
         server.abort();

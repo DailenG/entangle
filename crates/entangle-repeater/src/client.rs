@@ -24,9 +24,11 @@ use tokio::{
     time::Duration,
 };
 use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream, WebSocketStream};
+use tracing::debug;
 
 const NOISE: &str = "Noise_IK_25519_ChaChaPoly_BLAKE2s";
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+const INCOMING_QUEUE_CAPACITY: usize = 32;
 
 /// Errors returned while establishing or using a repeater session.
 #[derive(Debug, Error)]
@@ -233,7 +235,7 @@ pub async fn enroll(
 fn start_session(ws: Socket, noise: TransportState, static_public: [u8; 32]) -> RepeaterClient {
     let (outgoing, outgoing_rx) = mpsc::channel::<Frame>(128);
     let (control_tx, control) = mpsc::channel(32);
-    let (incoming_tx, incoming) = mpsc::channel(32);
+    let (incoming_tx, incoming) = mpsc::channel(INCOMING_QUEUE_CAPACITY);
     let (shutdown, mut shutdown_rx) = oneshot::channel();
     let routes: Routes = Arc::new(Mutex::new(HashMap::new()));
     let (session_shutdown, watch_rx) = watch::channel(false);
@@ -431,13 +433,44 @@ async fn client_reader(
             }
             INCOMING => {
                 let Ok(source) = <[u8; 32]>::try_from(frame.body.as_slice()) else {
+                    if !send_or_shutdown(
+                        &outgoing,
+                        Frame {
+                            kind: CLOSE,
+                            stream: frame.stream,
+                            body: Vec::new(),
+                        },
+                        &mut shutdown,
+                    )
+                    .await
+                    {
+                        return;
+                    }
                     continue;
                 };
-                let stream = make_stream(frame.stream, &routes, &outgoing, shutdown.clone()).await;
-                if !send_or_shutdown(&incoming, IncomingStream { source, stream }, &mut shutdown)
+                let (stream, pump) =
+                    make_stream(frame.stream, &routes, &outgoing, shutdown.clone()).await;
+                if let Err(error) = incoming.try_send(IncomingStream { source, stream }) {
+                    pump.abort();
+                    routes.lock().await.remove(&frame.stream);
+                    drop(error.into_inner());
+                    debug!(
+                        stream_id = frame.stream,
+                        "closing incoming repeater stream because the accept queue is unavailable"
+                    );
+                    if !send_or_shutdown(
+                        &outgoing,
+                        Frame {
+                            kind: CLOSE,
+                            stream: frame.stream,
+                            body: Vec::new(),
+                        },
+                        &mut shutdown,
+                    )
                     .await
-                {
-                    return;
+                    {
+                        return;
+                    }
                 }
             }
             DATA | CLOSE => {
@@ -446,7 +479,9 @@ async fn client_reader(
                     if !send_or_shutdown(&route, frame, &mut shutdown).await {
                         return;
                     }
-                } else if !send_or_shutdown(&control, frame, &mut shutdown).await {
+                } else if frame.stream == SESSION_STREAM
+                    && !send_or_shutdown(&control, frame, &mut shutdown).await
+                {
                     return;
                 }
             }
@@ -479,14 +514,14 @@ async fn make_stream(
     routes: &Routes,
     outgoing: &mpsc::Sender<Frame>,
     mut shutdown: watch::Receiver<bool>,
-) -> RepeaterStream {
+) -> (RepeaterStream, tokio::task::JoinHandle<()>) {
     let (app, pump) = tokio::io::duplex(64 * 1024);
     let (route_tx, mut route_rx) = mpsc::channel(32);
     routes.lock().await.insert(id, route_tx);
     let (mut read, mut write) = tokio::io::split(pump);
     let output = outgoing.clone();
     let routes = routes.clone();
-    tokio::spawn(async move {
+    let pump_task = tokio::spawn(async move {
         let mut buffer = vec![0; crate::wire::MAX_DATA];
         let mut read_shutdown = shutdown.clone();
         let mut route_shutdown = shutdown.clone();
@@ -556,10 +591,13 @@ async fn make_stream(
         }
         routes.lock().await.remove(&id);
     });
-    RepeaterStream {
-        id,
-        io: Box::new(app),
-    }
+    (
+        RepeaterStream {
+            id,
+            io: Box::new(app),
+        },
+        pump_task,
+    )
 }
 
 impl RepeaterClient {
@@ -646,7 +684,7 @@ impl DialerInner {
             return Err(ClientError::SessionClosed);
         }
         let id = allocate_stream_id(&self.next_stream);
-        let stream = make_stream(
+        let (stream, _pump) = make_stream(
             id,
             &self.routes,
             &self.outgoing,
@@ -721,6 +759,11 @@ impl IncomingStreams {
     /// Waits for an incoming stream, returning `None` when the session ends.
     pub async fn accept(&mut self) -> Option<IncomingStream> {
         self.incoming.recv().await
+    }
+
+    #[cfg(test)]
+    pub(crate) fn queued(&self) -> usize {
+        self.incoming.len()
     }
 }
 
