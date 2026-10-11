@@ -27,6 +27,7 @@ use tokio::{
     io::{AsyncReadExt, AsyncWriteExt, BufStream},
     net::TcpListener,
     sync::{mpsc, watch, Mutex},
+    task::JoinSet,
 };
 use tokio_tungstenite::{accept_async, tungstenite::Message};
 
@@ -34,6 +35,7 @@ const NOISE: &str = "Noise_IK_25519_ChaChaPoly_BLAKE2s";
 const MAX_FAILED_HANDSHAKES: usize = 10;
 const HANDSHAKE_FAILURE_WINDOW: Duration = Duration::from_secs(60);
 const HANDSHAKE_COOLDOWN: Duration = Duration::from_secs(5 * 60);
+const SERVER_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Default)]
 struct HandshakeLimiter {
@@ -123,6 +125,20 @@ struct Link {
     peer_session_id: u64,
     peer_stream_id: u32,
     outbound: mpsc::Sender<Frame>,
+    side: LinkSide,
+    state: Arc<StdMutex<LinkState>>,
+}
+
+#[derive(Clone, Copy)]
+enum LinkSide {
+    Source,
+    Target,
+}
+
+#[derive(Default)]
+struct LinkState {
+    source_closed: bool,
+    target_closed: bool,
 }
 
 type Peers = Arc<Mutex<HashMap<[u8; 32], Peer>>>;
@@ -192,21 +208,23 @@ fn noise_params() -> NoiseParams {
 /// Binds the configured WebSocket endpoint and serves until Ctrl+C.
 pub async fn serve(config: ServerConfig) -> Result<(), ServerError> {
     let listener = TcpListener::bind(config.listen).await?;
-    serve_with_listener(listener, config.path, config.root).await
+    serve_with_listener(listener, config.path, config.root, SERVER_HANDSHAKE_TIMEOUT).await
 }
 
 #[cfg(test)]
-pub(crate) async fn serve_on_listener(
+pub(crate) async fn serve_on_listener_with_timeout(
     listener: TcpListener,
     config: ServerConfig,
+    handshake_timeout: Duration,
 ) -> Result<(), ServerError> {
-    serve_with_listener(listener, config.path, config.root).await
+    serve_with_listener(listener, config.path, config.root, handshake_timeout).await
 }
 
 async fn serve_with_listener(
     listener: TcpListener,
     path: String,
     root: PathBuf,
+    handshake_timeout: Duration,
 ) -> Result<(), ServerError> {
     let shared = Arc::new(Shared {
         store: Arc::new(Store::new(root)),
@@ -220,45 +238,63 @@ async fn serve_with_listener(
     let watcher = spawn_device_watcher(Arc::clone(&shared));
     let shutdown = tokio::signal::ctrl_c();
     tokio::pin!(shutdown);
+    let mut connections = JoinSet::new();
 
     loop {
-        let (stream, addr) = tokio::select! {
-            accepted = listener.accept() => accepted?,
+        tokio::select! {
+            accepted = listener.accept() => {
+                let (stream, addr) = accepted?;
+                let path = path.clone();
+                let shared = Arc::clone(&shared);
+                connections.spawn(async move {
+                    let deadline = tokio::time::Instant::now() + handshake_timeout;
+                    let mut stream = BufStream::new(stream);
+                    let headers = match tokio::time::timeout_at(
+                        deadline,
+                        read_http_headers(&mut stream),
+                    )
+                    .await
+                    {
+                        Ok(Ok(Some(headers))) if is_websocket_upgrade(&headers, &path) => headers,
+                        Err(_) => return,
+                        _ => {
+                            let _ = write_not_found(&mut stream).await;
+                            return;
+                        }
+                    };
+                    if source_is_blocked(&shared, addr.ip()) {
+                        return;
+                    }
+                    // Replay validated headers so tungstenite still performs the upgrade.
+                    let (websocket_io, mut relay_io) = tokio::io::duplex(64 * 1024);
+                    tokio::spawn(async move {
+                        if relay_io.write_all(&headers).await.is_ok() {
+                            let _ = tokio::io::copy_bidirectional(&mut stream, &mut relay_io).await;
+                        }
+                    });
+                    match tokio::time::timeout_at(deadline, accept_async(websocket_io)).await {
+                        Ok(Ok(ws)) => {
+                            if let Err(error) = handle(ws, addr, shared, deadline).await {
+                                tracing::debug!(%error, "repeater connection closed");
+                            }
+                        }
+                        Ok(Err(error)) => tracing::debug!(%error, "rejected repeater WebSocket"),
+                        Err(_) => {}
+                    }
+                });
+            }
+            Some(result) = connections.join_next(), if !connections.is_empty() => {
+                if let Err(error) = result {
+                    tracing::debug!(%error, "repeater connection task failed");
+                }
+            }
             _ = &mut shutdown => {
                 watcher.abort();
+                connections.abort_all();
+                while connections.join_next().await.is_some() {}
                 return Ok(());
             }
-        };
-        let path = path.clone();
-        let shared = Arc::clone(&shared);
-        tokio::spawn(async move {
-            let mut stream = BufStream::new(stream);
-            let headers = match read_http_headers(&mut stream).await {
-                Ok(Some(headers)) if is_websocket_upgrade(&headers, &path) => headers,
-                _ => {
-                    let _ = write_not_found(&mut stream).await;
-                    return;
-                }
-            };
-            if source_is_blocked(&shared, addr.ip()) {
-                return;
-            }
-            // Replay validated headers so tungstenite still performs the upgrade.
-            let (websocket_io, mut relay_io) = tokio::io::duplex(64 * 1024);
-            tokio::spawn(async move {
-                if relay_io.write_all(&headers).await.is_ok() {
-                    let _ = tokio::io::copy_bidirectional(&mut stream, &mut relay_io).await;
-                }
-            });
-            match accept_async(websocket_io).await {
-                Ok(ws) => {
-                    if let Err(error) = handle(ws, addr, shared).await {
-                        tracing::debug!(%error, "repeater connection closed");
-                    }
-                }
-                Err(error) => tracing::debug!(%error, "rejected repeater WebSocket"),
-            }
-        });
+        }
     }
 }
 
@@ -409,12 +445,14 @@ async fn handle<S>(
     mut ws: tokio_tungstenite::WebSocketStream<S>,
     addr: SocketAddr,
     shared: Arc<Shared>,
+    deadline: tokio::time::Instant,
 ) -> Result<(), ServerError>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    let first = match ws.next().await {
-        Some(Ok(Message::Binary(first))) => first,
+    let first = match tokio::time::timeout_at(deadline, ws.next()).await {
+        Ok(Some(Ok(Message::Binary(first)))) => first,
+        Err(_) => return Ok(()),
         _ => {
             record_failed_handshake(&shared, addr.ip());
             return Ok(());
@@ -866,12 +904,15 @@ where
                         }
                     }
                 });
+                let link_state = Arc::new(StdMutex::new(LinkState::default()));
                 links.insert(
                     (session_id, frame.stream),
                     Link {
                         peer_session_id: target_peer.session_id,
                         peer_stream_id: incoming_id,
                         outbound: to_target,
+                        side: LinkSide::Source,
+                        state: Arc::clone(&link_state),
                     },
                 );
                 links.insert(
@@ -880,6 +921,8 @@ where
                         peer_session_id: session_id,
                         peer_stream_id: frame.stream,
                         outbound: to_source,
+                        side: LinkSide::Target,
+                        state: link_state,
                     },
                 );
                 drop(links);
@@ -957,23 +1000,43 @@ where
                     .links
                     .lock()
                     .await
-                    .remove(&(session_id, frame.stream));
+                    .get(&(session_id, frame.stream))
+                    .cloned();
                 if let Some(link) = link {
-                    shared
-                        .links
-                        .lock()
+                    let (forward_close, fully_closed) = {
+                        let mut state = link.state.lock().expect("link state lock");
+                        let forward = match link.side {
+                            LinkSide::Source if !state.source_closed => {
+                                state.source_closed = true;
+                                true
+                            }
+                            LinkSide::Target if !state.target_closed => {
+                                state.target_closed = true;
+                                true
+                            }
+                            _ => false,
+                        };
+                        (forward, state.source_closed && state.target_closed)
+                    };
+                    if forward_close
+                        && !enqueue(
+                            &link.outbound,
+                            Frame {
+                                kind: CLOSE,
+                                stream: link.peer_stream_id,
+                                body: Vec::new(),
+                            },
+                            &mut shutdown,
+                        )
                         .await
-                        .remove(&(link.peer_session_id, link.peer_stream_id));
-                    let _ = enqueue(
-                        &link.outbound,
-                        Frame {
-                            kind: CLOSE,
-                            stream: link.peer_stream_id,
-                            body: Vec::new(),
-                        },
-                        &mut shutdown,
-                    )
-                    .await;
+                    {
+                        return Ok(());
+                    }
+                    if fully_closed {
+                        let mut links = shared.links.lock().await;
+                        links.remove(&(session_id, frame.stream));
+                        links.remove(&(link.peer_session_id, link.peer_stream_id));
+                    }
                 }
             }
             LIST if frame.body.is_empty() => {

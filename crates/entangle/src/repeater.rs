@@ -52,10 +52,10 @@ pub enum RepeaterCommand {
     Leave,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
-struct RepeaterConfig {
-    url: String,
-    repeater_public_key: String,
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(crate) struct RepeaterConfig {
+    pub(crate) url: String,
+    pub(crate) repeater_public_key: String,
 }
 
 fn human_only(command: &RepeaterCommand) -> bool {
@@ -87,7 +87,7 @@ fn validate_label(label: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-fn websocket_host(url: &str) -> Result<&str> {
+pub(crate) fn websocket_host(url: &str) -> Result<&str> {
     let (scheme, remainder) = url
         .split_once("://")
         .ok_or_else(|| anyhow!("URL must use ws:// or wss://"))?;
@@ -109,6 +109,19 @@ fn websocket_host(url: &str) -> Result<&str> {
         bail!("URL must include a host");
     }
     Ok(host)
+}
+
+pub(crate) fn read_config(path: &Path) -> Result<Option<RepeaterConfig>> {
+    let Some(bytes) = read_regular_file(path)? else {
+        return Ok(None);
+    };
+    let config: RepeaterConfig = serde_json::from_slice(&bytes)?;
+    websocket_host(&config.url)?;
+    let public: [u8; 32] = hex::decode(&config.repeater_public_key)?
+        .try_into()
+        .map_err(|_| anyhow!("invalid repeater configuration"))?;
+    let _ = public;
+    Ok(Some(config))
 }
 
 pub async fn run(
@@ -212,13 +225,20 @@ pub async fn run(
         RepeaterCommand::Join { code } => {
             let parsed = invite::decode(&code)?;
             websocket_host(&parsed.url)?;
-            let identity = crate::identity::claim(&options.data_root())?;
-            if !identity.persistent {
-                bail!("a persistent particle identity is required to join a repeater");
-            }
+            let root = options.data_root();
+            let static_private = match crate::identity::read_saved(&root)? {
+                Some((_, static_private)) => static_private,
+                None => {
+                    let identity = crate::identity::claim(&root)?;
+                    if !identity.persistent {
+                        bail!("a persistent particle identity is required to join a repeater");
+                    }
+                    identity.static_private
+                }
+            };
             client::enroll(
                 &parsed.url,
-                identity.static_private,
+                static_private,
                 parsed.repeater_public_key,
                 parsed.secret,
                 None,
@@ -313,10 +333,6 @@ fn replace_private_file(
     temporary: &std::path::Path,
     destination: &std::path::Path,
 ) -> io::Result<()> {
-    #[cfg(windows)]
-    if destination.exists() {
-        fs::remove_file(destination)?;
-    }
     fs::rename(temporary, destination)
 }
 

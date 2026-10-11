@@ -3,7 +3,7 @@
     {
       "name": "find_entangled_particles",
       "title": "Find entangled particles",
-      "description": "List Entangle peers discovered via mDNS or static peers. `self` reports live pairing, identity persistence, and link-port fallback status; only entangled particles can receive state syncs.",
+      "description": "List Entangle peers discovered via mDNS, static peers, or a repeater. `self` reports live pairing, identity persistence, link-port fallback, and repeater status; only entangled particles can receive state syncs.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -24,6 +24,16 @@
               "pending_approvals": { "type": "integer", "description": "Number of discovered peers awaiting local human approval." },
               "identity": { "type": "string", "enum": ["persistent", "ephemeral"], "description": "Whether this process holds the saved particle identity or is using a temporary one." },
               "link_port_fallback": { "type": "boolean", "description": "True when the configured link port was occupied and this process bound an ephemeral port instead." },
+              "repeater": {
+                "type": "object",
+                "properties": {
+                  "configured": { "type": "boolean" },
+                  "connected": { "type": "boolean" },
+                  "relay_only": { "type": "boolean" }
+                },
+                "required": ["configured", "connected", "relay_only"],
+                "additionalProperties": false
+              },
               "warning": { "type": "string", "description": "Startup warning for an ephemeral identity or fallback link port; report it verbatim to the human." },
               "hint": { "type": "string", "description": "Human action required when this particle is unpaired or peers are pending approval; agents must not approve peers." }
             },
@@ -41,6 +51,8 @@
                 "port": { "type": "integer" },
                 "context": { "type": ["string", "null"] },
                 "key_fingerprint": { "type": ["string", "null"], "description": "First 16 hex characters of SHA-256 of the authenticated Noise static public key." },
+                "path": { "type": ["string", "null"], "enum": ["direct", "repeater", null], "description": "Route used by the most recent successful Hello, if known." },
+                "via_repeater": { "type": "boolean", "description": "Whether this peer is currently in the live repeater directory." },
                 "state": { "type": "string", "enum": ["resonating", "pending", "entangled"], "description": "Pending peers have authenticated but are not authorized to sync until a human approves them locally." },
                 "approval": { "type": "string", "description": "Human-only approval instruction for pending peers; agents must not approve or relay SAS emoji." },
                 "manifest": { "type": ["object", "null"] },

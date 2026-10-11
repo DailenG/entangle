@@ -4,7 +4,11 @@ use entangle_core::{Manifest, ParticleId};
 use entangle_resonance::Resonance;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::{collections::HashMap, net::IpAddr, time::Instant};
+use std::{
+    collections::{HashMap, HashSet},
+    net::IpAddr,
+    time::Instant,
+};
 
 /// Relationship state stored for a peer.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -15,6 +19,15 @@ pub enum PeerState {
     Pending,
     /// The peer exchanged compatible manifests.
     Entangled,
+}
+
+/// Route used by the most recent successful peer Hello.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LinkPath {
+    /// The peer link used a direct TCP connection.
+    Direct,
+    /// The peer link was carried through a Quantum Repeater.
+    Repeater,
 }
 
 /// One peer record and its latest discovery and manifest data.
@@ -28,6 +41,8 @@ pub struct PeerRecord {
     pub static_key: Option<[u8; 32]>,
     /// Current relationship state.
     pub state: PeerState,
+    /// Route used by the most recent successful Hello, if known.
+    pub path: Option<LinkPath>,
     /// Monotonic time at which this record was refreshed.
     pub last_seen: Instant,
 }
@@ -50,6 +65,7 @@ impl Field {
                 manifest: None,
                 static_key: None,
                 state: PeerState::Resonating,
+                path: None,
                 last_seen: Instant::now(),
             });
         record.resonance = resonance;
@@ -60,9 +76,21 @@ impl Field {
     #[must_use]
     pub fn entangle(
         &mut self,
+        resonance: Resonance,
+        manifest: Manifest,
+        static_key: [u8; 32],
+    ) -> bool {
+        self.entangle_with_path(resonance, manifest, static_key, Some(LinkPath::Direct))
+    }
+
+    /// Stores a validated manifest, relationship state, and link route.
+    #[must_use]
+    pub fn entangle_with_path(
+        &mut self,
         mut resonance: Resonance,
         manifest: Manifest,
         static_key: [u8; 32],
+        path: Option<LinkPath>,
     ) -> bool {
         let id = resonance.particle_id.clone();
         let newly_entangled = !self
@@ -70,13 +98,16 @@ impl Field {
             .get(&id)
             .is_some_and(|existing| existing.state == PeerState::Entangled);
         self.bindings.insert(id.clone(), static_key);
-        if let Some(existing) = self.peers.get(&id) {
+        let path = if let Some(existing) = self.peers.get(&id) {
             for address in &existing.resonance.addrs {
                 if !resonance.addrs.contains(address) {
                     resonance.addrs.push(*address);
                 }
             }
-        }
+            path.or(existing.path)
+        } else {
+            path
+        };
         self.peers.insert(
             id,
             PeerRecord {
@@ -84,6 +115,7 @@ impl Field {
                 manifest: Some(manifest),
                 static_key: Some(static_key),
                 state: PeerState::Entangled,
+                path,
                 last_seen: Instant::now(),
             },
         );
@@ -92,11 +124,18 @@ impl Field {
 
     /// Stores an authenticated peer without granting it sync permission.
     #[must_use]
-    pub fn pend(
+    pub fn pend(&mut self, resonance: Resonance, manifest: Manifest, static_key: [u8; 32]) -> bool {
+        self.pend_with_path(resonance, manifest, static_key, Some(LinkPath::Direct))
+    }
+
+    /// Stores an authenticated peer awaiting local approval and its route.
+    #[must_use]
+    pub fn pend_with_path(
         &mut self,
         mut resonance: Resonance,
         manifest: Manifest,
         static_key: [u8; 32],
+        path: Option<LinkPath>,
     ) -> bool {
         let id = resonance.particle_id.clone();
         let newly_pending = !self
@@ -104,13 +143,16 @@ impl Field {
             .get(&id)
             .is_some_and(|existing| existing.state == PeerState::Pending);
         self.bindings.insert(id.clone(), static_key);
-        if let Some(existing) = self.peers.get(&id) {
+        let path = if let Some(existing) = self.peers.get(&id) {
             for address in &existing.resonance.addrs {
                 if !resonance.addrs.contains(address) {
                     resonance.addrs.push(*address);
                 }
             }
-        }
+            path.or(existing.path)
+        } else {
+            path
+        };
         self.peers.insert(
             id,
             PeerRecord {
@@ -118,6 +160,7 @@ impl Field {
                 manifest: Some(manifest),
                 static_key: Some(static_key),
                 state: PeerState::Pending,
+                path,
                 last_seen: Instant::now(),
             },
         );
@@ -183,6 +226,16 @@ impl Field {
 
     /// Returns a serialized view, optionally including resonating peers.
     pub fn view(&self, context: Option<&str>, include_unentangled: bool) -> Vec<Value> {
+        self.view_with_relay_directory(context, include_unentangled, &HashSet::new())
+    }
+
+    /// Returns a serialized view with live repeater-directory membership.
+    pub fn view_with_relay_directory(
+        &self,
+        context: Option<&str>,
+        include_unentangled: bool,
+        relay_directory: &HashSet<[u8; 32]>,
+    ) -> Vec<Value> {
         self.peers
             .values()
             .filter(|record| include_unentangled || record.state == PeerState::Entangled)
@@ -196,6 +249,10 @@ impl Field {
                     PeerState::Pending => "pending",
                     PeerState::Entangled => "entangled",
                 };
+                let path = record.path.map(|path| match path {
+                    LinkPath::Direct => "direct",
+                    LinkPath::Repeater => "repeater",
+                });
                 let mut view = json!({
                     "particle_id": record.resonance.particle_id.as_str(),
                     "name": record.resonance.name,
@@ -205,6 +262,8 @@ impl Field {
                     "context": record.resonance.context,
                     "key_fingerprint": key_fingerprint,
                     "state": state,
+                    "path": path,
+                    "via_repeater": record.static_key.is_some_and(|key| relay_directory.contains(&key)),
                     "manifest": record.manifest,
                     "last_seen_secs": record.last_seen.elapsed().as_secs()
                 });

@@ -193,10 +193,6 @@ fn write_key(path: &Path, key: &[u8; 32]) -> Result<(), PairingError> {
 }
 
 fn replace_file(temporary: &Path, destination: &Path) -> io::Result<()> {
-    #[cfg(windows)]
-    if destination.exists() {
-        fs::remove_file(destination)?;
-    }
     fs::rename(temporary, destination)
 }
 

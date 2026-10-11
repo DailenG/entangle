@@ -6,7 +6,10 @@ pub mod server;
 pub mod store;
 pub mod wire;
 
-pub use client::{connect, RepeaterClient, RepeaterStream};
+pub use client::{
+    connect, DirectoryEntry, IncomingStream, IncomingStreams, RepeaterClient, RepeaterDialer,
+    RepeaterStream,
+};
 pub use invite::{decode, encode, Invite};
 pub use server::{serve, ServerConfig};
 pub use store::{Device, Devices, InviteRecord, Invites, Store};

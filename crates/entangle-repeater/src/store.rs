@@ -193,25 +193,34 @@ impl Store {
             return Ok(false);
         };
         let invite_label = invites.invites[index].label.clone();
-        let record = &mut invites.invites[index];
-        let expiry = DateTime::parse_from_rfc3339(&record.expires_at)
+        let expiry = DateTime::parse_from_rfc3339(&invites.invites[index].expires_at)
             .map(|v| v.with_timezone(&Utc))
             .ok();
-        if record.used || expiry.is_none_or(|v| v <= now) {
+        if invites.invites[index].used || expiry.is_none_or(|v| v <= now) {
             return Ok(false);
         }
-        record.used = true;
+        invites.invites[index].used = true;
         self.save_invites(&invites)?;
-        let mut devices = self.devices()?;
-        devices.devices.insert(
-            hex::encode(key),
-            Device {
-                label: label.or(invite_label),
-                enrolled_at: now.to_rfc3339(),
-                revoked: false,
-            },
-        );
-        self.save_devices(&devices)?;
+        let enrollment = self.devices().and_then(|mut devices| {
+            devices.devices.insert(
+                hex::encode(key),
+                Device {
+                    label: label.or(invite_label),
+                    enrolled_at: now.to_rfc3339(),
+                    revoked: false,
+                },
+            );
+            self.save_devices(&devices)
+        });
+        if let Err(error) = enrollment {
+            invites.invites[index].used = false;
+            return match self.save_invites(&invites) {
+                Ok(()) => Err(error),
+                Err(rollback_error) => Err(StoreError::Io(io::Error::other(format!(
+                    "enrollment failed ({error}); invite rollback failed ({rollback_error})"
+                )))),
+            };
+        }
         Ok(true)
     }
 
@@ -304,10 +313,6 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), StoreError> {
 }
 
 fn replace_file(temporary: &Path, destination: &Path) -> io::Result<()> {
-    #[cfg(windows)]
-    if destination.exists() {
-        fs::remove_file(destination)?;
-    }
     fs::rename(temporary, destination)
 }
 
@@ -382,6 +387,45 @@ mod tests {
                 0o600
             );
         }
+    }
+
+    #[test]
+    fn atomic_store_write_replaces_existing_destination() {
+        let root = tempfile::tempdir().unwrap();
+        let root_path = test_root_path(root.path());
+        let store = Store::new(&root_path);
+        let first = Devices::default();
+        store.save_devices(&first).unwrap();
+        let mut second = Devices::default();
+        second.devices.insert(
+            "01".into(),
+            Device {
+                label: Some("device".into()),
+                enrolled_at: "2026-01-01T00:00:00Z".into(),
+                revoked: false,
+            },
+        );
+        store.save_devices(&second).unwrap();
+        assert_eq!(store.devices().unwrap().devices.len(), 1);
+    }
+
+    #[test]
+    fn failed_device_persistence_restores_single_use_invite() {
+        let root = tempfile::tempdir().unwrap();
+        let root_path = test_root_path(root.path());
+        let store = Store::new(&root_path);
+        let secret = [9; 32];
+        store
+            .add_invite(
+                secret,
+                (Utc::now() + chrono::Duration::hours(1)).to_rfc3339(),
+                None,
+            )
+            .unwrap();
+        fs::create_dir(root_path.join("devices.json")).unwrap();
+
+        assert!(store.consume_invite(&secret, [7; 32], None).is_err());
+        assert!(!store.invites().unwrap().invites[0].used);
     }
 
     #[cfg(unix)]
