@@ -13,7 +13,11 @@ mod trust;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use config::Options;
-use std::time::Duration;
+use std::{
+    io::{self, Write},
+    process::ExitCode,
+    time::Duration,
+};
 use tracing_subscriber::EnvFilter;
 
 /// Entangle local agent collaboration server.
@@ -80,7 +84,18 @@ enum PairCommand {
 }
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() -> ExitCode {
+    match run().await {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) if is_broken_pipe(&error) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("Error: {error:?}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+async fn run() -> Result<()> {
     let cli = Cli::parse();
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -97,15 +112,17 @@ async fn main() -> Result<()> {
     match cli.command.unwrap_or(Command::Serve) {
         Command::Scan { timeout_secs, json } => {
             let peers = entangle_resonance::scan(Duration::from_secs(timeout_secs)).await?;
+            let mut output = io::stdout().lock();
             if json {
-                println!("{}", serde_json::to_string_pretty(&peers)?);
+                writeln!(output, "{}", serde_json::to_string_pretty(&peers)?)?;
             } else if peers.is_empty() {
-                println!("No particles found.");
+                writeln!(output, "No particles found.")?;
             } else {
-                println!(
+                writeln!(
+                    output,
                     "{:<10} {:<24} {:<40} PORT  GROUP     CONTEXT",
                     "PARTICLE", "NAME", "ADDRESSES"
-                );
+                )?;
                 for peer in peers {
                     let addresses = peer
                         .addrs
@@ -113,7 +130,8 @@ async fn main() -> Result<()> {
                         .map(ToString::to_string)
                         .collect::<Vec<_>>()
                         .join(",");
-                    println!(
+                    writeln!(
+                        output,
                         "{:<10} {:<24} {:<40} {:<5} {:<9} {}",
                         peer.particle_id.short(),
                         peer.name,
@@ -121,18 +139,22 @@ async fn main() -> Result<()> {
                         peer.port,
                         peer.group.unwrap_or_default(),
                         peer.context.unwrap_or_default()
-                    );
+                    )?;
                 }
             }
         }
-        Command::Pair { command } => run_pairing(cli.options.data_root(), command)?,
+        Command::Pair { command } => {
+            let mut output = io::stdout().lock();
+            run_pairing(cli.options.data_root(), command, &mut output)?;
+        }
         Command::Peer { command } => {
             let data_root = cli.options.data_root();
             let local_name = identity::read_saved(&data_root)
                 .ok()
                 .flatten()
                 .map(|(id, _)| cli.options.particle_name(&id));
-            let exit_code = peer::run(command, &data_root, local_name.as_deref())?;
+            let mut output = io::stdout().lock();
+            let exit_code = peer::run(command, &data_root, local_name.as_deref(), &mut output)?;
             if exit_code != 0 {
                 std::process::exit(exit_code);
             }
@@ -157,33 +179,56 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-fn run_pairing(data_root: std::path::PathBuf, command: PairCommand) -> Result<()> {
+fn is_broken_pipe(error: &anyhow::Error) -> bool {
+    error.chain().last().is_some_and(|cause| {
+        cause
+            .downcast_ref::<io::Error>()
+            .is_some_and(|error| error.kind() == io::ErrorKind::BrokenPipe)
+    })
+}
+
+fn run_pairing(
+    data_root: std::path::PathBuf,
+    command: PairCommand,
+    output: &mut dyn Write,
+) -> Result<()> {
     match command {
         PairCommand::Init { force } => {
             let key = pairing::initialize(&data_root, force)?;
             eprintln!("WARNING: The pairing code is secret; share it only with the human on the other machine.");
-            println!("code: {}", pairing::encode_code(&key));
-            println!("group: {}", pairing::group_id(&key));
+            writeln!(output, "code: {}", pairing::encode_code(&key))?;
+            writeln!(output, "group: {}", pairing::group_id(&key))?;
         }
         PairCommand::Join { code, force } => {
             let key = pairing::join(&data_root, &code, force)?;
-            println!("paired with group: {}", pairing::group_id(&key));
+            writeln!(output, "paired with group: {}", pairing::group_id(&key))?;
         }
         PairCommand::Show => {
             let key = pairing::require(&data_root)?;
             eprintln!("WARNING: This pairing code is secret. Do not send it to an agent or include it in logs.");
-            println!("{}", pairing::encode_code(&key));
+            writeln!(output, "{}", pairing::encode_code(&key))?;
         }
         PairCommand::Status => match pairing::load(&data_root)? {
             Some(key) => {
-                println!("paired: yes");
-                println!("group: {}", pairing::group_id(&key));
+                writeln!(output, "paired: yes")?;
+                writeln!(output, "group: {}", pairing::group_id(&key))?;
             }
             None => {
-                println!("paired: no");
-                println!("group: none");
+                writeln!(output, "paired: no")?;
+                writeln!(output, "group: none")?;
             }
         },
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detects_broken_pipe_root_cause() {
+        let error = anyhow::Error::new(io::Error::new(io::ErrorKind::BrokenPipe, "closed"));
+        assert!(is_broken_pipe(&error));
+    }
 }

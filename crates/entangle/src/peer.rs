@@ -55,17 +55,25 @@ fn human_only(command: &PeerCommand) -> bool {
     )
 }
 
-pub fn run(command: PeerCommand, data_root: &Path, local_name: Option<&str>) -> Result<i32> {
+pub fn run(
+    command: PeerCommand,
+    data_root: &Path,
+    local_name: Option<&str>,
+    output: &mut dyn Write,
+) -> Result<i32> {
     if human_only(&command) && !(io::stdin().is_terminal() && io::stdout().is_terminal()) {
-        println!("This command is for the human operator and needs an interactive terminal.");
+        writeln!(
+            output,
+            "This command is for the human operator and needs an interactive terminal."
+        )?;
         return Ok(2);
     }
     if !matches!(command, PeerCommand::Emoji) && identity::read_saved(data_root)?.is_none() {
         if matches!(command, PeerCommand::List { .. }) {
             if matches!(command, PeerCommand::List { json: true }) {
-                println!("[]");
+                writeln!(output, "[]")?;
             } else {
-                println!("No peers are known.");
+                writeln!(output, "No peers are known.")?;
             }
             return Ok(0);
         }
@@ -73,17 +81,21 @@ pub fn run(command: PeerCommand, data_root: &Path, local_name: Option<&str>) -> 
     }
     match command {
         PeerCommand::Emoji => {
-            println!("index glyph name");
+            writeln!(output, "index glyph name")?;
             for (index, (glyph, name)) in sas::EMOJI.iter().enumerate() {
-                println!("{index} {glyph} {name}");
+                writeln!(output, "{index} {glyph} {name}")?;
             }
         }
-        PeerCommand::List { json } => list(data_root, json)?,
-        PeerCommand::Verify { peer } => return verify(data_root, peer.as_deref(), local_name),
-        PeerCommand::Approve { peer } => return approve(data_root, peer.as_deref(), local_name),
-        PeerCommand::Deny { peer } => deny(data_root, &peer)?,
-        PeerCommand::Revoke { peer } => revoke(data_root, &peer)?,
-        PeerCommand::Forget { peer } => forget(data_root, &peer)?,
+        PeerCommand::List { json } => list(data_root, json, output)?,
+        PeerCommand::Verify { peer } => {
+            return verify(data_root, peer.as_deref(), local_name, output)
+        }
+        PeerCommand::Approve { peer } => {
+            return approve(data_root, peer.as_deref(), local_name, output)
+        }
+        PeerCommand::Deny { peer } => deny(data_root, &peer, output)?,
+        PeerCommand::Revoke { peer } => revoke(data_root, &peer, output)?,
+        PeerCommand::Forget { peer } => forget(data_root, &peer, output)?,
     }
     Ok(0)
 }
@@ -99,7 +111,7 @@ fn records(data_root: &Path) -> Result<Vec<trust::VerificationRecord>> {
         .collect())
 }
 
-fn list(data_root: &Path, json: bool) -> Result<()> {
+fn list(data_root: &Path, json: bool, output: &mut dyn Write) -> Result<()> {
     let store = trust::load(data_root)?;
     let mut lines = BTreeMap::new();
     for record in records(data_root)? {
@@ -130,22 +142,25 @@ fn list(data_root: &Path, json: bool) -> Result<()> {
         );
     }
     if json {
-        println!(
+        writeln!(
+            output,
             "{}",
             serde_json::to_string_pretty(&lines.values().collect::<Vec<_>>())?
-        );
+        )?;
     } else if lines.is_empty() {
-        println!("No peers are known.");
+        writeln!(output, "No peers are known.")?;
     } else {
-        println!(
+        writeln!(
+            output,
             "{:<24} {:<8} {:<10} KEY FINGERPRINT",
             "NAME", "ID", "STATUS"
-        );
+        )?;
         for peer in lines.values() {
-            println!(
+            writeln!(
+                output,
                 "{:<24} {:<8} {:<10} {}",
                 peer.name, peer.id, peer.status, peer.key_fingerprint
-            );
+            )?;
         }
     }
     Ok(())
@@ -193,13 +208,19 @@ fn choose_record(
     }
 }
 
-fn verify(data_root: &Path, query: Option<&str>, local_name: Option<&str>) -> Result<i32> {
+fn verify(
+    data_root: &Path,
+    query: Option<&str>,
+    local_name: Option<&str>,
+    output: &mut dyn Write,
+) -> Result<i32> {
     let record = choose_record(data_root, query, true)?;
     let Some(sas) = record.sas else {
-        println!(
+        writeln!(
+            output,
             "Still verifying with {}; keep Entangle running on both machines and retry in a few seconds.",
             record.name
-        );
+        )?;
         return Ok(1);
     };
     let local_name = local_name
@@ -211,16 +232,26 @@ fn verify(data_root: &Path, query: Option<&str>, local_name: Option<&str>) -> Re
                 .map(|(id, _)| id.short().to_owned())
         })
         .unwrap_or_else(|| "this machine".into());
-    println!("This machine ({local_name}) sees {} as:", record.name);
-    println!("{}", sas::render(sas));
-    println!(
+    writeln!(
+        output,
+        "This machine ({local_name}) sees {} as:",
+        record.name
+    )?;
+    writeln!(output, "{}", sas::render(sas))?;
+    writeln!(
+        output,
         "On {}, run `entangle peer approve` and pick this set.",
         record.name
-    );
+    )?;
     Ok(0)
 }
 
-fn approve(data_root: &Path, query: Option<&str>, local_name: Option<&str>) -> Result<i32> {
+fn approve(
+    data_root: &Path,
+    query: Option<&str>,
+    local_name: Option<&str>,
+    output: &mut dyn Write,
+) -> Result<i32> {
     let store = trust::load(data_root)?;
     let mut pending = records(data_root)?
         .into_iter()
@@ -239,11 +270,12 @@ fn approve(data_root: &Path, query: Option<&str>, local_name: Option<&str>) -> R
                 || record.name == query
         });
     } else if pending.len() > 1 {
-        println!(
+        writeln!(
+            output,
             "Several machines are waiting for approval. If you only expected one, deny the others."
-        );
+        )?;
         for record in &pending {
-            println!("{} ({})", record.name, record.particle_id.short());
+            writeln!(output, "{} ({})", record.name, record.particle_id.short())?;
         }
         bail!("specify a peer by ID or exact name");
     }
@@ -260,30 +292,32 @@ fn approve(data_root: &Path, query: Option<&str>, local_name: Option<&str>) -> R
     }
     let record = pending.remove(0);
     let Some(real) = record.sas else {
-        println!(
+        writeln!(
+            output,
             "Still verifying with {}; keep Entangle running on both machines and retry in a few seconds.",
             record.name
-        );
+        )?;
         return Ok(1);
     };
-    println!(
+    writeln!(
+        output,
         "On {}, run `entangle peer verify` (or look at its approve output). Which set does it show?",
         record.name
-    );
+    )?;
     let mut options = sas::decoys(real, &mut rand::thread_rng())
         .into_iter()
         .collect::<Vec<_>>();
     options.push(real);
     options.shuffle(&mut rand::thread_rng());
     for (index, option) in options.iter().enumerate() {
-        println!("{}) {}", index + 1, sas::render(*option));
+        writeln!(output, "{}) {}", index + 1, sas::render(*option))?;
     }
-    println!("5) none of these");
+    writeln!(output, "5) none of these")?;
     let mut input = String::new();
     let mut choice = None;
     for _ in 0..3 {
-        print!("Choose 1-5: ");
-        io::stdout().flush()?;
+        write!(output, "Choose 1-5: ")?;
+        output.flush()?;
         input.clear();
         io::stdin().read_line(&mut input)?;
         match input.trim().parse::<usize>() {
@@ -291,7 +325,7 @@ fn approve(data_root: &Path, query: Option<&str>, local_name: Option<&str>) -> R
                 choice = Some(value);
                 break;
             }
-            _ => println!("Please enter a number from 1 to 5."),
+            _ => writeln!(output, "Please enter a number from 1 to 5.")?,
         }
     }
     let Some(choice) = choice else {
@@ -317,11 +351,12 @@ fn approve(data_root: &Path, query: Option<&str>, local_name: Option<&str>) -> R
             },
         );
         trust::save(data_root, &store)?;
-        println!("Denied {}.", record.name);
-        println!(
+        writeln!(output, "Denied {}.", record.name)?;
+        writeln!(
+            output,
             "If that was a mistake, run `entangle peer forget {}` here and verify again.",
             record.particle_id.short()
-        );
+        )?;
         return Ok(1);
     }
     store.approved.insert(
@@ -334,19 +369,20 @@ fn approve(data_root: &Path, query: Option<&str>, local_name: Option<&str>) -> R
         },
     );
     trust::save(data_root, &store)?;
-    println!("Approved {}.", record.name);
+    writeln!(output, "Approved {}.", record.name)?;
     let local = local_name.unwrap_or("this machine");
-    println!("{local} sees {} as:", record.name);
-    println!("{}", sas::render(real));
-    println!(
+    writeln!(output, "{local} sees {} as:", record.name)?;
+    writeln!(output, "{}", sas::render(real))?;
+    writeln!(
+        output,
         "If {} hasn't approved this machine yet, run `entangle peer approve` there and pick:",
         record.name
-    );
-    println!("{}", sas::render(real));
+    )?;
+    writeln!(output, "{}", sas::render(real))?;
     Ok(0)
 }
 
-fn deny(data_root: &Path, query: &str) -> Result<()> {
+fn deny(data_root: &Path, query: &str, output: &mut dyn Write) -> Result<()> {
     let record = choose_record(data_root, Some(query), false)?;
     let mut store = trust::load(data_root)?;
     store.denied.insert(
@@ -359,11 +395,11 @@ fn deny(data_root: &Path, query: &str) -> Result<()> {
         },
     );
     trust::save(data_root, &store)?;
-    println!("Denied {}.", record.name);
+    writeln!(output, "Denied {}.", record.name)?;
     Ok(())
 }
 
-fn revoke(data_root: &Path, query: &str) -> Result<()> {
+fn revoke(data_root: &Path, query: &str, output: &mut dyn Write) -> Result<()> {
     let record = choose_record(data_root, Some(query), true)?;
     let mut store = trust::load(data_root)?;
     store.approved.remove(record.particle_id.as_str());
@@ -377,18 +413,18 @@ fn revoke(data_root: &Path, query: &str) -> Result<()> {
         },
     );
     trust::save(data_root, &store)?;
-    println!("Revoked {}.", record.name);
+    writeln!(output, "Revoked {}.", record.name)?;
     Ok(())
 }
 
-fn forget(data_root: &Path, query: &str) -> Result<()> {
+fn forget(data_root: &Path, query: &str, output: &mut dyn Write) -> Result<()> {
     let record = choose_record(data_root, Some(query), true)?;
     let mut store = trust::load(data_root)?;
     store.approved.remove(record.particle_id.as_str());
     store.denied.remove(&record.remote_key);
     trust::save(data_root, &store)?;
     trust::remove_verification(data_root, &record.particle_id)?;
-    println!("Forgot {}.", record.name);
+    writeln!(output, "Forgot {}.", record.name)?;
     Ok(())
 }
 
