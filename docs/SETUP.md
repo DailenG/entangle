@@ -195,6 +195,48 @@ collapsed. Collapsing removes the inbox entry; received files remain on disk.
 
 ## Troubleshooting
 
+## Quantum Repeater (preview)
+
+The standalone repeater host and enrollment commands are available for
+preview, but nodes do not yet use the repeater for peer links. Do not rely on
+it as a replacement for direct connectivity.
+
+On the host, choose an address reachable by the devices and start the relay.
+The host prints a short public-key fingerprint; keep the repeater state
+directory private and leave the process running:
+
+```sh
+entangle repeater serve --listen 0.0.0.0:7338
+```
+
+In a human terminal on the host, create a single-use invitation. Share the
+resulting code with the device operator through a trusted human channel; the
+code contains the secret that authorizes enrollment:
+
+```sh
+entangle repeater invite --url ws://HOST:7338/entangle
+```
+
+On each device, a human enters the invitation in a terminal; this enrolls the
+device's persistent Noise identity and saves the repeater URL and pinned
+public key:
+
+```sh
+entangle repeater join <code>
+entangle repeater status
+```
+
+The host can inspect enrolled device fingerprints with
+`entangle repeater devices` and revoke a device by fingerprint prefix with
+`entangle repeater revoke <fingerprint>`. On a device,
+`entangle repeater leave` removes its saved repeater configuration but does
+not revoke the host-side enrollment. `invite`, `join`, `revoke`, and `leave`
+are human-only; agents may run only `repeater devices` and `repeater status`.
+
+The repeater forwards the end-to-end encrypted link bytes and cannot read
+sync content, pairing keys, or SAS values. It does learn enrolled static
+public keys, declared group IDs, connection timing, and traffic sizes.
+
 - **No peers appear:** check UDP 5353, multicast/VLAN policy, and Wi-Fi client
   isolation. Use `--peer host:7337` when multicast is blocked; `--peer` can be
   repeated and also accepts a resolvable hostname. For example,

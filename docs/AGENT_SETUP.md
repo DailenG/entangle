@@ -130,6 +130,10 @@ Peer approval is human-only. You may run `entangle peer list` and
 human. If a peer is pending, tell the human to run `entangle peer approve` on
 this machine and compare the cards themselves.
 
+Quantum Repeater administration is also human-only. Agents may run `entangle
+repeater devices` and `entangle repeater status`, but must never run
+`repeater invite`, `repeater join`, `repeater revoke`, or `repeater leave`.
+
 ## 3. Use this machine's identity
 
 3. **Keep the default identity unless the human requests a custom name.**

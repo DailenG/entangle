@@ -5,6 +5,7 @@ members = [
     "crates/entangle-transport",
     "crates/entangle-link",
     "crates/entangle-mcp",
+    "crates/entangle-repeater",
     "crates/entangle",
 ]
 resolver = "2"
