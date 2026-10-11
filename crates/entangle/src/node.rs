@@ -12,7 +12,7 @@ use anyhow::{Context, Result};
 use chrono::Utc;
 use entangle_core::{is_valid_sync_id, Manifest, StateKind, PROTOCOL_VERSION};
 use entangle_link::{
-    LinkError, LinkHandler, LinkListener, PayloadReader, PeerInfo, SyncDecision, SyncOffer,
+    LinkError, LinkHandler, LinkListener, PayloadReader, PeerInfo, Route, SyncDecision, SyncOffer,
     VerifyMessage,
 };
 use entangle_resonance::{Advertisement, Resonance, ResonanceEvent, Resonator};
@@ -987,7 +987,7 @@ impl Particle {
             .await
             .map_err(|error| error.to_string())?;
         let result = entangle_link::offer(
-            socket,
+            &Route::Direct(socket),
             self.keys.clone(),
             SyncOffer {
                 from: self.manifest.particle_id.clone(),
@@ -1064,7 +1064,7 @@ impl Particle {
             return false;
         }
         match entangle_link::handshake_stream(
-            address,
+            &Route::Direct(address),
             self.keys.clone(),
             &self.manifest,
             Duration::from_secs(5),
@@ -1931,6 +1931,7 @@ mod tests {
                 &PeerInfo {
                     addr: SocketAddr::from(([127, 0, 0, 1], a.manifest.link_port)),
                     remote_static: entangle_transport::public_key(&a._identity.static_private),
+                    relayed: false,
                 },
                 SyncOffer {
                     from: a.manifest.particle_id.clone(),
@@ -1963,7 +1964,7 @@ mod tests {
             .await
             .unwrap();
         let failed_offer = entangle_link::offer(
-            SocketAddr::from(([127, 0, 0, 1], b_port)),
+            &Route::Direct(SocketAddr::from(([127, 0, 0, 1], b_port))),
             a.keys.clone(),
             SyncOffer {
                 from: a.manifest.particle_id.clone(),
@@ -2321,6 +2322,7 @@ mod tests {
         let matching_peer = PeerInfo {
             addr: SocketAddr::from(([127, 0, 0, 1], 7337)),
             remote_static: [0x11; 32],
+            relayed: false,
         };
         let decision = particle
             .on_offer(&matching_peer, invalid_offer)
@@ -2340,6 +2342,7 @@ mod tests {
                 &PeerInfo {
                     addr: SocketAddr::from(([127, 0, 0, 1], 7337)),
                     remote_static: [0x22; 32],
+                    relayed: false,
                 },
                 manifest,
             )
@@ -2363,6 +2366,7 @@ mod tests {
                 &PeerInfo {
                     addr: SocketAddr::from(([127, 0, 0, 1], 7337)),
                     remote_static: [0x22; 32],
+                    relayed: false,
                 },
                 &offer,
             )
@@ -2401,6 +2405,7 @@ mod tests {
                 &PeerInfo {
                     addr: address,
                     remote_static: key,
+                    relayed: false,
                 },
                 manifest.clone(),
             )
@@ -2426,6 +2431,7 @@ mod tests {
                 &PeerInfo {
                     addr: address,
                     remote_static: [0x22; 32],
+                    relayed: false,
                 },
                 manifest.clone(),
             )
@@ -2475,6 +2481,7 @@ mod tests {
                 &PeerInfo {
                     addr: address,
                     remote_static: key,
+                    relayed: false,
                 },
                 peer_manifest(id.clone()),
             )

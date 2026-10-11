@@ -8,7 +8,7 @@ use snow::{
 use std::{fmt, io, net::SocketAddr, sync::Arc, time::Duration};
 use thiserror::Error;
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::TcpStream,
     time::timeout,
 };
@@ -19,6 +19,14 @@ const MAX_MESSAGE: usize = u16::MAX as usize;
 const TAG_LENGTH: usize = 16;
 /// Maximum plaintext bytes carried by one Noise transport message.
 pub const MAX_PLAINTEXT: usize = MAX_MESSAGE - TAG_LENGTH;
+
+/// An asynchronous, owned byte stream suitable for carrying a Noise link.
+pub trait LinkIo: AsyncRead + AsyncWrite + Unpin + Send + 'static {}
+
+impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> LinkIo for T {}
+
+/// An owned byte stream that can be used by a Noise link.
+pub type BoxedIo = Box<dyn LinkIo>;
 
 /// Shared, reloadable keys used by listeners and outbound links.
 pub type KeySlot = Arc<std::sync::RwLock<Option<Arc<LinkKeys>>>>;
@@ -86,9 +94,9 @@ pub enum TransportError {
     Timeout,
 }
 
-/// A TCP connection protected by an established Noise session.
+/// A byte stream protected by an established Noise session.
 pub struct SecureStream {
-    stream: TcpStream,
+    stream: BoxedIo,
     noise: TransportState,
     remote_static: [u8; 32],
 }
@@ -135,7 +143,20 @@ pub async fn connect(
     duration: Duration,
 ) -> Result<SecureStream, TransportError> {
     timeout(duration, async {
-        let mut stream = TcpStream::connect(addr).await?;
+        let stream = TcpStream::connect(addr).await?;
+        connect_io(Box::new(stream), keys, duration).await
+    })
+    .await
+    .map_err(|_| TransportError::Timeout)?
+}
+
+/// Completes the Noise initiator handshake over an already-open byte stream.
+pub async fn connect_io(
+    mut stream: BoxedIo,
+    keys: &LinkKeys,
+    duration: Duration,
+) -> Result<SecureStream, TransportError> {
+    timeout(duration, async {
         let (noise, remote_static) = initiator_handshake(&mut stream, keys).await?;
         Ok(SecureStream {
             stream,
@@ -149,7 +170,16 @@ pub async fn connect(
 
 /// Accepts a TCP stream as a Noise responder and completes the XXpsk3 handshake.
 pub async fn accept(
-    mut stream: TcpStream,
+    stream: TcpStream,
+    keys: &LinkKeys,
+    duration: Duration,
+) -> Result<SecureStream, TransportError> {
+    accept_io(Box::new(stream), keys, duration).await
+}
+
+/// Completes the Noise responder handshake over an already-open byte stream.
+pub async fn accept_io(
+    mut stream: BoxedIo,
     keys: &LinkKeys,
     duration: Duration,
 ) -> Result<SecureStream, TransportError> {
@@ -186,7 +216,7 @@ fn handshake_state(keys: &LinkKeys, initiator: bool) -> Result<HandshakeState, T
 }
 
 async fn initiator_handshake(
-    stream: &mut TcpStream,
+    stream: &mut (impl AsyncRead + AsyncWrite + Unpin + Send),
     keys: &LinkKeys,
 ) -> Result<(TransportState, [u8; 32]), TransportError> {
     let mut state = handshake_state(keys, true)?;
@@ -219,7 +249,7 @@ async fn initiator_handshake(
 }
 
 async fn responder_handshake(
-    stream: &mut TcpStream,
+    stream: &mut (impl AsyncRead + AsyncWrite + Unpin + Send),
     keys: &LinkKeys,
 ) -> Result<(TransportState, [u8; 32]), TransportError> {
     let mut state = handshake_state(keys, false)?;
@@ -261,7 +291,10 @@ fn handshake_io_error(error: TransportError) -> TransportError {
     TransportError::Handshake(error.to_string())
 }
 
-async fn write_message(stream: &mut TcpStream, message: &[u8]) -> Result<(), TransportError> {
+async fn write_message(
+    stream: &mut (impl AsyncWrite + Unpin),
+    message: &[u8],
+) -> Result<(), TransportError> {
     if message.len() > MAX_MESSAGE {
         return Err(TransportError::Oversize);
     }
@@ -273,7 +306,7 @@ async fn write_message(stream: &mut TcpStream, message: &[u8]) -> Result<(), Tra
     Ok(())
 }
 
-async fn read_message(stream: &mut TcpStream) -> Result<Vec<u8>, TransportError> {
+async fn read_message(stream: &mut (impl AsyncRead + Unpin)) -> Result<Vec<u8>, TransportError> {
     let mut length = [0_u8; 2];
     stream.read_exact(&mut length).await?;
     let length = usize::from(u16::from_be_bytes(length));
