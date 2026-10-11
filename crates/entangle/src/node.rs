@@ -860,8 +860,11 @@ impl Particle {
                     let local_key = entangle_transport::public_key(&self._identity.static_private);
                     let source_fingerprint = hex::encode(&Sha256::digest(incoming_stream.source)[..4]);
                     let serve_fingerprint = source_fingerprint.clone();
-                    let known = self.field.read().expect("field lock").all().iter()
-                        .any(|record| record.static_key == Some(incoming_stream.source));
+                    let known_in_session_directory = self
+                        .relay_directory
+                        .lock()
+                        .expect("relay directory lock")
+                        .contains(&incoming_stream.source);
                     debug!(source_fingerprint, "accepted incoming repeater stream");
                     if incoming_stream.source != local_key {
                         self.relay_directory
@@ -886,11 +889,11 @@ impl Particle {
                             Err(error) => debug!(source_fingerprint = serve_fingerprint, %error, "relayed peer link failed"),
                         }
                     });
-                    if !known && incoming_stream.source != local_key {
+                    if !known_in_session_directory && incoming_stream.source != local_key {
                         let node = self.clone();
                         let dialer = dialer.clone();
                         tokio::spawn(async move {
-                            debug!(source_fingerprint, "refreshing directory for unknown incoming repeater peer");
+                            debug!(source_fingerprint, "refreshing directory for peer missing from the current repeater session");
                             if let Err(error) = node.refresh_relay_directory(&dialer).await {
                                 debug!(%error, "repeater directory refresh after incoming stream failed");
                             }
@@ -2246,6 +2249,10 @@ mod tests {
             .port()
     }
 
+    fn canonical_temp_root(temp: &tempfile::TempDir) -> PathBuf {
+        temp.path().canonicalize().unwrap()
+    }
+
     fn port_other_than(other: u16) -> u16 {
         loop {
             let port = free_port();
@@ -2328,20 +2335,32 @@ mod tests {
     }
 
     async fn wait_for_repeater(a: &Particle, b: &Particle) {
+        let a_key = entangle_transport::public_key(&a._identity.static_private);
+        let b_key = entangle_transport::public_key(&b._identity.static_private);
         tokio::time::timeout(Duration::from_secs(10), async {
             loop {
                 let a_connected =
                     a.find_particles(&json!({}))["self"]["repeater"]["connected"] == true;
                 let b_connected =
                     b.find_particles(&json!({}))["self"]["repeater"]["connected"] == true;
-                if a_connected && b_connected {
+                let a_lists_b = a
+                    .relay_directory
+                    .lock()
+                    .expect("relay directory lock")
+                    .contains(&b_key);
+                let b_lists_a = b
+                    .relay_directory
+                    .lock()
+                    .expect("relay directory lock")
+                    .contains(&a_key);
+                if a_connected && b_connected && a_lists_b && b_lists_a {
                     break;
                 }
                 sleep(Duration::from_millis(20)).await;
             }
         })
         .await
-        .expect("both particles should connect to the repeater");
+        .expect("both particles should connect and see each other in the repeater directory");
     }
 
     fn peer_manifest(id: ParticleId) -> Manifest {
@@ -3256,9 +3275,10 @@ mod tests {
     #[tokio::test]
     async fn relay_only_particles_exchange_json_and_files_through_repeater() {
         let temp = tempfile::tempdir().unwrap();
-        let root_a = temp.path().join("a");
-        let root_b = temp.path().join("b");
-        let repeater_root = temp.path().join("repeater");
+        let temp_root = canonical_temp_root(&temp);
+        let root_a = temp_root.join("a");
+        let root_b = temp_root.join("b");
+        let repeater_root = temp_root.join("repeater");
         let port = free_port();
         let (server, _, _) =
             prepare_test_repeater_pair(&root_a, &root_b, &repeater_root, port).await;
@@ -3341,9 +3361,10 @@ mod tests {
     #[tokio::test]
     async fn normal_particle_uses_repeater_for_relay_only_peer() {
         let temp = tempfile::tempdir().unwrap();
-        let root_a = temp.path().join("a");
-        let root_b = temp.path().join("b");
-        let repeater_root = temp.path().join("repeater");
+        let temp_root = canonical_temp_root(&temp);
+        let root_a = temp_root.join("a");
+        let root_b = temp_root.join("b");
+        let repeater_root = temp_root.join("repeater");
         let (server, _, _) =
             prepare_test_repeater_pair(&root_a, &root_b, &repeater_root, free_port()).await;
         let options_a = options("particle-a", free_port(), root_a.clone(), None);
@@ -3382,9 +3403,10 @@ mod tests {
     #[tokio::test]
     async fn normal_particles_prefer_direct_route_with_repeater_available() {
         let temp = tempfile::tempdir().unwrap();
-        let root_a = temp.path().join("a");
-        let root_b = temp.path().join("b");
-        let repeater_root = temp.path().join("repeater");
+        let temp_root = canonical_temp_root(&temp);
+        let root_a = temp_root.join("a");
+        let root_b = temp_root.join("b");
+        let repeater_root = temp_root.join("repeater");
         let repeater_port = free_port();
         let port_a = loop {
             let port = free_port();
@@ -3451,9 +3473,10 @@ mod tests {
     #[tokio::test]
     async fn relay_only_particles_reconnect_after_repeater_restart() {
         let temp = tempfile::tempdir().unwrap();
-        let root_a = temp.path().join("a");
-        let root_b = temp.path().join("b");
-        let repeater_root = temp.path().join("repeater");
+        let temp_root = canonical_temp_root(&temp);
+        let root_a = temp_root.join("a");
+        let root_b = temp_root.join("b");
+        let repeater_root = temp_root.join("repeater");
         let port = free_port();
         let (server, url, repeater_public) =
             prepare_test_repeater_pair(&root_a, &root_b, &repeater_root, port).await;
