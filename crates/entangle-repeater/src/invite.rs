@@ -1,22 +1,32 @@
+//! Human-transferable, versioned repeater invitation codes.
+
 use data_encoding::BASE32_NOPAD;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+/// Decoded contents of an `ENTR1-` invitation code.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Invite {
+    /// Pinned repeater Noise static public key.
     pub repeater_public_key: [u8; 32],
+    /// Single-use enrollment secret; keep it private until transferred to a device.
     pub secret: [u8; 32],
+    /// Repeater WebSocket URL embedded in the invitation.
     pub url: String,
 }
 
+/// Errors while encoding or decoding invitation codes.
 #[derive(Debug, Error)]
 pub enum InviteError {
+    /// The code's prefix, encoding, version, length, or UTF-8 payload is invalid.
     #[error("invalid invite code")]
     Invalid,
+    /// The UTF-8 URL cannot fit in the wire format's u16 length field.
     #[error("invite URL is too long")]
     UrlTooLong,
 }
 
+/// Encodes an invitation as grouped, unpadded RFC 4648 Base32.
 pub fn encode(invite: &Invite) -> Result<String, InviteError> {
     let url = invite.url.as_bytes();
     let len = u16::try_from(url.len()).map_err(|_| InviteError::UrlTooLong)?;
@@ -36,6 +46,7 @@ pub fn encode(invite: &Invite) -> Result<String, InviteError> {
     Ok(format!("ENTR1-{groups}"))
 }
 
+/// Decodes and validates an `ENTR1-` invitation.
 pub fn decode(code: &str) -> Result<Invite, InviteError> {
     let body = code.strip_prefix("ENTR1-").ok_or(InviteError::Invalid)?;
     let encoded = body
@@ -59,6 +70,7 @@ pub fn decode(code: &str) -> Result<Invite, InviteError> {
     })
 }
 
+/// Hashes an invitation secret for storage without persisting the secret itself.
 pub fn secret_hash(secret: &[u8; 32]) -> String {
     hex::encode(Sha256::digest(secret))
 }

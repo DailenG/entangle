@@ -2,20 +2,23 @@
 
 use crate::{
     store::{Device, Store},
-    wire::{Frame, MAX_MESSAGE},
+    wire::{
+        Frame, CLOSE, DATA, INCOMING, INCOMING_BIT, LIST, LIST_REPLY, MAX_MESSAGE, OPEN, OPEN_FAIL,
+        PING, PONG, SESSION_STREAM,
+    },
 };
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use snow::{params::NoiseParams, Builder, TransportState};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     io,
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
     path::PathBuf,
     sync::{
         atomic::{AtomicU32, AtomicU64, Ordering},
-        Arc,
+        Arc, Mutex as StdMutex,
     },
     time::{Duration, Instant},
 };
@@ -23,11 +26,62 @@ use thiserror::Error;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt, BufStream},
     net::TcpListener,
-    sync::{mpsc, Mutex},
+    sync::{mpsc, watch, Mutex},
 };
 use tokio_tungstenite::{accept_async, tungstenite::Message};
 
 const NOISE: &str = "Noise_IK_25519_ChaChaPoly_BLAKE2s";
+const MAX_FAILED_HANDSHAKES: usize = 10;
+const HANDSHAKE_FAILURE_WINDOW: Duration = Duration::from_secs(60);
+const HANDSHAKE_COOLDOWN: Duration = Duration::from_secs(5 * 60);
+
+#[derive(Default)]
+struct HandshakeLimiter {
+    sources: HashMap<IpAddr, SourceFailures>,
+}
+
+#[derive(Default)]
+struct SourceFailures {
+    failures: VecDeque<Instant>,
+    blocked_until: Option<Instant>,
+}
+
+impl HandshakeLimiter {
+    fn is_blocked(&mut self, ip: IpAddr, now: Instant) -> bool {
+        let Some(source) = self.sources.get_mut(&ip) else {
+            return false;
+        };
+        if source.blocked_until.is_some_and(|until| now < until) {
+            return true;
+        }
+        source.blocked_until = None;
+        Self::prune_failures(source, now);
+        if source.failures.is_empty() {
+            self.sources.remove(&ip);
+        }
+        false
+    }
+
+    fn record_failure(&mut self, ip: IpAddr, now: Instant) {
+        let source = self.sources.entry(ip).or_default();
+        if source.blocked_until.is_some_and(|until| now < until) {
+            return;
+        }
+        source.blocked_until = None;
+        Self::prune_failures(source, now);
+        source.failures.push_back(now);
+        if source.failures.len() >= MAX_FAILED_HANDSHAKES {
+            source.blocked_until = Some(now + HANDSHAKE_COOLDOWN);
+            source.failures.clear();
+        }
+    }
+
+    fn prune_failures(source: &mut SourceFailures, now: Instant) {
+        source
+            .failures
+            .retain(|failure| now.saturating_duration_since(*failure) < HANDSHAKE_FAILURE_WINDOW);
+    }
+}
 
 #[derive(Clone, Debug)]
 /// Host configuration; device and invite state live under `root`.
@@ -78,6 +132,7 @@ struct Shared {
     store: Arc<Store>,
     peers: Peers,
     links: Links,
+    handshake_limiter: StdMutex<HandshakeLimiter>,
     incoming_ids: AtomicU32,
     session_ids: AtomicU64,
     session_gate: Arc<Mutex<()>>,
@@ -89,6 +144,14 @@ struct SessionContext {
     group: String,
     tx: mpsc::Sender<Frame>,
     rx: mpsc::Receiver<Frame>,
+    shared: Arc<Shared>,
+}
+
+struct ReaderContext {
+    key: [u8; 32],
+    session_id: u64,
+    group: String,
+    tx: mpsc::Sender<Frame>,
     shared: Arc<Shared>,
 }
 
@@ -133,6 +196,7 @@ pub async fn serve(config: ServerConfig) -> Result<(), ServerError> {
         store: Arc::new(Store::new(config.root)),
         peers: Arc::new(Mutex::new(HashMap::new())),
         links: Arc::new(Mutex::new(HashMap::new())),
+        handshake_limiter: StdMutex::new(HandshakeLimiter::default()),
         incoming_ids: AtomicU32::new(0x8000_0000),
         session_ids: AtomicU64::new(1),
         session_gate: Arc::new(Mutex::new(())),
@@ -160,6 +224,9 @@ pub async fn serve(config: ServerConfig) -> Result<(), ServerError> {
                     return;
                 }
             };
+            if source_is_blocked(&shared, addr.ip()) {
+                return;
+            }
             // Replay validated headers so tungstenite still performs the upgrade.
             let (websocket_io, mut relay_io) = tokio::io::duplex(64 * 1024);
             tokio::spawn(async move {
@@ -292,8 +359,8 @@ fn spawn_device_watcher(shared: Arc<Shared>) -> tokio::task::JoinHandle<()> {
             for (_, tx) in revoked {
                 let _ = tx
                     .send(Frame {
-                        kind: 4,
-                        stream: 0,
+                        kind: CLOSE,
+                        stream: SESSION_STREAM,
                         body: Vec::new(),
                     })
                     .await;
@@ -308,18 +375,37 @@ fn allowed(devices: &std::collections::BTreeMap<String, Device>, key: &[u8; 32])
         .is_some_and(|device| !device.revoked)
 }
 
+fn source_is_blocked(shared: &Shared, ip: IpAddr) -> bool {
+    shared
+        .handshake_limiter
+        .lock()
+        .map(|mut limiter| limiter.is_blocked(ip, Instant::now()))
+        .unwrap_or(true)
+}
+
+fn record_failed_handshake(shared: &Shared, ip: IpAddr) {
+    if let Ok(mut limiter) = shared.handshake_limiter.lock() {
+        limiter.record_failure(ip, Instant::now());
+    }
+}
+
 async fn handle<S>(
     mut ws: tokio_tungstenite::WebSocketStream<S>,
-    _addr: SocketAddr,
+    addr: SocketAddr,
     shared: Arc<Shared>,
 ) -> Result<(), ServerError>
 where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    let Some(Ok(Message::Binary(first))) = ws.next().await else {
-        return Ok(());
+    let first = match ws.next().await {
+        Some(Ok(Message::Binary(first))) => first,
+        _ => {
+            record_failed_handshake(&shared, addr.ip());
+            return Ok(());
+        }
     };
     if first.len() > MAX_MESSAGE {
+        record_failed_handshake(&shared, addr.ip());
         return Ok(());
     }
     let private = shared.store.key()?;
@@ -329,27 +415,49 @@ where
         .build_responder()
         .map_err(|error| io::Error::other(error.to_string()))?;
     let mut plaintext = vec![0; u16::MAX as usize];
-    let size = handshake
-        .read_message(&first, &mut plaintext)
-        .map_err(|error| io::Error::other(error.to_string()))?;
-    let remote: [u8; 32] = handshake
+    let size = match handshake.read_message(&first, &mut plaintext) {
+        Ok(size) => size,
+        Err(_) => {
+            record_failed_handshake(&shared, addr.ip());
+            return Ok(());
+        }
+    };
+    let remote: [u8; 32] = match handshake
         .get_remote_static()
-        .ok_or_else(|| io::Error::other("missing client static key"))?
-        .try_into()
-        .map_err(|_| io::Error::other("invalid client static key"))?;
-    let hello: Hello = serde_json::from_slice(&plaintext[..size])
-        .map_err(|error| io::Error::other(error.to_string()))?;
+        .and_then(|key| key.try_into().ok())
+    {
+        Some(remote) => remote,
+        None => {
+            record_failed_handshake(&shared, addr.ip());
+            return Ok(());
+        }
+    };
+    let hello: Hello = match serde_json::from_slice(&plaintext[..size]) {
+        Ok(hello) => hello,
+        Err(_) => {
+            record_failed_handshake(&shared, addr.ip());
+            return Ok(());
+        }
+    };
 
     // Reject invalid first messages before msg2. This prevents the repeater
     // from becoming an enrollment or allowlist oracle.
-    if hello.v != 1
-        || !matches!(hello.mode.as_str(), "session" | "enroll")
-        || hello.mode == "session"
-            && (!valid_group(hello.group.as_deref()) || !shared.store.device_allowed(&remote)?)
-        || hello.mode == "enroll"
-            && (!valid_label(hello.label.as_deref())
-                || !valid_invite(&shared.store, hello.invite.as_deref())?)
-    {
+    let valid = if hello.v != 1 {
+        false
+    } else {
+        match hello.mode.as_str() {
+            "session" => {
+                valid_group(hello.group.as_deref()) && shared.store.device_allowed(&remote)?
+            }
+            "enroll" => {
+                valid_label(hello.label.as_deref())
+                    && valid_invite(&shared.store, hello.invite.as_deref())?
+            }
+            _ => false,
+        }
+    };
+    if !valid {
+        record_failed_handshake(&shared, addr.ip());
         return Ok(());
     }
 
@@ -376,6 +484,7 @@ where
             .try_into()
             .map_err(|_| io::Error::other("invalid invitation"))?;
         if !shared.store.consume_invite(&secret, remote, hello.label)? {
+            record_failed_handshake(&shared, addr.ip());
             return Ok(());
         }
         ws.send(Message::Binary(response[..response_size].to_vec()))
@@ -385,7 +494,7 @@ where
 
     ws.send(Message::Binary(response[..response_size].to_vec()))
         .await?;
-    let mut transport = handshake
+    let transport = handshake
         .into_transport_mode()
         .map_err(|error| io::Error::other(error.to_string()))?;
     let group = hello.group.unwrap();
@@ -405,8 +514,8 @@ where
         let _ = old
             .tx
             .send(Frame {
-                kind: 4,
-                stream: 0,
+                kind: CLOSE,
+                stream: SESSION_STREAM,
                 body: Vec::new(),
             })
             .await;
@@ -415,7 +524,7 @@ where
 
     let result = session(
         ws,
-        &mut transport,
+        transport,
         SessionContext {
             key: remote,
             session_id,
@@ -486,7 +595,7 @@ async fn close_session_links(shared: &Shared, session_id: u64) {
         let _ = link
             .outbound
             .send(Frame {
-                kind: 4,
+                kind: CLOSE,
                 stream: link.peer_stream_id,
                 body: Vec::new(),
             })
@@ -494,211 +603,463 @@ async fn close_session_links(shared: &Shared, session_id: u64) {
     }
 }
 
-async fn send_noise_frame<S>(
-    ws: &mut tokio_tungstenite::WebSocketStream<S>,
-    noise: &mut TransportState,
-    frame: Frame,
-) -> Result<(), ServerError>
-where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
-{
-    let plaintext = frame
-        .encode()
-        .map_err(|_| io::Error::other("frame too large"))?;
-    let mut encrypted = vec![0; u16::MAX as usize];
-    let size = noise
-        .write_message(&plaintext, &mut encrypted)
-        .map_err(|error| io::Error::other(error.to_string()))?;
-    ws.send(Message::Binary(encrypted[..size].to_vec())).await?;
-    Ok(())
-}
-
 async fn session<S>(
-    mut ws: tokio_tungstenite::WebSocketStream<S>,
-    noise: &mut TransportState,
+    ws: tokio_tungstenite::WebSocketStream<S>,
+    noise: TransportState,
     context: SessionContext,
 ) -> Result<(), ServerError>
 where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     let SessionContext {
         key,
         session_id,
         group,
         tx,
-        mut rx,
+        rx,
         shared,
     } = context;
-    loop {
-        tokio::select! {
-            _ = tokio::time::sleep(Duration::from_secs(60)) => return Ok(()),
-            Some(frame) = rx.recv() => {
-                let plaintext = frame.encode().map_err(|_| io::Error::other("frame too large"))?;
-                let mut encrypted = vec![0; u16::MAX as usize];
-                let size = noise.write_message(&plaintext, &mut encrypted)
-                    .map_err(|error| io::Error::other(error.to_string()))?;
-                ws.send(Message::Binary(encrypted[..size].to_vec())).await?;
-                if frame.kind == 4 && frame.stream == 0 {
-                    let _ = ws.close(None).await;
-                    return Ok(());
-                }
-            }
-            message = ws.next() => {
-                let Some(message) = message else { return Ok(()) };
-                let Message::Binary(data) = message? else { continue };
-                if data.len() > MAX_MESSAGE {
-                    return Ok(());
-                }
-                let mut plaintext = vec![0; u16::MAX as usize];
-                let size = noise.read_message(&data, &mut plaintext)
-                    .map_err(|error| io::Error::other(error.to_string()))?;
-                let frame = Frame::decode(&plaintext[..size])
-                    .map_err(|_| io::Error::other("invalid frame"))?;
-                match frame.kind {
-                    1 => {
-                        if frame.body.len() != 32 || frame.stream & 0x8000_0000 != 0 {
-                            continue;
-                        }
-                        let target: [u8; 32] = frame.body.try_into().unwrap();
-                        if target == key || !shared.store.device_allowed(&target)? {
-                            send_noise_frame(&mut ws, noise, Frame {
-                                kind: 5,
-                                stream: frame.stream,
-                                body: b"target is not enrolled".to_vec(),
-                            }).await?;
-                            continue;
-                        }
-                        let target_peer = shared.peers.lock().await.get(&target).cloned();
-                        let Some(target_peer) = target_peer.filter(|peer| peer.group == group) else {
-                            send_noise_frame(&mut ws, noise, Frame {
-                                kind: 5,
-                                stream: frame.stream,
-                                body: b"target offline or not in your group".to_vec(),
-                            }).await?;
-                            continue;
-                        };
-                        let mut links = shared.links.lock().await;
-                        let local_count = links.keys().filter(|(id, _)| *id == session_id).count();
-                        let target_count = links.keys()
-                            .filter(|(id, _)| *id == target_peer.session_id).count();
-                        if local_count >= 64 || target_count >= 64
-                            || links.contains_key(&(session_id, frame.stream))
-                        {
-                            drop(links);
-                            send_noise_frame(&mut ws, noise, Frame {
-                                kind: 5,
-                                stream: frame.stream,
-                                body: b"stream limit".to_vec(),
-                            }).await?;
-                            continue;
-                        }
-                        let incoming_id = loop {
-                            let id = shared.incoming_ids.fetch_add(1, Ordering::Relaxed) | 0x8000_0000;
-                            if !links.contains_key(&(target_peer.session_id, id)) {
-                                break id;
-                            }
-                        };
-                        // Each direction has a 32-frame queue. Slow consumers
-                        // backpressure only the affected stream.
-                        let (to_target, mut target_queue) = mpsc::channel::<Frame>(32);
-                        let target_session = target_peer.tx.clone();
-                        tokio::spawn(async move {
-                            while let Some(frame) = target_queue.recv().await {
-                                if target_session.send(frame).await.is_err() {
-                                    break;
-                                }
-                            }
-                        });
-                        let (to_source, mut source_queue) = mpsc::channel::<Frame>(32);
-                        let source_session = tx.clone();
-                        tokio::spawn(async move {
-                            while let Some(frame) = source_queue.recv().await {
-                                if source_session.send(frame).await.is_err() {
-                                    break;
-                                }
-                            }
-                        });
-                        links.insert((session_id, frame.stream), Link {
-                            peer_session_id: target_peer.session_id,
-                            peer_stream_id: incoming_id,
-                            outbound: to_target,
-                        });
-                        links.insert((target_peer.session_id, incoming_id), Link {
-                            peer_session_id: session_id,
-                            peer_stream_id: frame.stream,
-                            outbound: to_source,
-                        });
-                        drop(links);
-                        if target_peer.tx.send(Frame {
-                            kind: 2,
-                            stream: incoming_id,
-                            body: key.to_vec(),
-                        }).await.is_err() {
-                            shared.links.lock().await.remove(&(session_id, frame.stream));
-                            shared.links.lock().await.remove(&(target_peer.session_id, incoming_id));
-                            send_noise_frame(&mut ws, noise, Frame {
-                                kind: 5,
-                                stream: frame.stream,
-                                body: b"target offline".to_vec(),
-                            }).await?;
-                        }
-                    }
-                    3 => {
-                        let link = shared.links.lock().await
-                            .get(&(session_id, frame.stream)).cloned();
-                        if let Some(link) = link
-                        {
-                            // This tap is test-only; production never stores or
-                            // logs forwarded DATA bodies.
-                            #[cfg(test)]
-                            FORWARDED_DATA.get_or_init(Default::default)
-                                .lock().unwrap().extend_from_slice(&frame.body);
-                            let _ = link.outbound.send(Frame {
-                                kind: 3,
-                                stream: link.peer_stream_id,
-                                body: frame.body,
-                            }).await;
-                        }
-                    }
-                    4 => {
-                        let link = shared.links.lock().await.remove(&(session_id, frame.stream));
-                        if let Some(link) = link
-                        {
-                            shared.links.lock().await
-                                .remove(&(link.peer_session_id, link.peer_stream_id));
-                            let _ = link.outbound.send(Frame {
-                                kind: 4,
-                                stream: link.peer_stream_id,
-                                body: Vec::new(),
-                            }).await;
-                        }
-                    }
-                    6 if frame.body.is_empty() => {
-                        let list = {
-                            let peers = shared.peers.lock().await;
-                            peers.values().filter(|peer| peer.key != key && peer.group == group)
-                                .map(|peer| serde_json::json!({
-                                    "key": hex::encode(peer.key),
-                                    "since_secs": peer.since.elapsed().as_secs(),
-                                })).collect::<Vec<_>>()
-                        };
-                        send_noise_frame(&mut ws, noise, Frame {
-                            kind: 7,
-                            stream: 0,
-                            body: serde_json::to_vec(&list)?,
-                        }).await?;
-                    }
-                    8 if frame.body.is_empty() => {
-                        send_noise_frame(&mut ws, noise, Frame {
-                            kind: 9,
-                            stream: frame.stream,
-                            body: Vec::new(),
-                        }).await?;
-                    }
-                    9 => {}
-                    _ => {}
-                }
-            }
+    let noise = Arc::new(StdMutex::new(noise));
+    let (sink, stream) = ws.split();
+    let (shutdown, shutdown_rx) = watch::channel(false);
+    let writer_noise = Arc::clone(&noise);
+    let mut writer = tokio::spawn(server_writer(sink, rx, writer_noise, shutdown_rx.clone()));
+    let mut reader = tokio::spawn(server_reader(
+        stream,
+        noise,
+        ReaderContext {
+            key,
+            session_id,
+            group,
+            tx,
+            shared,
+        },
+        shutdown_rx,
+    ));
+    tokio::select! {
+        result = &mut writer => {
+            let _ = shutdown.send(true);
+            let _ = reader.await;
+            result.map_err(|error| io::Error::other(error.to_string()))?
         }
+        result = &mut reader => {
+            let _ = shutdown.send(true);
+            let _ = writer.await;
+            result.map_err(|error| io::Error::other(error.to_string()))?
+        }
+    }
+}
+
+fn encrypt_frame(noise: &StdMutex<TransportState>, frame: Frame) -> Result<Vec<u8>, ServerError> {
+    let plaintext = frame
+        .encode()
+        .map_err(|_| io::Error::other("frame too large"))?;
+    let mut encrypted = vec![0; MAX_MESSAGE];
+    let size = noise
+        .lock()
+        .map_err(|_| io::Error::other("Noise state lock poisoned"))?
+        .write_message(&plaintext, &mut encrypted)
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    encrypted.truncate(size);
+    Ok(encrypted)
+}
+
+fn decrypt_frame(noise: &StdMutex<TransportState>, encrypted: &[u8]) -> Result<Frame, ServerError> {
+    if encrypted.len() > MAX_MESSAGE {
+        return Err(io::Error::other("message too large").into());
+    }
+    let mut plaintext = vec![0; u16::MAX as usize];
+    let size = noise
+        .lock()
+        .map_err(|_| io::Error::other("Noise state lock poisoned"))?
+        .read_message(encrypted, &mut plaintext)
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    Frame::decode(&plaintext[..size]).map_err(|_| io::Error::other("invalid frame").into())
+}
+
+async fn enqueue(
+    queue: &mpsc::Sender<Frame>,
+    frame: Frame,
+    shutdown: &mut watch::Receiver<bool>,
+) -> bool {
+    tokio::select! {
+        changed = shutdown.changed() => changed.is_ok() && !*shutdown.borrow(),
+        result = queue.send(frame) => result.is_ok(),
+    }
+}
+
+async fn server_writer<S>(
+    mut sink: futures_util::stream::SplitSink<tokio_tungstenite::WebSocketStream<S>, Message>,
+    mut rx: mpsc::Receiver<Frame>,
+    noise: Arc<StdMutex<TransportState>>,
+    mut shutdown: watch::Receiver<bool>,
+) -> Result<(), ServerError>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    loop {
+        let frame = tokio::select! {
+            changed = shutdown.changed() => {
+                let _ = changed;
+                return Ok(());
+            }
+            frame = rx.recv() => match frame {
+                Some(frame) => frame,
+                None => return Ok(()),
+            }
+        };
+        let encrypted = encrypt_frame(&noise, frame.clone())?;
+        tokio::select! {
+            changed = shutdown.changed() => {
+                let _ = changed;
+                return Ok(());
+            }
+            result = sink.send(Message::Binary(encrypted)) => result?,
+        }
+        if frame.kind == CLOSE && frame.stream == SESSION_STREAM {
+            let _ = sink.close().await;
+            return Ok(());
+        }
+    }
+}
+
+async fn server_reader<S>(
+    mut stream: futures_util::stream::SplitStream<tokio_tungstenite::WebSocketStream<S>>,
+    noise: Arc<StdMutex<TransportState>>,
+    context: ReaderContext,
+    mut shutdown: watch::Receiver<bool>,
+) -> Result<(), ServerError>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let ReaderContext {
+        key,
+        session_id,
+        group,
+        tx,
+        shared,
+    } = context;
+    let mut silence_deadline = Box::pin(tokio::time::sleep(Duration::from_secs(60)));
+    loop {
+        let message = tokio::select! {
+            _ = &mut silence_deadline => return Ok(()),
+            changed = shutdown.changed() => {
+                let _ = changed;
+                return Ok(());
+            }
+            message = stream.next() => message,
+        };
+        let Some(message) = message else {
+            return Ok(());
+        };
+        let Message::Binary(data) = message? else {
+            continue;
+        };
+        silence_deadline
+            .as_mut()
+            .reset(tokio::time::Instant::now() + Duration::from_secs(60));
+        let frame = decrypt_frame(&noise, &data)?;
+        match frame.kind {
+            OPEN => {
+                if frame.body.len() != 32 || frame.stream & INCOMING_BIT != 0 {
+                    continue;
+                }
+                let target: [u8; 32] = frame.body.try_into().unwrap();
+                if target == key || !shared.store.device_allowed(&target)? {
+                    if !enqueue(
+                        &tx,
+                        Frame {
+                            kind: OPEN_FAIL,
+                            stream: frame.stream,
+                            body: b"target is not enrolled".to_vec(),
+                        },
+                        &mut shutdown,
+                    )
+                    .await
+                    {
+                        return Ok(());
+                    }
+                    continue;
+                }
+                let target_peer = shared.peers.lock().await.get(&target).cloned();
+                let Some(target_peer) = target_peer.filter(|peer| peer.group == group) else {
+                    if !enqueue(
+                        &tx,
+                        Frame {
+                            kind: OPEN_FAIL,
+                            stream: frame.stream,
+                            body: b"target offline or not in your group".to_vec(),
+                        },
+                        &mut shutdown,
+                    )
+                    .await
+                    {
+                        return Ok(());
+                    }
+                    continue;
+                };
+                let mut links = shared.links.lock().await;
+                let local_count = links.keys().filter(|(id, _)| *id == session_id).count();
+                let target_count = links
+                    .keys()
+                    .filter(|(id, _)| *id == target_peer.session_id)
+                    .count();
+                if local_count >= 64
+                    || target_count >= 64
+                    || links.contains_key(&(session_id, frame.stream))
+                {
+                    drop(links);
+                    if !enqueue(
+                        &tx,
+                        Frame {
+                            kind: OPEN_FAIL,
+                            stream: frame.stream,
+                            body: b"stream limit".to_vec(),
+                        },
+                        &mut shutdown,
+                    )
+                    .await
+                    {
+                        return Ok(());
+                    }
+                    continue;
+                }
+                let incoming_id = loop {
+                    let id = shared.incoming_ids.fetch_add(1, Ordering::Relaxed) | INCOMING_BIT;
+                    if !links.contains_key(&(target_peer.session_id, id)) {
+                        break id;
+                    }
+                };
+                // Each stream has a bounded queue; a slow stream can apply
+                // backpressure to all streams on this session.
+                let (to_target, mut target_queue) = mpsc::channel::<Frame>(32);
+                let target_session = target_peer.tx.clone();
+                tokio::spawn(async move {
+                    while let Some(frame) = target_queue.recv().await {
+                        if target_session.send(frame).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+                let (to_source, mut source_queue) = mpsc::channel::<Frame>(32);
+                let source_session = tx.clone();
+                tokio::spawn(async move {
+                    while let Some(frame) = source_queue.recv().await {
+                        if source_session.send(frame).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+                links.insert(
+                    (session_id, frame.stream),
+                    Link {
+                        peer_session_id: target_peer.session_id,
+                        peer_stream_id: incoming_id,
+                        outbound: to_target,
+                    },
+                );
+                links.insert(
+                    (target_peer.session_id, incoming_id),
+                    Link {
+                        peer_session_id: session_id,
+                        peer_stream_id: frame.stream,
+                        outbound: to_source,
+                    },
+                );
+                drop(links);
+                if !enqueue(
+                    &target_peer.tx,
+                    Frame {
+                        kind: INCOMING,
+                        stream: incoming_id,
+                        body: key.to_vec(),
+                    },
+                    &mut shutdown,
+                )
+                .await
+                {
+                    shared
+                        .links
+                        .lock()
+                        .await
+                        .remove(&(session_id, frame.stream));
+                    shared
+                        .links
+                        .lock()
+                        .await
+                        .remove(&(target_peer.session_id, incoming_id));
+                    if !enqueue(
+                        &tx,
+                        Frame {
+                            kind: OPEN_FAIL,
+                            stream: frame.stream,
+                            body: b"target offline".to_vec(),
+                        },
+                        &mut shutdown,
+                    )
+                    .await
+                    {
+                        return Ok(());
+                    }
+                }
+            }
+            DATA => {
+                let link = shared
+                    .links
+                    .lock()
+                    .await
+                    .get(&(session_id, frame.stream))
+                    .cloned();
+                if let Some(link) = link {
+                    // This tap is test-only; production never stores or logs DATA.
+                    #[cfg(test)]
+                    FORWARDED_DATA
+                        .get_or_init(Default::default)
+                        .lock()
+                        .unwrap()
+                        .extend_from_slice(&frame.body);
+                    if !enqueue(
+                        &link.outbound,
+                        Frame {
+                            kind: DATA,
+                            stream: link.peer_stream_id,
+                            body: frame.body,
+                        },
+                        &mut shutdown,
+                    )
+                    .await
+                    {
+                        return Ok(());
+                    }
+                }
+            }
+            CLOSE => {
+                if frame.stream == SESSION_STREAM {
+                    return Ok(());
+                }
+                let link = shared
+                    .links
+                    .lock()
+                    .await
+                    .remove(&(session_id, frame.stream));
+                if let Some(link) = link {
+                    shared
+                        .links
+                        .lock()
+                        .await
+                        .remove(&(link.peer_session_id, link.peer_stream_id));
+                    let _ = enqueue(
+                        &link.outbound,
+                        Frame {
+                            kind: CLOSE,
+                            stream: link.peer_stream_id,
+                            body: Vec::new(),
+                        },
+                        &mut shutdown,
+                    )
+                    .await;
+                }
+            }
+            LIST if frame.body.is_empty() => {
+                let list = {
+                    let peers = shared.peers.lock().await;
+                    peers
+                        .values()
+                        .filter(|peer| peer.key != key && peer.group == group)
+                        .map(|peer| {
+                            serde_json::json!({
+                                "key": hex::encode(peer.key),
+                                "since_secs": peer.since.elapsed().as_secs(),
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                };
+                if !enqueue(
+                    &tx,
+                    Frame {
+                        kind: LIST_REPLY,
+                        stream: SESSION_STREAM,
+                        body: serde_json::to_vec(&list)?,
+                    },
+                    &mut shutdown,
+                )
+                .await
+                {
+                    return Ok(());
+                }
+            }
+            PING if frame.body.is_empty() => {
+                if !enqueue(
+                    &tx,
+                    Frame {
+                        kind: PONG,
+                        stream: frame.stream,
+                        body: Vec::new(),
+                    },
+                    &mut shutdown,
+                )
+                .await
+                {
+                    return Ok(());
+                }
+            }
+            PONG => {}
+            _ => {}
+        }
+    }
+}
+
+#[cfg(test)]
+mod limiter_tests {
+    use super::*;
+
+    fn loopback() -> IpAddr {
+        "127.0.0.1".parse().unwrap()
+    }
+
+    #[test]
+    fn handshake_limiter_blocks_on_the_tenth_failure() {
+        let mut limiter = HandshakeLimiter::default();
+        let now = Instant::now();
+        let ip = loopback();
+
+        for _ in 0..MAX_FAILED_HANDSHAKES - 1 {
+            limiter.record_failure(ip, now);
+        }
+        assert!(!limiter.is_blocked(ip, now));
+        limiter.record_failure(ip, now);
+        assert!(limiter.is_blocked(ip, now));
+    }
+
+    #[test]
+    fn handshake_limiter_expires_failures_outside_the_window() {
+        let mut limiter = HandshakeLimiter::default();
+        let now = Instant::now();
+        let ip = loopback();
+        for _ in 0..MAX_FAILED_HANDSHAKES - 1 {
+            limiter.record_failure(ip, now);
+        }
+
+        let after_window = now + HANDSHAKE_FAILURE_WINDOW + Duration::from_secs(1);
+        limiter.record_failure(ip, after_window);
+        for _ in 0..MAX_FAILED_HANDSHAKES - 2 {
+            limiter.record_failure(ip, after_window);
+        }
+        assert!(!limiter.is_blocked(ip, after_window));
+        limiter.record_failure(ip, after_window);
+        assert!(limiter.is_blocked(ip, after_window));
+    }
+
+    #[test]
+    fn handshake_limiter_expires_the_cooldown() {
+        let mut limiter = HandshakeLimiter::default();
+        let now = Instant::now();
+        let ip = loopback();
+        for _ in 0..MAX_FAILED_HANDSHAKES {
+            limiter.record_failure(ip, now);
+        }
+
+        assert!(limiter.is_blocked(ip, now + HANDSHAKE_COOLDOWN - Duration::from_secs(1)));
+        assert!(!limiter.is_blocked(ip, now + HANDSHAKE_COOLDOWN));
     }
 }

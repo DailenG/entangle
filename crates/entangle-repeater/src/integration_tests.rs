@@ -2,16 +2,17 @@ use crate::{
     client::{self, RepeaterClient},
     server::{self, ServerConfig},
     store::Store,
-    wire::Frame,
+    wire::{Frame, CLOSE, OPEN},
 };
 use entangle_transport::{self, LinkKeys};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::json;
 use sha2::{Digest, Sha256};
-use std::{net::SocketAddr, time::Duration};
+use std::{net::SocketAddr, sync::Arc, time::Duration};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
+    sync::Barrier,
     task::JoinHandle,
 };
 use tokio_tungstenite::{connect_async, tungstenite::Message};
@@ -163,7 +164,7 @@ async fn sessions_route_large_streams_and_isolate_groups() {
         .unwrap();
     assert!(c.list().await.unwrap().is_empty());
     c.send_frame(Frame {
-        kind: 1,
+        kind: OPEN,
         stream: 1,
         body: a.static_public.to_vec(),
     })
@@ -172,6 +173,71 @@ async fn sessions_route_large_streams_and_isolate_groups() {
     let failed = c.recv_frame().await.unwrap();
     assert_eq!(failed.kind, 5);
     assert_eq!(failed.stream, 1);
+}
+
+async fn exchange_payload(
+    stream: entangle_transport::BoxedIo,
+    payload: Vec<u8>,
+    completed: Arc<Barrier>,
+) {
+    let (mut reader, mut writer) = tokio::io::split(stream);
+    let expected: [u8; 32] = Sha256::digest(&payload).into();
+    let size = payload.len();
+    let (send_result, received) = tokio::join!(writer.write_all(&payload), async {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let mut received = vec![0; size];
+        reader.read_exact(&mut received).await.unwrap();
+        received
+    });
+    send_result.unwrap();
+    assert_eq!(Sha256::digest(received).as_slice(), expected);
+    completed.wait().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn simultaneous_bidirectional_transfers_on_two_streams_finish_without_deadlock() {
+    const SIZE: usize = 8 * 1024 * 1024;
+
+    let server = start_server().await;
+    let a_private = entangle_transport::generate_static();
+    let b_private = entangle_transport::generate_static();
+    enroll(&server, a_private, [41; 32]).await;
+    enroll(&server, b_private, [42; 32]).await;
+    let (mut a, mut b) = open_sessions(&server, a_private, "aaaaaaaa", b_private, "aaaaaaaa").await;
+
+    let a_to_b = a.open(b.static_public).await.unwrap();
+    let b_to_a = b.open(a.static_public).await.unwrap();
+    let b_incoming = b.accept().await.unwrap();
+    let a_incoming = a.accept().await.unwrap();
+
+    let payload_a_to_b = (0..SIZE)
+        .map(|index| (index % 251) as u8)
+        .collect::<Vec<_>>();
+    let payload_b_to_a = (0..SIZE)
+        .map(|index| ((index * 7 + 19) % 251) as u8)
+        .collect::<Vec<_>>();
+    let completed = Arc::new(Barrier::new(4));
+    let result = tokio::time::timeout(Duration::from_secs(30), async {
+        tokio::join!(
+            exchange_payload(
+                a_to_b.into_io(),
+                payload_a_to_b.clone(),
+                Arc::clone(&completed),
+            ),
+            exchange_payload(b_incoming.into_io(), payload_a_to_b, Arc::clone(&completed),),
+            exchange_payload(
+                b_to_a.into_io(),
+                payload_b_to_a.clone(),
+                Arc::clone(&completed),
+            ),
+            exchange_payload(a_incoming.into_io(), payload_b_to_a, Arc::clone(&completed),),
+        )
+    })
+    .await;
+    assert!(
+        result.is_ok(),
+        "two-stream bidirectional transfer exceeded 30 seconds"
+    );
 }
 
 #[tokio::test]
@@ -233,7 +299,7 @@ async fn enrollment_rejects_unenrolled_reused_and_expired_credentials_and_revoke
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(frame.kind, 4);
+    assert_eq!(frame.kind, CLOSE);
 }
 
 #[tokio::test]

@@ -1,32 +1,45 @@
 //! Client-side Noise handshake and asynchronous stream multiplexer.
 
-use crate::wire::{Frame, MAX_MESSAGE};
+use crate::wire::{
+    Frame, CLOSE, DATA, INCOMING, LIST, LIST_REPLY, MAX_MESSAGE, OPEN, OPEN_FAIL, PING, PONG,
+    SESSION_STREAM,
+};
 use entangle_transport::BoxedIo;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::json;
 use snow::{params::NoiseParams, Builder, TransportState};
-use std::{collections::HashMap, io};
+use std::{
+    collections::HashMap,
+    io,
+    sync::{Arc, Mutex as StdMutex},
+};
 use thiserror::Error;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
-    sync::{mpsc, oneshot, Mutex},
+    sync::{mpsc, oneshot, watch, Mutex},
     time::Duration,
 };
 use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream, WebSocketStream};
 
 const NOISE: &str = "Noise_IK_25519_ChaChaPoly_BLAKE2s";
 
+/// Errors returned while establishing or using a repeater session.
 #[derive(Debug, Error)]
 pub enum ClientError {
+    /// WebSocket transport failure.
     #[error("repeater WebSocket failed: {0}")]
     WebSocket(#[from] tokio_tungstenite::tungstenite::Error),
+    /// Socket I/O failure.
     #[error("repeater I/O failed: {0}")]
     Io(#[from] io::Error),
+    /// Noise handshake or transport failure.
     #[error("repeater Noise failed: {0}")]
     Noise(String),
+    /// The repeater returned or sent an invalid protocol message.
     #[error("repeater protocol error")]
     Protocol,
+    /// A protocol JSON payload could not be encoded or decoded.
     #[error("repeater JSON failed: {0}")]
     Json(#[from] serde_json::Error),
 }
@@ -34,17 +47,22 @@ pub enum ClientError {
 type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 type Routes = std::sync::Arc<Mutex<HashMap<u32, mpsc::Sender<Frame>>>>;
 
+/// An authenticated client session to a repeater.
 pub struct RepeaterClient {
     outgoing: mpsc::Sender<Frame>,
     control: mpsc::Receiver<Frame>,
     incoming: mpsc::Receiver<RepeaterStream>,
     routes: Routes,
     shutdown: Option<oneshot::Sender<()>>,
+    session_shutdown: watch::Receiver<bool>,
+    /// This session's Noise static public key.
     pub static_public: [u8; 32],
     next_stream: u32,
 }
 
+/// One multiplexed byte stream carried by a repeater session.
 pub struct RepeaterStream {
+    /// Stream identifier assigned by the client or repeater.
     pub id: u32,
     io: BoxedIo,
 }
@@ -100,6 +118,8 @@ async fn handshake(
 }
 
 /// Establishes a repeater session with a pinned server key and self-declared group.
+///
+/// The group is ephemeral routing metadata and is not persisted by the repeater.
 pub async fn connect(
     url: &str,
     private: [u8; 32],
@@ -117,6 +137,8 @@ pub async fn connect(
 }
 
 /// Enrolls the particle's static key with a single-use invitation.
+///
+/// The repeater does not retain the invitation secret after enrollment.
 pub async fn enroll(
     url: &str,
     private: [u8; 32],
@@ -135,79 +157,52 @@ pub async fn enroll(
     Ok(())
 }
 
-fn start_session(ws: Socket, mut noise: TransportState, static_public: [u8; 32]) -> RepeaterClient {
-    let (outgoing, mut outgoing_rx) = mpsc::channel::<Frame>(128);
+fn start_session(ws: Socket, noise: TransportState, static_public: [u8; 32]) -> RepeaterClient {
+    let (outgoing, outgoing_rx) = mpsc::channel::<Frame>(128);
     let (control_tx, control) = mpsc::channel(32);
     let (incoming_tx, incoming) = mpsc::channel(32);
     let (shutdown, mut shutdown_rx) = oneshot::channel();
     let routes: Routes = std::sync::Arc::new(Mutex::new(HashMap::new()));
+    let (session_shutdown, watch_rx) = watch::channel(false);
+    let noise = Arc::new(StdMutex::new(noise));
+    let client_shutdown = watch_rx.clone();
+    let (sink, stream) = ws.split();
+    let writer_noise = Arc::clone(&noise);
+    let mut writer = tokio::spawn(client_writer(
+        sink,
+        outgoing_rx,
+        writer_noise,
+        watch_rx.clone(),
+    ));
+    let reader_routes = routes.clone();
+    let reader_outgoing = outgoing.clone();
+    let mut reader = tokio::spawn(client_reader(
+        stream,
+        noise,
+        control_tx,
+        incoming_tx,
+        reader_routes,
+        reader_outgoing,
+        watch_rx,
+    ));
     let pump_routes = routes.clone();
-    let pump_outgoing = outgoing.clone();
     tokio::spawn(async move {
-        let mut ws = ws;
-        let mut heartbeat = tokio::time::interval(Duration::from_secs(20));
-        heartbeat.tick().await;
-        let silence_deadline = tokio::time::sleep(Duration::from_secs(60));
-        tokio::pin!(silence_deadline);
-        loop {
-            tokio::select! {
-                _ = &mut silence_deadline => break,
-                Some(frame) = outgoing_rx.recv() => {
-                    let Ok(plain) = frame.encode() else { continue };
-                    let mut encrypted = vec![0; u16::MAX as usize];
-                    let Ok(size) = noise.write_message(&plain, &mut encrypted) else { break };
-                    if ws.send(Message::Binary(encrypted[..size].to_vec())).await.is_err() {
-                        break;
-                    }
-                }
-                Some(message) = ws.next() => {
-                    let Ok(Message::Binary(message)) = message else { break };
-                    if message.len() > MAX_MESSAGE {
-                        break;
-                    }
-                    silence_deadline.as_mut().reset(tokio::time::Instant::now() + Duration::from_secs(60));
-                    let mut plain = vec![0; u16::MAX as usize];
-                    let Ok(size) = noise.read_message(&message, &mut plain) else { break };
-                    let Ok(frame) = Frame::decode(&plain[..size]) else { break };
-                    if frame.kind == 9 {
-                        continue;
-                    } else if frame.kind == 5 {
-                        let route = pump_routes.lock().await.remove(&frame.stream);
-                        if let Some(route) = route {
-                            let _ = route
-                                .send(Frame { kind: 4, stream: frame.stream, body: Vec::new() })
-                                .await;
-                        } else if control_tx.send(frame).await.is_err() {
-                            break;
-                        }
-                    } else if frame.kind == 2 {
-                        let stream = make_stream(frame.stream, &pump_routes, &pump_outgoing).await;
-                        if incoming_tx.send(stream).await.is_err() {
-                            break;
-                        }
-                    } else if matches!(frame.kind, 3 | 4) {
-                        let route = pump_routes.lock().await.get(&frame.stream).cloned();
-                        if let Some(route) = route {
-                            let _ = route.send(frame).await;
-                        } else if control_tx.send(frame).await.is_err() {
-                            break;
-                        }
-                    } else if control_tx.send(frame).await.is_err() {
-                        break;
-                    }
-                }
-                _ = heartbeat.tick() => {
-                    let Ok(plain) = (Frame { kind: 8, stream: 0, body: Vec::new() }).encode() else { break };
-                    let mut encrypted = vec![0; u16::MAX as usize];
-                    let Ok(size) = noise.write_message(&plain, &mut encrypted) else { break };
-                    if ws.send(Message::Binary(encrypted[..size].to_vec())).await.is_err() {
-                        break;
-                    }
-                }
-                _ = &mut shutdown_rx => break,
-                else => break,
+        tokio::select! {
+            _ = &mut shutdown_rx => {
+                let _ = session_shutdown.send(true);
+                let _ = writer.await;
+                let _ = reader.await;
+            }
+            _ = &mut writer => {
+                let _ = session_shutdown.send(true);
+                let _ = reader.await;
+            }
+            _ = &mut reader => {
+                let _ = session_shutdown.send(true);
+                let _ = writer.await;
             }
         }
+        pump_routes.lock().await.clear();
     });
     RepeaterClient {
         outgoing,
@@ -215,12 +210,195 @@ fn start_session(ws: Socket, mut noise: TransportState, static_public: [u8; 32])
         incoming,
         routes,
         shutdown: Some(shutdown),
+        session_shutdown: client_shutdown,
         static_public,
         next_stream: 0,
     }
 }
 
-async fn make_stream(id: u32, routes: &Routes, outgoing: &mpsc::Sender<Frame>) -> RepeaterStream {
+async fn send_or_shutdown<T: Send>(
+    queue: &mpsc::Sender<T>,
+    value: T,
+    shutdown: &mut watch::Receiver<bool>,
+) -> bool {
+    tokio::select! {
+        changed = shutdown.changed() => {
+            let _ = changed;
+            false
+        }
+        result = queue.send(value) => result.is_ok(),
+    }
+}
+
+fn encrypt_frame(noise: &StdMutex<TransportState>, frame: &Frame) -> io::Result<Vec<u8>> {
+    let plaintext = frame
+        .encode()
+        .map_err(|_| io::Error::other("invalid frame"))?;
+    let mut encrypted = vec![0; MAX_MESSAGE];
+    let size = noise
+        .lock()
+        .map_err(|_| io::Error::other("Noise state lock poisoned"))?
+        .write_message(&plaintext, &mut encrypted)
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    encrypted.truncate(size);
+    Ok(encrypted)
+}
+
+fn decrypt_frame(noise: &StdMutex<TransportState>, encrypted: &[u8]) -> io::Result<Frame> {
+    if encrypted.len() > MAX_MESSAGE {
+        return Err(io::Error::other("message too large"));
+    }
+    let mut plaintext = vec![0; u16::MAX as usize];
+    let size = noise
+        .lock()
+        .map_err(|_| io::Error::other("Noise state lock poisoned"))?
+        .read_message(encrypted, &mut plaintext)
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    Frame::decode(&plaintext[..size]).map_err(|_| io::Error::other("invalid frame"))
+}
+
+async fn client_writer(
+    mut sink: futures_util::stream::SplitSink<Socket, Message>,
+    mut outgoing: mpsc::Receiver<Frame>,
+    noise: Arc<StdMutex<TransportState>>,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    let mut heartbeat = tokio::time::interval(Duration::from_secs(20));
+    heartbeat.tick().await;
+    loop {
+        let frame = tokio::select! {
+            changed = shutdown.changed() => {
+                let _ = changed;
+                return;
+            }
+            frame = outgoing.recv() => match frame {
+                Some(frame) => frame,
+                None => return,
+            },
+            _ = heartbeat.tick() => {
+                Frame {
+                    kind: PING,
+                    stream: SESSION_STREAM,
+                    body: Vec::new(),
+                }
+            }
+        };
+        let Ok(encrypted) = encrypt_frame(&noise, &frame) else {
+            return;
+        };
+        tokio::select! {
+            changed = shutdown.changed() => {
+                let _ = changed;
+                return;
+            }
+            result = sink.send(Message::Binary(encrypted)) => {
+                if result.is_err() {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+async fn client_reader(
+    mut stream: futures_util::stream::SplitStream<Socket>,
+    noise: Arc<StdMutex<TransportState>>,
+    control: mpsc::Sender<Frame>,
+    incoming: mpsc::Sender<RepeaterStream>,
+    routes: Routes,
+    outgoing: mpsc::Sender<Frame>,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    let mut silence_deadline = Box::pin(tokio::time::sleep(Duration::from_secs(60)));
+    loop {
+        let message = tokio::select! {
+            _ = &mut silence_deadline => return,
+            changed = shutdown.changed() => {
+                let _ = changed;
+                return;
+            }
+            message = stream.next() => message,
+        };
+        let Some(message) = message else {
+            return;
+        };
+        let Ok(Message::Binary(message)) = message else {
+            return;
+        };
+        silence_deadline
+            .as_mut()
+            .reset(tokio::time::Instant::now() + Duration::from_secs(60));
+        let Ok(frame) = decrypt_frame(&noise, &message) else {
+            return;
+        };
+        match frame.kind {
+            PONG => {}
+            OPEN_FAIL => {
+                let route = routes.lock().await.remove(&frame.stream);
+                if let Some(route) = route {
+                    if !send_or_shutdown(
+                        &route,
+                        Frame {
+                            kind: CLOSE,
+                            stream: frame.stream,
+                            body: Vec::new(),
+                        },
+                        &mut shutdown,
+                    )
+                    .await
+                    {
+                        return;
+                    }
+                } else if !send_or_shutdown(&control, frame, &mut shutdown).await {
+                    return;
+                }
+            }
+            INCOMING => {
+                let stream = make_stream(frame.stream, &routes, &outgoing, shutdown.clone()).await;
+                if !send_or_shutdown(&incoming, stream, &mut shutdown).await {
+                    return;
+                }
+            }
+            DATA | CLOSE => {
+                let route = routes.lock().await.get(&frame.stream).cloned();
+                if let Some(route) = route {
+                    if !send_or_shutdown(&route, frame, &mut shutdown).await {
+                        return;
+                    }
+                } else if !send_or_shutdown(&control, frame, &mut shutdown).await {
+                    return;
+                }
+            }
+            PING => {
+                if !send_or_shutdown(
+                    &outgoing,
+                    Frame {
+                        kind: PONG,
+                        stream: frame.stream,
+                        body: Vec::new(),
+                    },
+                    &mut shutdown,
+                )
+                .await
+                {
+                    return;
+                }
+            }
+            _ => {
+                if !send_or_shutdown(&control, frame, &mut shutdown).await {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+async fn make_stream(
+    id: u32,
+    routes: &Routes,
+    outgoing: &mpsc::Sender<Frame>,
+    mut shutdown: watch::Receiver<bool>,
+) -> RepeaterStream {
     let (app, pump) = tokio::io::duplex(64 * 1024);
     let (route_tx, mut route_rx) = mpsc::channel(32);
     routes.lock().await.insert(id, route_tx);
@@ -229,30 +407,57 @@ async fn make_stream(id: u32, routes: &Routes, outgoing: &mpsc::Sender<Frame>) -
     let routes = routes.clone();
     tokio::spawn(async move {
         let mut buffer = vec![0; crate::wire::MAX_DATA];
+        let mut read_shutdown = shutdown.clone();
+        let mut route_shutdown = shutdown.clone();
         loop {
             tokio::select! {
+                changed = shutdown.changed() => {
+                    let _ = changed;
+                    let _ = write.shutdown().await;
+                    break;
+                }
                 read_result = read.read(&mut buffer) => {
                     match read_result {
                         Ok(0) => {
-                            let _ = output.send(Frame { kind: 4, stream: id, body: Vec::new() }).await;
+                            let _ = output.send(Frame { kind: CLOSE, stream: id, body: Vec::new() }).await;
                             break;
                         }
                         Ok(size) => {
-                            if output.send(Frame { kind: 3, stream: id, body: buffer[..size].to_vec() }).await.is_err() {
+                            if !send_or_shutdown(&output, Frame {
+                                kind: DATA,
+                                stream: id,
+                                body: buffer[..size].to_vec(),
+                            }, &mut read_shutdown).await {
                                 break;
                             }
                         }
                         Err(_) => break,
                     }
                 }
-                Some(frame) = route_rx.recv() => {
-                    match frame.kind {
-                        3 => if write.write_all(&frame.body).await.is_err() { break; },
-                        4 => {
+                frame = route_rx.recv() => {
+                    match frame {
+                        Some(frame) => match frame.kind {
+                            DATA => {
+                                let result = tokio::select! {
+                                    changed = route_shutdown.changed() => {
+                                        let _ = changed;
+                                        let _ = write.shutdown().await;
+                                        break;
+                                    }
+                                    result = write.write_all(&frame.body) => result,
+                                };
+                                if result.is_err() { break; }
+                            }
+                            CLOSE => {
+                                let _ = write.shutdown().await;
+                                break;
+                            }
+                            _ => {}
+                        },
+                        None => {
                             let _ = write.shutdown().await;
                             break;
                         }
-                        _ => {}
                     }
                 }
                 else => break,
@@ -270,18 +475,19 @@ impl RepeaterClient {
     /// Lists other live sessions in the group's ephemeral directory.
     pub async fn list(&mut self) -> Result<Vec<serde_json::Value>, ClientError> {
         self.send_frame(Frame {
-            kind: 6,
-            stream: 0,
+            kind: LIST,
+            stream: SESSION_STREAM,
             body: Vec::new(),
         })
         .await?;
         let frame = self.recv_frame().await?;
-        if frame.kind != 7 {
+        if frame.kind != LIST_REPLY {
             return Err(ClientError::Protocol);
         }
         serde_json::from_slice(&frame.body).map_err(Into::into)
     }
 
+    /// Queues a protocol frame for the session writer.
     pub async fn send_frame(&mut self, frame: Frame) -> Result<(), ClientError> {
         self.outgoing
             .send(frame)
@@ -289,17 +495,24 @@ impl RepeaterClient {
             .map_err(|_| ClientError::Protocol)
     }
 
+    /// Waits for a control frame that is not associated with an open stream.
     pub async fn recv_frame(&mut self) -> Result<Frame, ClientError> {
         self.control.recv().await.ok_or(ClientError::Protocol)
     }
 
     /// Opens an opaque byte stream to another enrolled session.
     pub async fn open(&mut self, target: [u8; 32]) -> Result<RepeaterStream, ClientError> {
-        let id = self.next_stream & 0x7fff_ffff;
-        self.next_stream = self.next_stream.wrapping_add(1) & 0x7fff_ffff;
-        let stream = make_stream(id, &self.routes, &self.outgoing).await;
+        let id = self.next_stream & !crate::wire::INCOMING_BIT;
+        self.next_stream = self.next_stream.wrapping_add(1) & !crate::wire::INCOMING_BIT;
+        let stream = make_stream(
+            id,
+            &self.routes,
+            &self.outgoing,
+            self.session_shutdown.clone(),
+        )
+        .await;
         self.send_frame(Frame {
-            kind: 1,
+            kind: OPEN,
             stream: id,
             body: target.to_vec(),
         })

@@ -19,50 +19,73 @@ use thiserror::Error;
 
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
+/// Errors from private repeater state access and persistence.
 #[derive(Debug, Error)]
 pub enum StoreError {
+    /// Filesystem access or atomic-write failure.
     #[error("repeater store I/O failed: {0}")]
     Io(#[from] io::Error),
+    /// State-file serialization or parsing failure.
     #[error("repeater store JSON failed: {0}")]
     Json(#[from] serde_json::Error),
+    /// A state path is a symlink or has an unsafe file type.
     #[error("repeater store path is not a regular file or directory")]
     UnsafePath,
+    /// The host's stored private key is malformed.
     #[error("invalid repeater key")]
     InvalidKey,
 }
 
+/// An enrolled repeater device.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Device {
+    /// Optional operator-supplied enrollment label.
     pub label: Option<String>,
+    /// RFC 3339 enrollment time.
     pub enrolled_at: String,
+    /// Whether the repeater must refuse this device.
     pub revoked: bool,
 }
 
+/// Persistent repeater device allowlist.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct Devices {
+    /// Map from lowercase static-public-key hex to device metadata.
     pub devices: BTreeMap<String, Device>,
 }
 
+/// Persistent metadata for a single-use invitation.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct InviteRecord {
+    /// SHA-256 digest of the invitation secret; the secret itself is not stored.
     pub secret_sha256: String,
+    /// RFC 3339 expiry time.
     pub expires_at: String,
+    /// Whether this invitation has already been consumed.
     pub used: bool,
+    /// Optional operator-supplied label transferred to the enrolled device.
     pub label: Option<String>,
 }
 
+/// Persistent list of invitations.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct Invites {
+    /// Available and previously consumed invitation records.
     pub invites: Vec<InviteRecord>,
 }
 
+/// Metadata used by the server to detect device-file changes.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FileStamp {
+    /// Last-modified time, if the filesystem reports one.
     pub modified: Option<SystemTime>,
+    /// File length in bytes.
     pub len: u64,
 }
 
+/// Private, atomically persisted repeater host state.
 pub struct Store {
+    /// Directory containing the host key, devices, and invitations.
     pub root: PathBuf,
     invite_lock: Arc<Mutex<()>>,
 }
@@ -77,6 +100,7 @@ impl Clone for Store {
 }
 
 impl Store {
+    /// Opens or creates a repeater store rooted at `root`.
     pub fn new(root: impl Into<PathBuf>) -> Self {
         Self {
             root: root.into(),
@@ -84,6 +108,7 @@ impl Store {
         }
     }
 
+    /// Loads the private host key, creating a mode-0600 key if absent.
     pub fn key(&self) -> Result<[u8; 32], StoreError> {
         let path = self.root.join("repeater.key");
         if let Some(bytes) = read_file(&path)? {
@@ -105,10 +130,12 @@ impl Store {
         Ok(key)
     }
 
+    /// Loads enrolled devices, or an empty allowlist if the file is absent.
     pub fn devices(&self) -> Result<Devices, StoreError> {
         load_json(&self.root.join("devices.json"))
     }
 
+    /// Atomically writes the device allowlist with private permissions.
     pub fn save_devices(&self, value: &Devices) -> Result<(), StoreError> {
         atomic_write(
             &self.root.join("devices.json"),
@@ -116,10 +143,12 @@ impl Store {
         )
     }
 
+    /// Loads invitations, or an empty list if the file is absent.
     pub fn invites(&self) -> Result<Invites, StoreError> {
         load_json(&self.root.join("invites.json"))
     }
 
+    /// Atomically writes invitation metadata with private permissions.
     pub fn save_invites(&self, value: &Invites) -> Result<(), StoreError> {
         atomic_write(
             &self.root.join("invites.json"),
@@ -127,6 +156,7 @@ impl Store {
         )
     }
 
+    /// Persists a single-use invitation by its secret hash, never its secret.
     pub fn add_invite(
         &self,
         secret: [u8; 32],
@@ -143,6 +173,7 @@ impl Store {
         self.save_invites(&invites)
     }
 
+    /// Atomically consumes an unused, unexpired invite and enrolls its key.
     pub fn consume_invite(
         &self,
         secret: &[u8; 32],
@@ -184,6 +215,7 @@ impl Store {
         Ok(true)
     }
 
+    /// Returns whether the key is present in the allowlist and not revoked.
     pub fn device_allowed(&self, key: &[u8; 32]) -> Result<bool, StoreError> {
         Ok(self
             .devices()?
@@ -192,6 +224,7 @@ impl Store {
             .is_some_and(|d| !d.revoked))
     }
 
+    /// Returns the current stamp for `devices.json` for revocation polling.
     pub fn device_stamp(&self) -> Result<Option<FileStamp>, StoreError> {
         stamp(&self.root.join("devices.json"))
     }

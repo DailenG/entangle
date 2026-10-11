@@ -128,3 +128,8 @@ traffic sizes; group IDs are public routing identifiers, not an authorization
 boundary. The pairing-derived PSK and local SAS approval remain the
 end-to-end security boundary. Repeater use is preview-only until node
 integration is delivered.
+
+### Known limits (v1)
+
+One slow stream can delay other streams on the same session (head-of-line
+blocking). Per-stream credit windows are a follow-up.
