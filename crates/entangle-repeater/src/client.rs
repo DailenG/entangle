@@ -11,7 +11,10 @@ use snow::{params::NoiseParams, Builder, TransportState};
 use std::{
     collections::HashMap,
     io,
-    sync::{Arc, Mutex as StdMutex},
+    sync::{
+        atomic::{AtomicU32, Ordering},
+        Arc, Mutex as StdMutex,
+    },
 };
 use thiserror::Error;
 use tokio::{
@@ -21,8 +24,11 @@ use tokio::{
     time::Duration,
 };
 use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream, WebSocketStream};
+use tracing::debug;
 
 const NOISE: &str = "Noise_IK_25519_ChaChaPoly_BLAKE2s";
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+const INCOMING_QUEUE_CAPACITY: usize = 32;
 
 /// Errors returned while establishing or using a repeater session.
 #[derive(Debug, Error)]
@@ -39,6 +45,12 @@ pub enum ClientError {
     /// The repeater returned or sent an invalid protocol message.
     #[error("repeater protocol error")]
     Protocol,
+    /// The repeater did not complete its handshake before the deadline.
+    #[error("repeater handshake timed out")]
+    HandshakeTimeout,
+    /// The repeater session has ended.
+    #[error("repeater session is closed")]
+    SessionClosed,
     /// A protocol JSON payload could not be encoded or decoded.
     #[error("repeater JSON failed: {0}")]
     Json(#[from] serde_json::Error),
@@ -51,19 +63,52 @@ impl From<tokio_tungstenite::tungstenite::Error> for ClientError {
 }
 
 type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
-type Routes = std::sync::Arc<Mutex<HashMap<u32, mpsc::Sender<Frame>>>>;
+type Routes = Arc<Mutex<HashMap<u32, mpsc::Sender<Frame>>>>;
+
+struct DialerInner {
+    outgoing: mpsc::Sender<Frame>,
+    control: Mutex<mpsc::Receiver<Frame>>,
+    routes: Routes,
+    session_shutdown: watch::Receiver<bool>,
+    next_stream: AtomicU32,
+    list_lock: Mutex<()>,
+    _shutdown: Option<oneshot::Sender<()>>,
+}
 
 /// An authenticated client session to a repeater.
 pub struct RepeaterClient {
-    outgoing: mpsc::Sender<Frame>,
-    control: mpsc::Receiver<Frame>,
-    incoming: mpsc::Receiver<RepeaterStream>,
-    routes: Routes,
-    shutdown: Option<oneshot::Sender<()>>,
-    session_shutdown: watch::Receiver<bool>,
+    inner: Arc<DialerInner>,
+    incoming: IncomingStreams,
     /// This session's Noise static public key.
     pub static_public: [u8; 32],
-    next_stream: u32,
+}
+
+/// Shared, cheap-to-clone access to an authenticated repeater session.
+#[derive(Clone)]
+pub struct RepeaterDialer {
+    inner: Arc<DialerInner>,
+}
+
+/// Directory entry for a live peer in this repeater group.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DirectoryEntry {
+    /// The peer's authenticated Noise static public key.
+    pub key: [u8; 32],
+    /// Seconds since the peer joined the live directory.
+    pub since_secs: u64,
+}
+
+/// Receiver for streams opened by other repeater clients.
+pub struct IncomingStreams {
+    incoming: mpsc::Receiver<IncomingStream>,
+}
+
+/// An incoming relayed stream and the remote client's static key.
+pub struct IncomingStream {
+    /// Static public key of the session that opened this stream.
+    pub source: [u8; 32],
+    /// The byte stream to pass to the end-to-end link handshake.
+    pub stream: RepeaterStream,
 }
 
 /// One multiplexed byte stream carried by a repeater session.
@@ -78,6 +123,30 @@ fn params() -> NoiseParams {
 }
 
 async fn handshake(
+    url: &str,
+    private: [u8; 32],
+    repeater_public: [u8; 32],
+    payload: serde_json::Value,
+) -> Result<(Socket, TransportState, [u8; 32]), ClientError> {
+    handshake_with_timeout(url, private, repeater_public, payload, HANDSHAKE_TIMEOUT).await
+}
+
+async fn handshake_with_timeout(
+    url: &str,
+    private: [u8; 32],
+    repeater_public: [u8; 32],
+    payload: serde_json::Value,
+    timeout: Duration,
+) -> Result<(Socket, TransportState, [u8; 32]), ClientError> {
+    tokio::time::timeout(
+        timeout,
+        handshake_inner(url, private, repeater_public, payload),
+    )
+    .await
+    .map_err(|_| ClientError::HandshakeTimeout)?
+}
+
+async fn handshake_inner(
     url: &str,
     private: [u8; 32],
     repeater_public: [u8; 32],
@@ -166,9 +235,9 @@ pub async fn enroll(
 fn start_session(ws: Socket, noise: TransportState, static_public: [u8; 32]) -> RepeaterClient {
     let (outgoing, outgoing_rx) = mpsc::channel::<Frame>(128);
     let (control_tx, control) = mpsc::channel(32);
-    let (incoming_tx, incoming) = mpsc::channel(32);
+    let (incoming_tx, incoming) = mpsc::channel(INCOMING_QUEUE_CAPACITY);
     let (shutdown, mut shutdown_rx) = oneshot::channel();
-    let routes: Routes = std::sync::Arc::new(Mutex::new(HashMap::new()));
+    let routes: Routes = Arc::new(Mutex::new(HashMap::new()));
     let (session_shutdown, watch_rx) = watch::channel(false);
     let noise = Arc::new(StdMutex::new(noise));
     let client_shutdown = watch_rx.clone();
@@ -211,14 +280,17 @@ fn start_session(ws: Socket, noise: TransportState, static_public: [u8; 32]) -> 
         pump_routes.lock().await.clear();
     });
     RepeaterClient {
-        outgoing,
-        control,
-        incoming,
-        routes,
-        shutdown: Some(shutdown),
-        session_shutdown: client_shutdown,
+        inner: Arc::new(DialerInner {
+            outgoing,
+            control: Mutex::new(control),
+            routes,
+            session_shutdown: client_shutdown,
+            next_stream: AtomicU32::new(1),
+            list_lock: Mutex::new(()),
+            _shutdown: Some(shutdown),
+        }),
+        incoming: IncomingStreams { incoming },
         static_public,
-        next_stream: 0,
     }
 }
 
@@ -310,7 +382,7 @@ async fn client_reader(
     mut stream: futures_util::stream::SplitStream<Socket>,
     noise: Arc<StdMutex<TransportState>>,
     control: mpsc::Sender<Frame>,
-    incoming: mpsc::Sender<RepeaterStream>,
+    incoming: mpsc::Sender<IncomingStream>,
     routes: Routes,
     outgoing: mpsc::Sender<Frame>,
     mut shutdown: watch::Receiver<bool>,
@@ -340,7 +412,7 @@ async fn client_reader(
         match frame.kind {
             PONG => {}
             OPEN_FAIL => {
-                let route = routes.lock().await.remove(&frame.stream);
+                let route = routes.lock().await.get(&frame.stream).cloned();
                 if let Some(route) = route {
                     if !send_or_shutdown(
                         &route,
@@ -360,9 +432,45 @@ async fn client_reader(
                 }
             }
             INCOMING => {
-                let stream = make_stream(frame.stream, &routes, &outgoing, shutdown.clone()).await;
-                if !send_or_shutdown(&incoming, stream, &mut shutdown).await {
-                    return;
+                let Ok(source) = <[u8; 32]>::try_from(frame.body.as_slice()) else {
+                    if !send_or_shutdown(
+                        &outgoing,
+                        Frame {
+                            kind: CLOSE,
+                            stream: frame.stream,
+                            body: Vec::new(),
+                        },
+                        &mut shutdown,
+                    )
+                    .await
+                    {
+                        return;
+                    }
+                    continue;
+                };
+                let (stream, pump) =
+                    make_stream(frame.stream, &routes, &outgoing, shutdown.clone()).await;
+                if let Err(error) = incoming.try_send(IncomingStream { source, stream }) {
+                    pump.abort();
+                    routes.lock().await.remove(&frame.stream);
+                    drop(error.into_inner());
+                    debug!(
+                        stream_id = frame.stream,
+                        "closing incoming repeater stream because the accept queue is unavailable"
+                    );
+                    if !send_or_shutdown(
+                        &outgoing,
+                        Frame {
+                            kind: CLOSE,
+                            stream: frame.stream,
+                            body: Vec::new(),
+                        },
+                        &mut shutdown,
+                    )
+                    .await
+                    {
+                        return;
+                    }
                 }
             }
             DATA | CLOSE => {
@@ -371,7 +479,9 @@ async fn client_reader(
                     if !send_or_shutdown(&route, frame, &mut shutdown).await {
                         return;
                     }
-                } else if !send_or_shutdown(&control, frame, &mut shutdown).await {
+                } else if frame.stream == SESSION_STREAM
+                    && !send_or_shutdown(&control, frame, &mut shutdown).await
+                {
                     return;
                 }
             }
@@ -404,29 +514,40 @@ async fn make_stream(
     routes: &Routes,
     outgoing: &mpsc::Sender<Frame>,
     mut shutdown: watch::Receiver<bool>,
-) -> RepeaterStream {
+) -> (RepeaterStream, tokio::task::JoinHandle<()>) {
     let (app, pump) = tokio::io::duplex(64 * 1024);
     let (route_tx, mut route_rx) = mpsc::channel(32);
     routes.lock().await.insert(id, route_tx);
     let (mut read, mut write) = tokio::io::split(pump);
     let output = outgoing.clone();
     let routes = routes.clone();
-    tokio::spawn(async move {
+    let pump_task = tokio::spawn(async move {
         let mut buffer = vec![0; crate::wire::MAX_DATA];
         let mut read_shutdown = shutdown.clone();
         let mut route_shutdown = shutdown.clone();
+        let mut local_closed = false;
+        let mut remote_closed = false;
         loop {
+            if local_closed && remote_closed {
+                break;
+            }
             tokio::select! {
                 changed = shutdown.changed() => {
                     let _ = changed;
                     let _ = write.shutdown().await;
                     break;
                 }
-                read_result = read.read(&mut buffer) => {
+                read_result = read.read(&mut buffer), if !local_closed => {
                     match read_result {
                         Ok(0) => {
-                            let _ = output.send(Frame { kind: CLOSE, stream: id, body: Vec::new() }).await;
-                            break;
+                            if !send_or_shutdown(&output, Frame {
+                                kind: CLOSE,
+                                stream: id,
+                                body: Vec::new(),
+                            }, &mut read_shutdown).await {
+                                break;
+                            }
+                            local_closed = true;
                         }
                         Ok(size) => {
                             if !send_or_shutdown(&output, Frame {
@@ -440,7 +561,7 @@ async fn make_stream(
                         Err(_) => break,
                     }
                 }
-                frame = route_rx.recv() => {
+                frame = route_rx.recv(), if !remote_closed => {
                     match frame {
                         Some(frame) => match frame.kind {
                             DATA => {
@@ -456,7 +577,7 @@ async fn make_stream(
                             }
                             CLOSE => {
                                 let _ = write.shutdown().await;
-                                break;
+                                remote_closed = true;
                             }
                             _ => {}
                         },
@@ -466,69 +587,183 @@ async fn make_stream(
                         }
                     }
                 }
-                else => break,
             }
         }
         routes.lock().await.remove(&id);
     });
-    RepeaterStream {
-        id,
-        io: Box::new(app),
-    }
+    (
+        RepeaterStream {
+            id,
+            io: Box::new(app),
+        },
+        pump_task,
+    )
 }
 
 impl RepeaterClient {
     /// Lists other live sessions in the group's ephemeral directory.
     pub async fn list(&mut self) -> Result<Vec<serde_json::Value>, ClientError> {
-        self.send_frame(Frame {
-            kind: LIST,
-            stream: SESSION_STREAM,
-            body: Vec::new(),
-        })
-        .await?;
-        let frame = self.recv_frame().await?;
-        if frame.kind != LIST_REPLY {
-            return Err(ClientError::Protocol);
-        }
+        let frame = self.inner.list_frame().await?;
         serde_json::from_slice(&frame.body).map_err(Into::into)
     }
 
     /// Queues a protocol frame for the session writer.
     pub async fn send_frame(&mut self, frame: Frame) -> Result<(), ClientError> {
-        self.outgoing
+        self.inner
+            .outgoing
             .send(frame)
             .await
-            .map_err(|_| ClientError::Protocol)
+            .map_err(|_| ClientError::SessionClosed)
     }
 
     /// Waits for a control frame that is not associated with an open stream.
     pub async fn recv_frame(&mut self) -> Result<Frame, ClientError> {
-        self.control.recv().await.ok_or(ClientError::Protocol)
+        self.inner
+            .control
+            .lock()
+            .await
+            .recv()
+            .await
+            .ok_or(ClientError::SessionClosed)
     }
 
     /// Opens an opaque byte stream to another enrolled session.
     pub async fn open(&mut self, target: [u8; 32]) -> Result<RepeaterStream, ClientError> {
-        let id = self.next_stream & !crate::wire::INCOMING_BIT;
-        self.next_stream = self.next_stream.wrapping_add(1) & !crate::wire::INCOMING_BIT;
-        let stream = make_stream(
+        self.inner.open(target).await
+    }
+
+    /// Waits for an incoming stream opened by another session.
+    pub async fn accept(&mut self) -> Result<RepeaterStream, ClientError> {
+        self.incoming
+            .accept()
+            .await
+            .map(|incoming| incoming.stream)
+            .ok_or(ClientError::SessionClosed)
+    }
+
+    /// Splits this session into a shared dialer and an incoming-stream receiver.
+    pub fn split(self) -> (RepeaterDialer, IncomingStreams) {
+        (
+            RepeaterDialer {
+                inner: Arc::clone(&self.inner),
+            },
+            self.incoming,
+        )
+    }
+}
+
+impl DialerInner {
+    async fn list_frame(&self) -> Result<Frame, ClientError> {
+        let _guard = self.list_lock.lock().await;
+        if *self.session_shutdown.borrow() {
+            return Err(ClientError::SessionClosed);
+        }
+        self.outgoing
+            .send(Frame {
+                kind: LIST,
+                stream: SESSION_STREAM,
+                body: Vec::new(),
+            })
+            .await
+            .map_err(|_| ClientError::SessionClosed)?;
+        let frame = self
+            .control
+            .lock()
+            .await
+            .recv()
+            .await
+            .ok_or(ClientError::SessionClosed)?;
+        if frame.kind != LIST_REPLY {
+            return Err(ClientError::Protocol);
+        }
+        Ok(frame)
+    }
+
+    async fn open(&self, target: [u8; 32]) -> Result<RepeaterStream, ClientError> {
+        if *self.session_shutdown.borrow() {
+            return Err(ClientError::SessionClosed);
+        }
+        let id = allocate_stream_id(&self.next_stream);
+        let (stream, _pump) = make_stream(
             id,
             &self.routes,
             &self.outgoing,
             self.session_shutdown.clone(),
         )
         .await;
-        self.send_frame(Frame {
-            kind: OPEN,
-            stream: id,
-            body: target.to_vec(),
-        })
-        .await?;
+        self.outgoing
+            .send(Frame {
+                kind: OPEN,
+                stream: id,
+                body: target.to_vec(),
+            })
+            .await
+            .map_err(|_| ClientError::SessionClosed)?;
+        if *self.session_shutdown.borrow() {
+            return Err(ClientError::SessionClosed);
+        }
         Ok(stream)
     }
+}
 
-    /// Waits for an incoming stream opened by another session.
-    pub async fn accept(&mut self) -> Result<RepeaterStream, ClientError> {
-        self.incoming.recv().await.ok_or(ClientError::Protocol)
+fn allocate_stream_id(next_stream: &AtomicU32) -> u32 {
+    loop {
+        let candidate = next_stream.fetch_add(1, Ordering::Relaxed) & !crate::wire::INCOMING_BIT;
+        if candidate != SESSION_STREAM {
+            return candidate;
+        }
+    }
+}
+
+impl RepeaterDialer {
+    /// Opens an opaque byte stream to another enrolled session.
+    ///
+    /// The protocol has no positive OPEN acknowledgement. This returns after
+    /// queuing OPEN; a rejected stream is closed and the end-to-end Noise
+    /// handshake observes EOF. Waiting for DATA would deadlock because Noise
+    /// cannot send it until this method returns the stream.
+    pub async fn open(&self, target: [u8; 32]) -> Result<RepeaterStream, ClientError> {
+        self.inner.open(target).await
+    }
+
+    /// Lists live sessions in this group's ephemeral directory.
+    pub async fn list(&self) -> Result<Vec<DirectoryEntry>, ClientError> {
+        let frame = self.inner.list_frame().await?;
+        let raw: Vec<serde_json::Value> = serde_json::from_slice(&frame.body)?;
+        raw.into_iter()
+            .map(|entry| {
+                let key = entry
+                    .get("key")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or(ClientError::Protocol)?;
+                let key = hex::decode(key)
+                    .map_err(|_| ClientError::Protocol)?
+                    .try_into()
+                    .map_err(|_| ClientError::Protocol)?;
+                let since_secs = entry
+                    .get("since_secs")
+                    .and_then(serde_json::Value::as_u64)
+                    .ok_or(ClientError::Protocol)?;
+                Ok(DirectoryEntry { key, since_secs })
+            })
+            .collect()
+    }
+
+    /// Reports whether the session reader or writer has exited.
+    pub fn is_closed(&self) -> bool {
+        *self.inner.session_shutdown.borrow()
+    }
+}
+
+impl IncomingStreams {
+    /// Waits for an incoming stream, returning `None` when the session ends.
+    pub async fn accept(&mut self) -> Option<IncomingStream> {
+        self.incoming.recv().await
+    }
+
+    #[cfg(test)]
+    pub(crate) fn queued(&self) -> usize {
+        self.incoming.len()
     }
 }
 
@@ -539,10 +774,37 @@ impl RepeaterStream {
     }
 }
 
-impl Drop for RepeaterClient {
-    fn drop(&mut self) {
-        if let Some(shutdown) = self.shutdown.take() {
-            let _ = shutdown.send(());
-        }
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::net::TcpListener;
+    use tokio_tungstenite::accept_async;
+
+    #[test]
+    fn stream_id_allocator_skips_reserved_session_id_on_wrap() {
+        let next_stream = AtomicU32::new(u32::MAX);
+        assert_eq!(allocate_stream_id(&next_stream), 0x7fff_ffff);
+        assert_eq!(allocate_stream_id(&next_stream), 1);
+    }
+
+    #[tokio::test]
+    async fn handshake_times_out_after_silent_websocket_upgrade() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let _websocket = accept_async(stream).await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        let result = handshake_with_timeout(
+            &format!("ws://{address}/entangle"),
+            entangle_transport::generate_static(),
+            [0; 32],
+            json!({"v": 1, "mode": "session", "group": "aaaaaaaa"}),
+            Duration::from_millis(50),
+        )
+        .await;
+        assert!(matches!(result, Err(ClientError::HandshakeTimeout)));
+        server.abort();
     }
 }

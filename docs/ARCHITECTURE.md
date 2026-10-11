@@ -101,7 +101,7 @@ with the same pairing key.
 
 Further work is tracked in [issue #10](https://github.com/DailenG/entangle/issues/10).
 
-## Quantum Repeater (preview)
+## Quantum Repeater
 
 The Quantum Repeater is a blind WebSocket relay for links between networks
 that cannot reach one another directly. A client pins the repeater's static
@@ -120,14 +120,19 @@ applies session and stream limits, and closes removed or revoked devices when
 the host reloads its device file. Invite secrets are single-use and stored
 only as SHA-256 digests.
 
+The node tries direct TCP first, then uses a repeater tunnel for peers in the
+same live directory. Relayed Hello metadata is never treated as a real socket
+address: it cannot replace or erase mDNS-learned addresses, and the
+`0.0.0.0:0` serving placeholder is never advertised or dialed. Relay-only
+mode removes the TCP listener and disables mDNS.
+
 The peer-to-peer Noise `XXpsk3` session remains end-to-end. The repeater
 forwards its encrypted bytes without inspecting or logging them: it cannot
 see particle names, pairing keys, SAS values, or sync content. It can see
 static device public keys, declared group IDs, connection timing, and
 traffic sizes; group IDs are public routing identifiers, not an authorization
 boundary. The pairing-derived PSK and local SAS approval remain the
-end-to-end security boundary. Repeater use is preview-only until node
-integration is delivered.
+end-to-end security boundary.
 
 ### Known limits (v1)
 

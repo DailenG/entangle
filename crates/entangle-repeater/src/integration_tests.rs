@@ -2,7 +2,7 @@ use crate::{
     client::{self, RepeaterClient},
     server::{self, ServerConfig},
     store::Store,
-    wire::{Frame, CLOSE, OPEN},
+    wire::{Frame, CLOSE, OPEN, OPEN_FAIL},
 };
 use entangle_transport::{self, LinkKeys};
 use futures_util::{SinkExt, StreamExt};
@@ -43,19 +43,24 @@ fn test_root_path(path: &Path) -> std::path::PathBuf {
 }
 
 async fn start_server() -> TestServer {
+    start_server_with_timeout(Duration::from_secs(10)).await
+}
+
+async fn start_server_with_timeout(handshake_timeout: Duration) -> TestServer {
     let root = tempfile::tempdir().unwrap();
     let root_path = test_root_path(root.path());
     let store = Store::new(&root_path);
     let private = store.key().unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let handle = tokio::spawn(server::serve_on_listener(
+    let handle = tokio::spawn(server::serve_on_listener_with_timeout(
         listener,
         ServerConfig {
             listen: addr,
             path: "/entangle".into(),
             root: root_path.clone(),
         },
+        handshake_timeout,
     ));
     tokio::time::sleep(Duration::from_millis(30)).await;
     TestServer {
@@ -65,6 +70,28 @@ async fn start_server() -> TestServer {
         public: entangle_transport::public_key(&private),
         handle,
     }
+}
+
+#[tokio::test]
+async fn partial_http_request_is_closed_by_handshake_deadline() {
+    let server = start_server_with_timeout(Duration::from_millis(50)).await;
+    let address = server
+        .url
+        .strip_prefix("ws://")
+        .unwrap()
+        .split('/')
+        .next()
+        .unwrap()
+        .parse::<SocketAddr>()
+        .unwrap();
+    let mut stream = TcpStream::connect(address).await.unwrap();
+    stream.write_all(b"GET /entangle").await.unwrap();
+    let mut response = Vec::new();
+    tokio::time::timeout(Duration::from_secs(1), stream.read_to_end(&mut response))
+        .await
+        .expect("partial HTTP request should time out")
+        .unwrap();
+    assert!(response.is_empty());
 }
 
 async fn enroll(server: &TestServer, key: [u8; 32], secret: [u8; 32]) {
@@ -122,6 +149,61 @@ async fn open_sessions(
         .await
         .unwrap();
     (a, b)
+}
+
+#[tokio::test]
+async fn split_dialer_lists_peers_and_reports_incoming_sources() {
+    let server = start_server().await;
+    let a_private = entangle_transport::generate_static();
+    let b_private = entangle_transport::generate_static();
+    enroll(&server, a_private, [21; 32]).await;
+    enroll(&server, b_private, [22; 32]).await;
+    let (a, b) = open_sessions(&server, a_private, "aaaaaaaa", b_private, "aaaaaaaa").await;
+    let a_key = a.static_public;
+    let b_key = b.static_public;
+    let (a_dialer, _a_incoming) = a.split();
+    let (_b_dialer, mut b_incoming) = b.split();
+
+    let directory = a_dialer.list().await.unwrap();
+    assert_eq!(directory.len(), 1);
+    assert_eq!(directory[0].key, b_key);
+    let _opened = a_dialer.open(b_key).await.unwrap();
+    let incoming = b_incoming.accept().await.unwrap();
+    assert_eq!(incoming.source, a_key);
+}
+
+#[tokio::test]
+async fn incoming_burst_does_not_block_list_or_close_the_session() {
+    let server = start_server().await;
+    let a_private = entangle_transport::generate_static();
+    let b_private = entangle_transport::generate_static();
+    enroll(&server, a_private, [41; 32]).await;
+    enroll(&server, b_private, [42; 32]).await;
+    let (a, b) = open_sessions(&server, a_private, "aaaaaaaa", b_private, "aaaaaaaa").await;
+    let b_public = b.static_public;
+    let (a_dialer, _a_incoming) = a.split();
+    let (b_dialer, b_incoming) = b.split();
+
+    let mut streams = Vec::new();
+    for _ in 0..40 {
+        streams.push(a_dialer.open(b_public).await.unwrap());
+    }
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while b_incoming.queued() < 32 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("incoming queue should fill without blocking the reader");
+
+    let directory = tokio::time::timeout(Duration::from_secs(2), b_dialer.list())
+        .await
+        .expect("LIST must not wait for incoming-stream acceptance")
+        .unwrap();
+    assert_eq!(directory.len(), 1);
+    assert!(!a_dialer.is_closed());
+    assert!(!b_dialer.is_closed());
+    drop(streams);
 }
 
 #[tokio::test]
@@ -187,8 +269,45 @@ async fn sessions_route_large_streams_and_isolate_groups() {
     .await
     .unwrap();
     let failed = c.recv_frame().await.unwrap();
-    assert_eq!(failed.kind, 5);
+    assert_eq!(failed.kind, OPEN_FAIL);
     assert_eq!(failed.stream, 1);
+}
+
+#[tokio::test]
+async fn stream_half_close_allows_a_reply_after_request_eof() {
+    let server = start_server().await;
+    let a_private = entangle_transport::generate_static();
+    let b_private = entangle_transport::generate_static();
+    enroll(&server, a_private, [31; 32]).await;
+    enroll(&server, b_private, [32; 32]).await;
+    let (a, b) = open_sessions(&server, a_private, "aaaaaaaa", b_private, "aaaaaaaa").await;
+    let b_public = b.static_public;
+    let (a_dialer, _) = a.split();
+    let (_b_dialer, mut b_incoming) = b.split();
+    let a_stream = a_dialer.open(b_public).await.unwrap();
+    let b_stream = b_incoming.accept().await.unwrap();
+    let (mut a_reader, mut a_writer) = tokio::io::split(a_stream.into_io());
+    let (mut b_reader, mut b_writer) = tokio::io::split(b_stream.stream.into_io());
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let request = b"request before half-close";
+        a_writer.write_all(request).await.unwrap();
+        a_writer.shutdown().await.unwrap();
+
+        let mut received_request = Vec::new();
+        b_reader.read_to_end(&mut received_request).await.unwrap();
+        assert_eq!(received_request, request);
+
+        let reply = b"reply after request EOF";
+        b_writer.write_all(reply).await.unwrap();
+        b_writer.shutdown().await.unwrap();
+
+        let mut received_reply = Vec::new();
+        a_reader.read_to_end(&mut received_reply).await.unwrap();
+        assert_eq!(received_reply, reply);
+    })
+    .await
+    .expect("both directions should remain usable after a half-close");
 }
 
 async fn exchange_payload(

@@ -195,11 +195,11 @@ collapsed. Collapsing removes the inbox entry; received files remain on disk.
 
 ## Troubleshooting
 
-## Quantum Repeater (preview)
+## Using a repeater
 
-The standalone repeater host and enrollment commands are available for
-preview, but nodes do not yet use the repeater for peer links. Do not rely on
-it as a replacement for direct connectivity.
+A Quantum Repeater can carry end-to-end encrypted links when devices cannot
+connect directly. Run a repeater on a host reachable by both devices. Keep
+its state directory private and leave the server running.
 
 On the host, choose an address reachable by the devices and start the relay.
 The host prints a short public-key fingerprint; keep the repeater state
@@ -219,7 +219,8 @@ entangle repeater invite --url ws://HOST:7338/entangle
 
 On each device, a human enters the invitation in a terminal; this enrolls the
 device's persistent Noise identity and saves the repeater URL and pinned
-public key:
+public key. Run `join` while Entangle (`omp`) keeps running; the node picks up
+the configuration within 30 seconds:
 
 ```sh
 entangle repeater join <code>
@@ -232,6 +233,16 @@ The host can inspect enrolled device fingerprints with
 `entangle repeater leave` removes its saved repeater configuration but does
 not revoke the host-side enrollment. `invite`, `join`, `revoke`, and `leave`
 are human-only; agents may run only `repeater devices` and `repeater status`.
+
+For a device that must never accept a direct TCP link, start Entangle with
+`--relay-only` (or set `ENTANGLE_RELAY_ONLY=1`). This disables the TCP listener
+and mDNS and ignores static `--peer` entries. Relay-only mode can start before
+the repeater is configured; it connects after a human runs `join`. Check the
+local state with:
+
+```sh
+entangle repeater status
+```
 
 The repeater forwards the end-to-end encrypted link bytes and cannot read
 sync content, pairing keys, or SAS values. It does learn enrolled static

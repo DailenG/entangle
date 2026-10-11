@@ -260,10 +260,6 @@ fn persist_static(path: &Path, key: &[u8; 32]) -> std::io::Result<()> {
     }
     file.write_all(hex::encode(key).as_bytes())?;
     file.sync_all()?;
-    #[cfg(windows)]
-    if path.exists() {
-        fs::remove_file(path)?;
-    }
     fs::rename(temporary, path)
 }
 
@@ -304,6 +300,15 @@ mod tests {
 
         let second = claim(temp.path()).unwrap();
         assert_eq!(second.static_private, key);
+    }
+
+    #[test]
+    fn read_saved_reads_identity_while_another_process_holds_the_lock() {
+        let temp = tempfile::tempdir().unwrap();
+        let claimed = claim(temp.path()).unwrap();
+        let saved = read_saved(temp.path()).unwrap().unwrap();
+        assert_eq!(saved.0, claimed.id);
+        assert_eq!(saved.1, claimed.static_private);
     }
 
     #[cfg(unix)]

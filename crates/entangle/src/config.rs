@@ -52,6 +52,9 @@ pub struct Options {
     /// Disable mDNS browsing and advertisement.
     #[arg(long, global = true, env = "ENTANGLE_NO_MDNS")]
     pub no_mdns: bool,
+    /// Use repeater tunnels only; do not bind or advertise a TCP link listener.
+    #[arg(long, global = true, env = "ENTANGLE_RELAY_ONLY")]
+    pub relay_only: bool,
     /// Logging filter; all logs go to stderr.
     #[arg(
         long,
@@ -108,6 +111,7 @@ mod tests {
             legacy_transfer_path: None,
             max_payload_mb: 512,
             no_mdns: true,
+            relay_only: false,
             log_level: "info".into(),
         }
     }

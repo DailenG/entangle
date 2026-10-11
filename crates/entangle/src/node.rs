@@ -2,26 +2,28 @@
 
 use crate::{
     config::Options,
-    field::{Field, PeerRecord, PeerState},
+    field::{Field, LinkPath, PeerRecord, PeerState},
     identity::{self, Identity},
     inbox::{self, InboxItem},
     pairing,
     trust::{self, VerificationRecord},
 };
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use chrono::Utc;
 use entangle_core::{is_valid_sync_id, Manifest, StateKind, PROTOCOL_VERSION};
 use entangle_link::{
     LinkError, LinkHandler, LinkListener, PayloadReader, PeerInfo, Route, SyncDecision, SyncOffer,
-    VerifyMessage,
+    TunnelOpener, VerifyMessage,
 };
+use entangle_repeater::{client as repeater_client, RepeaterDialer};
 use entangle_resonance::{Advertisement, Resonance, ResonanceEvent, Resonator};
-use entangle_transport::{KeySlot, LinkKeys};
+use entangle_transport::{BoxedIo, KeySlot, LinkKeys, SecureStream};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, HashSet},
-    net::SocketAddr,
+    io,
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -40,6 +42,32 @@ use tracing::{debug, info, warn};
 
 const MIN_TIMEOUT_SECS: u64 = 5;
 const MAX_TIMEOUT_SECS: u64 = 3600;
+const RELAY_PLACEHOLDER: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
+const REPEATER_CONFIG_POLL: Duration = Duration::from_secs(30);
+const REPEATER_DIRECTORY_POLL: Duration = Duration::from_secs(15);
+const REPEATER_RECONNECT_BASE: Duration = Duration::from_secs(1);
+const REPEATER_RECONNECT_CAP: Duration = Duration::from_secs(60);
+
+struct RepeaterOpener {
+    dialer: RepeaterDialer,
+    target: [u8; 32],
+}
+
+#[async_trait::async_trait]
+impl TunnelOpener for RepeaterOpener {
+    async fn open(&self) -> io::Result<BoxedIo> {
+        self.dialer
+            .open(self.target)
+            .await
+            .map(|stream| stream.into_io())
+            .map_err(|error| io::Error::new(io::ErrorKind::ConnectionAborted, error))
+    }
+
+    fn describe(&self) -> String {
+        let fingerprint = Sha256::digest(self.target);
+        format!("repeater:{}", hex::encode(&fingerprint[..4]))
+    }
+}
 
 struct PartialTransferGuard {
     directory: PathBuf,
@@ -95,6 +123,13 @@ pub struct Particle {
     pairing_group: Arc<RwLock<Option<String>>>,
     active_pairing_key: Arc<RwLock<Option<[u8; 32]>>>,
     keys: KeySlot,
+    repeater: RwLock<Option<RepeaterDialer>>,
+    repeater_configured: AtomicBool,
+    relay_directory: StdMutex<HashSet<[u8; 32]>>,
+    relay_dialing: StdMutex<HashSet<[u8; 32]>>,
+    reconnect_base_ms: AtomicU64,
+    reconnect_cap_ms: AtomicU64,
+    repeater_directory_poll_ms: AtomicU64,
     link_port_fallback: bool,
     pairing_root: PathBuf,
     data_dir: PathBuf,
@@ -169,23 +204,25 @@ impl Particle {
         } else {
             None
         };
-        let (listener, link_port, link_port_fallback) = match LinkListener::bind(SocketAddr::from(
-            ([0, 0, 0, 0], options.link_port),
-        ))
-        .await
-        {
-            Ok((listener, port)) => (listener, port, false),
-            Err(LinkError::Io(error)) if error.kind() == std::io::ErrorKind::AddrInUse => {
-                warn!(
-                    configured_port = options.link_port,
-                    "configured link port is occupied; using an ephemeral port; static --peer entries pointing at this machine need the new port"
-                );
-                let (listener, port) = LinkListener::bind(SocketAddr::from(([0, 0, 0, 0], 0)))
-                    .await
-                    .context("could not bind Entangle TCP link listener")?;
-                (listener, port, true)
+        let (listener, link_port, link_port_fallback) = if options.relay_only {
+            (None, 0, false)
+        } else {
+            match LinkListener::bind(SocketAddr::from(([0, 0, 0, 0], options.link_port))).await {
+                Ok((listener, port)) => (Some(listener), port, false),
+                Err(LinkError::Io(error)) if error.kind() == std::io::ErrorKind::AddrInUse => {
+                    warn!(
+                        configured_port = options.link_port,
+                        "configured link port is occupied; using an ephemeral port; static --peer entries pointing at this machine need the new port"
+                    );
+                    let (listener, port) = LinkListener::bind(SocketAddr::from(([0, 0, 0, 0], 0)))
+                        .await
+                        .context("could not bind Entangle TCP link listener")?;
+                    (Some(listener), port, true)
+                }
+                Err(error) => {
+                    return Err(error).context("could not bind Entangle TCP link listener")
+                }
             }
-            Err(error) => return Err(error).context("could not bind Entangle TCP link listener"),
         };
         let manifest = Manifest {
             particle_id: particle_id.clone(),
@@ -204,6 +241,13 @@ impl Particle {
         };
         let field = Arc::new(RwLock::new(Field::default()));
         let (shutdown, _) = tokio::sync::watch::channel(false);
+        let repeater_configured = match crate::repeater::read_config(&root.join("repeater.json")) {
+            Ok(config) => config.is_some(),
+            Err(error) => {
+                warn!(%error, "could not read repeater configuration");
+                false
+            }
+        };
         let particle = Arc::new(Self {
             manifest: manifest.clone(),
             field,
@@ -212,6 +256,13 @@ impl Particle {
             pairing_group,
             active_pairing_key,
             keys: keys.clone(),
+            repeater: RwLock::new(None),
+            repeater_configured: AtomicBool::new(repeater_configured),
+            relay_directory: StdMutex::new(HashSet::new()),
+            relay_dialing: StdMutex::new(HashSet::new()),
+            reconnect_base_ms: AtomicU64::new(REPEATER_RECONNECT_BASE.as_millis() as u64),
+            reconnect_cap_ms: AtomicU64::new(REPEATER_RECONNECT_CAP.as_millis() as u64),
+            repeater_directory_poll_ms: AtomicU64::new(REPEATER_DIRECTORY_POLL.as_millis() as u64),
             link_port_fallback,
             pairing_root: root,
             data_dir,
@@ -233,11 +284,15 @@ impl Particle {
         if let Err(error) = particle.restart_resonator().await {
             particle.log_discovery_failure(&error);
         }
-        tokio::spawn(listener.run(particle.keys.clone(), particle.clone()));
+        if let Some(listener) = listener {
+            tokio::spawn(listener.run(particle.keys.clone(), particle.clone()));
+        }
         let pairing_node = particle.clone();
         tokio::spawn(async move { pairing_node.pairing_watch().await });
         let static_node = particle.clone();
         tokio::spawn(async move { static_node.static_peer_loop().await });
+        let repeater_node = particle.clone();
+        tokio::spawn(async move { repeater_node.repeater_loop().await });
         info!(
             "particle identity: id={} name={} status={}",
             particle.manifest.particle_id.as_str(),
@@ -248,7 +303,18 @@ impl Particle {
                 "ephemeral"
             }
         );
-        if particle.keys.read().expect("key slot lock").is_none() {
+        if particle.options.relay_only {
+            info!(
+                "particle {} relay-only (no listener, mDNS disabled)",
+                particle.manifest.particle_id.short()
+            );
+            if !repeater_configured {
+                warn!("relay-only mode has no repeater.json; waiting for repeater configuration");
+            }
+            if !particle.options.peer.is_empty() {
+                warn!("--peer entries are ignored in relay-only mode");
+            }
+        } else if particle.keys.read().expect("key slot lock").is_none() {
             info!("particle is unpaired; encrypted links are disabled");
         } else if !particle.options.no_mdns {
             info!(
@@ -457,7 +523,7 @@ impl Particle {
         if let Some(previous) = resonator.take() {
             let _ = previous.shutdown();
         }
-        if self.options.no_mdns {
+        if self.options.no_mdns || self.options.relay_only {
             return Ok(());
         }
         let (next, events) = Resonator::start(self.advertisement())?;
@@ -555,7 +621,7 @@ impl Particle {
                 }
             }
             let paired = self.keys.read().expect("key slot lock").is_some();
-            if paired && !self.options.no_mdns {
+            if paired && !self.options.no_mdns && !self.options.relay_only {
                 let discovery_down = self.resonator.lock().await.is_none();
                 if key_changed || discovery_down {
                     if let Err(error) = self.restart_resonator().await {
@@ -617,8 +683,395 @@ impl Particle {
         }
     }
 
+    async fn repeater_loop(self: Arc<Self>) {
+        let mut shutdown = self.shutdown.subscribe();
+        let mut failures = 0_u32;
+        loop {
+            if *shutdown.borrow() {
+                break;
+            }
+            let config_path = self.pairing_root.join("repeater.json");
+            let config = match crate::repeater::read_config(&config_path) {
+                Ok(config) => {
+                    self.repeater_configured
+                        .store(config.is_some(), Ordering::Relaxed);
+                    config
+                }
+                Err(error) => {
+                    self.repeater_configured.store(false, Ordering::Relaxed);
+                    warn!(%error, "could not read repeater configuration");
+                    None
+                }
+            };
+            let Some(config) = config else {
+                self.clear_repeater();
+                if !self
+                    .wait_or_shutdown(&mut shutdown, REPEATER_CONFIG_POLL)
+                    .await
+                {
+                    break;
+                }
+                continue;
+            };
+            let paired = self.keys.read().expect("key slot lock").is_some();
+            if !self._identity.persistent || !paired {
+                debug!(
+                    persistent = self._identity.persistent,
+                    paired, "repeater connection gated by identity or pairing state"
+                );
+                self.clear_repeater();
+                if !self
+                    .wait_or_shutdown(&mut shutdown, Duration::from_secs(1))
+                    .await
+                {
+                    break;
+                }
+                continue;
+            }
+            let Some(group) = self
+                .pairing_group
+                .read()
+                .expect("pairing group lock")
+                .clone()
+            else {
+                self.clear_repeater();
+                if !self
+                    .wait_or_shutdown(&mut shutdown, Duration::from_secs(1))
+                    .await
+                {
+                    break;
+                }
+                continue;
+            };
+            let repeater_public: [u8; 32] = match hex::decode(&config.repeater_public_key)
+                .ok()
+                .and_then(|bytes| bytes.try_into().ok())
+            {
+                Some(public) => public,
+                None => {
+                    warn!("repeater configuration contains an invalid pinned key");
+                    self.clear_repeater();
+                    if !self
+                        .wait_or_shutdown(&mut shutdown, REPEATER_CONFIG_POLL)
+                        .await
+                    {
+                        break;
+                    }
+                    continue;
+                }
+            };
+            let host = crate::repeater::websocket_host(&config.url)
+                .unwrap_or("unknown host")
+                .to_owned();
+            let fingerprint = hex::encode(&Sha256::digest(repeater_public)[..4]);
+            let connect = tokio::time::timeout(
+                Duration::from_secs(10),
+                repeater_client::connect(
+                    &config.url,
+                    self._identity.static_private,
+                    repeater_public,
+                    &group,
+                ),
+            )
+            .await;
+            let client = match connect {
+                Ok(Ok(client)) => client,
+                Ok(Err(error)) => {
+                    let _ = error;
+                    info!(host, fingerprint, "unable to connect to repeater");
+                    failures = failures.saturating_add(1);
+                    let delay = self.reconnect_delay(failures);
+                    info!(delay_ms = delay.as_millis(), "reconnecting to repeater");
+                    self.clear_repeater();
+                    if !self.wait_or_shutdown(&mut shutdown, delay).await {
+                        break;
+                    }
+                    continue;
+                }
+                Err(_) => {
+                    info!(host, fingerprint, "repeater connection attempt timed out");
+                    failures = failures.saturating_add(1);
+                    let delay = self.reconnect_delay(failures);
+                    info!(delay_ms = delay.as_millis(), "reconnecting to repeater");
+                    self.clear_repeater();
+                    if !self.wait_or_shutdown(&mut shutdown, delay).await {
+                        break;
+                    }
+                    continue;
+                }
+            };
+            info!(host, fingerprint, "connected to repeater");
+            let (dialer, incoming) = client.split();
+            *self.repeater.write().expect("repeater dialer lock") = Some(dialer.clone());
+            failures = 0;
+            let session_ended = self
+                .run_repeater_session(&dialer, incoming, &config, &group, &mut shutdown)
+                .await;
+            self.clear_repeater();
+            if !session_ended || *shutdown.borrow() {
+                break;
+            }
+            info!(host, fingerprint, "disconnected from repeater");
+            failures = failures.saturating_add(1);
+            let delay = self.reconnect_delay(failures);
+            info!(delay_ms = delay.as_millis(), "reconnecting to repeater");
+            if !self.wait_or_shutdown(&mut shutdown, delay).await {
+                break;
+            }
+        }
+        self.clear_repeater();
+    }
+
+    async fn run_repeater_session(
+        self: &Arc<Self>,
+        dialer: &RepeaterDialer,
+        incoming: repeater_client::IncomingStreams,
+        config: &crate::repeater::RepeaterConfig,
+        group: &str,
+        shutdown: &mut tokio::sync::watch::Receiver<bool>,
+    ) -> bool {
+        let directory_poll = Duration::from_millis(
+            self.repeater_directory_poll_ms
+                .load(Ordering::Relaxed)
+                .max(1),
+        );
+        let mut directory_poll =
+            tokio::time::interval_at(tokio::time::Instant::now() + directory_poll, directory_poll);
+        let mut config_poll = tokio::time::interval_at(
+            tokio::time::Instant::now() + REPEATER_CONFIG_POLL,
+            REPEATER_CONFIG_POLL,
+        );
+        let mut health_poll = tokio::time::interval(Duration::from_secs(1));
+        let accept_node = self.clone();
+        let accept_dialer = dialer.clone();
+        let mut accept_task = tokio::spawn(async move {
+            accept_node
+                .accept_repeater_streams(accept_dialer, incoming)
+                .await;
+        });
+        if self.refresh_relay_directory(dialer).await.is_err() {
+            accept_task.abort();
+            let _ = accept_task.await;
+            return true;
+        }
+        let mut session_ended = true;
+        let mut accept_task_finished = false;
+        loop {
+            tokio::select! {
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
+                        session_ended = false;
+                        break;
+                    }
+                }
+                _ = &mut accept_task => {
+                    accept_task_finished = true;
+                    debug!("repeater incoming stream accept task ended");
+                    break;
+                }
+                _ = directory_poll.tick() => {
+                    if let Err(error) = self.refresh_relay_directory(dialer).await {
+                        debug!(%error, "repeater directory LIST failed");
+                        break;
+                    }
+                }
+                _ = config_poll.tick() => {
+                    match crate::repeater::read_config(&self.pairing_root.join("repeater.json")) {
+                        Ok(Some(current)) if current.url == config.url
+                            && current.repeater_public_key == config.repeater_public_key => {}
+                        _ => {
+                            debug!("repeater configuration changed or became unreadable");
+                            break;
+                        }
+                    }
+                }
+                _ = health_poll.tick() => {
+                    let paired = self.keys.read().expect("key slot lock").is_some();
+                    let current_group = self.pairing_group.read().expect("pairing group lock");
+                    let closed = dialer.is_closed();
+                    let group_changed = current_group.as_deref() != Some(group);
+                    if closed || !paired || group_changed {
+                        debug!(closed, paired, group_changed, "repeater session health check failed");
+                        break;
+                    }
+                }
+            }
+        }
+        if !accept_task_finished {
+            accept_task.abort();
+            let _ = accept_task.await;
+        }
+        session_ended
+    }
+
+    async fn accept_repeater_streams(
+        self: Arc<Self>,
+        dialer: RepeaterDialer,
+        mut incoming: repeater_client::IncomingStreams,
+    ) {
+        loop {
+            let Some(incoming_stream) = incoming.accept().await else {
+                debug!("repeater incoming stream receiver closed");
+                return;
+            };
+            let local_key = entangle_transport::public_key(&self._identity.static_private);
+            let source_fingerprint = hex::encode(&Sha256::digest(incoming_stream.source)[..4]);
+            let serve_fingerprint = source_fingerprint.clone();
+            let known_in_session_directory = self
+                .relay_directory
+                .lock()
+                .expect("relay directory lock")
+                .contains(&incoming_stream.source);
+            debug!(source_fingerprint, "accepted incoming repeater stream");
+            if incoming_stream.source != local_key {
+                self.relay_directory
+                    .lock()
+                    .expect("relay directory lock")
+                    .insert(incoming_stream.source);
+            }
+            let stream = incoming_stream.stream.into_io();
+            let node: Arc<dyn LinkHandler> = self.clone();
+            let keys = self.keys.clone();
+            tokio::spawn(async move {
+                let result =
+                    entangle_link::serve_io(stream, RELAY_PLACEHOLDER, true, keys, node).await;
+                match result {
+                    Ok(()) => debug!(
+                        source_fingerprint = serve_fingerprint,
+                        "relayed peer link ended"
+                    ),
+                    Err(error) => debug!(
+                        source_fingerprint = serve_fingerprint,
+                        %error,
+                        "relayed peer link failed"
+                    ),
+                }
+            });
+            if !known_in_session_directory && incoming_stream.source != local_key {
+                let node = self.clone();
+                let dialer = dialer.clone();
+                tokio::spawn(async move {
+                    debug!(
+                        source_fingerprint,
+                        "refreshing directory for peer missing from the current repeater session"
+                    );
+                    if let Err(error) = node.refresh_relay_directory(&dialer).await {
+                        debug!(%error, "repeater directory refresh after incoming stream failed");
+                    }
+                });
+            }
+        }
+    }
+
+    async fn refresh_relay_directory(self: &Arc<Self>, dialer: &RepeaterDialer) -> Result<()> {
+        let entries = dialer.list().await?;
+        let local_key = entangle_transport::public_key(&self._identity.static_private);
+        let fingerprints = entries
+            .iter()
+            .map(|entry| hex::encode(&Sha256::digest(entry.key)[..4]))
+            .collect::<Vec<_>>();
+        debug!(
+            count = entries.len(),
+            ?fingerprints,
+            "listed repeater directory peers"
+        );
+        {
+            let mut directory = self.relay_directory.lock().expect("relay directory lock");
+            directory.clear();
+            directory.extend(
+                entries
+                    .iter()
+                    .map(|entry| entry.key)
+                    .filter(|key| *key != local_key),
+            );
+        }
+        for entry in entries {
+            if entry.key == local_key {
+                continue;
+            }
+            let already_fresh = self
+                .field
+                .read()
+                .expect("field lock")
+                .all()
+                .iter()
+                .any(|record| {
+                    record.static_key == Some(entry.key)
+                        && record.state == PeerState::Entangled
+                        && record.last_seen.elapsed() < Duration::from_secs(60)
+                });
+            if !already_fresh {
+                let fingerprint = hex::encode(&Sha256::digest(entry.key)[..4]);
+                let inserted = self
+                    .relay_dialing
+                    .lock()
+                    .expect("relay dialing lock")
+                    .insert(entry.key);
+                if !inserted {
+                    continue;
+                }
+                debug!(fingerprint, "dialing repeater directory peer");
+                let node = Arc::clone(self);
+                let dialer = dialer.clone();
+                let target = entry.key;
+                tokio::spawn(async move {
+                    let connected = node
+                        .dial(
+                            Route::Tunnel(Arc::new(RepeaterOpener { dialer, target })),
+                            None,
+                        )
+                        .await;
+                    node.relay_dialing
+                        .lock()
+                        .expect("relay dialing lock")
+                        .remove(&target);
+                    debug!(fingerprint, connected, "repeater directory dial completed");
+                });
+            } else {
+                debug!(
+                    fingerprint = hex::encode(&Sha256::digest(entry.key)[..4]),
+                    "skipping fresh entangled repeater peer"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn clear_repeater(&self) {
+        *self.repeater.write().expect("repeater dialer lock") = None;
+        self.relay_directory
+            .lock()
+            .expect("relay directory lock")
+            .clear();
+    }
+
+    fn reconnect_delay(&self, failures: u32) -> Duration {
+        let base = self.reconnect_base_ms.load(Ordering::Relaxed).max(1);
+        let cap = self.reconnect_cap_ms.load(Ordering::Relaxed).max(base);
+        let shift = failures.saturating_sub(1).min(31);
+        let millis = base.saturating_mul(1_u64 << shift).min(cap);
+        let entropy = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .subsec_nanos() as i64;
+        let jitter_per_mille = entropy.rem_euclid(401) - 200;
+        let jittered = ((millis as i128) * (1000 + jitter_per_mille) as i128 / 1000).max(1) as u64;
+        Duration::from_millis(jittered)
+    }
+
+    async fn wait_or_shutdown(
+        &self,
+        shutdown: &mut tokio::sync::watch::Receiver<bool>,
+        duration: Duration,
+    ) -> bool {
+        tokio::select! {
+            changed = shutdown.changed() => changed.is_ok() && !*shutdown.borrow(),
+            _ = sleep(duration) => true,
+        }
+    }
+
     async fn dial_static_peers(&self) {
-        if self.keys.read().expect("key slot lock").is_none() {
+        if self.options.relay_only || self.keys.read().expect("key slot lock").is_none() {
             return;
         }
         let mut attempted = HashSet::new();
@@ -640,7 +1093,7 @@ impl Particle {
                     {
                         continue;
                     }
-                    self.dial(address, None).await;
+                    self.dial(Route::Direct(address), None).await;
                 }
             }
         }
@@ -662,7 +1115,8 @@ impl Particle {
             for address in &peer.resonance.addrs {
                 let socket = SocketAddr::new(*address, peer.resonance.port);
                 if attempted.insert(socket) {
-                    self.dial(socket, Some(peer.resonance.clone())).await;
+                    self.dial(Route::Direct(socket), Some(peer.resonance.clone()))
+                        .await;
                 }
             }
         }
@@ -701,7 +1155,12 @@ impl Particle {
             let approved = trust::is_approved(store, &record.resonance.particle_id, &static_key);
             let denied = trust::is_denied(store, &static_key);
             if record.state == PeerState::Pending && approved {
-                if field.entangle(record.resonance.clone(), manifest, static_key) {
+                if field.entangle_with_path(
+                    record.resonance.clone(),
+                    manifest,
+                    static_key,
+                    record.path,
+                ) {
                     info!(
                         "peer entangled: {} ({})",
                         record.resonance.name,
@@ -754,6 +1213,22 @@ impl Particle {
             "ephemeral"
         });
         local["link_port_fallback"] = json!(self.link_port_fallback);
+        let connected = self
+            .repeater
+            .read()
+            .expect("repeater dialer lock")
+            .as_ref()
+            .is_some_and(|dialer| !dialer.is_closed());
+        let relay_directory = self
+            .relay_directory
+            .lock()
+            .expect("relay directory lock")
+            .clone();
+        local["repeater"] = json!({
+            "configured": self.repeater_configured.load(Ordering::Relaxed),
+            "connected": connected,
+            "relay_only": self.options.relay_only,
+        });
         if let Some(warning) = self.identity_warning() {
             local["warning"] = json!(warning);
         }
@@ -778,10 +1253,15 @@ impl Particle {
                 .unwrap_or_else(|| pending_hint.to_owned());
             local["hint"] = json!(hint);
         }
-        json!({
-            "self": local,
-            "particles": self.field.read().expect("field lock").view(context, include_unentangled)
-        })
+        let particles = {
+            let field = self.field.read().expect("field lock");
+            if relay_directory.is_empty() {
+                field.view(context, include_unentangled)
+            } else {
+                field.view_with_relay_directory(context, include_unentangled, &relay_directory)
+            }
+        };
+        json!({"self": local, "particles": particles})
     }
 
     /// Reads inbox entries, optionally consuming those returned to the caller.
@@ -914,7 +1394,7 @@ impl Particle {
             let bytes = serde_json::to_vec(&args["state"]).map_err(|e| e.to_string())?;
             tokio::fs::write(&path, bytes)
                 .await
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| format!("could not write outbox payload {}: {e}", path.display()))?;
             (path, format!("{sync_id}.json"), true)
         } else {
             let input = PathBuf::from(args["file_path"].as_str().unwrap_or_default());
@@ -965,30 +1445,89 @@ impl Particle {
             args,
             timeout_secs,
         } = payload;
-        let (size, sha256) = hash_file(&path).await.map_err(|e| e.to_string())?;
+        let (size, sha256) = hash_file(&path)
+            .await
+            .map_err(|error| format!("could not hash payload {}: {error}", path.display()))?;
         if size > target.max_payload_bytes {
             return Err(format!(
                 "payload is {size} bytes, exceeding peer limit of {} bytes",
                 target.max_payload_bytes
             ));
         }
-        let peer_addr = peer
-            .resonance
-            .addrs
-            .iter()
-            .find(|ip| !ip.is_loopback())
-            .or_else(|| peer.resonance.addrs.first())
-            .copied()
-            .ok_or_else(|| "peer has no usable address".to_owned())?;
-        let socket = SocketAddr::new(peer_addr, peer.resonance.port);
-        let label = args.get("label").and_then(Value::as_str).map(str::to_owned);
+        let remote_key = self
+            .field
+            .read()
+            .map_err(|_| "peer field lock poisoned".to_owned())?
+            .binding(&peer.resonance.particle_id)
+            .filter(|bound| peer.static_key == Some(*bound))
+            .ok_or_else(|| "peer has no authenticated static key".to_owned())?;
         let started = std::time::Instant::now();
+        let direct_socket = if self.options.relay_only || peer.resonance.port == 0 {
+            None
+        } else {
+            peer.resonance
+                .addrs
+                .iter()
+                .find(|ip| !ip.is_loopback() && !ip.is_unspecified())
+                .or_else(|| peer.resonance.addrs.iter().find(|ip| !ip.is_unspecified()))
+                .copied()
+                .map(|address| SocketAddr::new(address, peer.resonance.port))
+        };
+        let mut established = None;
+        if let Some(socket) = direct_socket {
+            match self
+                .sync_handshake(&Route::Direct(socket), remote_key)
+                .await
+            {
+                Ok(stream) => established = Some((stream, "direct")),
+                Err(error) => debug!(%error, "direct Noise connection failed before sync offer"),
+            }
+        }
+        if established.is_none() {
+            let dialer = self
+                .repeater
+                .read()
+                .expect("repeater dialer lock")
+                .as_ref()
+                .filter(|dialer| !dialer.is_closed())
+                .cloned();
+            let listed = self
+                .relay_directory
+                .lock()
+                .expect("relay directory lock")
+                .contains(&remote_key);
+            if let Some(dialer) = dialer.filter(|_| listed) {
+                let route = Route::Tunnel(Arc::new(RepeaterOpener {
+                    dialer,
+                    target: remote_key,
+                }));
+                match self.sync_handshake(&route, remote_key).await {
+                    Ok(stream) => established = Some((stream, "repeater")),
+                    Err(error) => {
+                        debug!(%error, "repeater Noise connection failed before sync offer")
+                    }
+                }
+            }
+        }
+        let Some((stream, link_path)) = established else {
+            let hint = if self.repeater_configured.load(Ordering::Relaxed) {
+                "configure and connect both peers to the repeater, then retry"
+            } else {
+                "configure a Quantum Repeater with `entangle repeater join` to enable relay fallback"
+            };
+            let reason = if direct_socket.is_none() {
+                "peer has no usable direct address"
+            } else {
+                "peer could not be authenticated over a direct link"
+            };
+            return Err(format!("{reason}; {hint}"));
+        };
+        let label = args.get("label").and_then(Value::as_str).map(str::to_owned);
         let source = tokio::fs::File::open(&path)
             .await
-            .map_err(|error| error.to_string())?;
-        let result = entangle_link::offer(
-            &Route::Direct(socket),
-            self.keys.clone(),
+            .map_err(|error| format!("could not open payload {}: {error}", path.display()))?;
+        let result = entangle_link::offer_on(
+            stream,
             SyncOffer {
                 from: self.manifest.particle_id.clone(),
                 sync_id: sync_id.clone(),
@@ -1023,8 +1562,24 @@ impl Particle {
             "bytes": size,
             "sha256": sha256,
             "delivered": true,
+            "path": link_path,
             "elapsed_ms": started.elapsed().as_millis()
         }))
+    }
+
+    async fn sync_handshake(
+        &self,
+        route: &Route,
+        expected_static: [u8; 32],
+    ) -> Result<SecureStream, String> {
+        let stream =
+            entangle_link::connect_secure(route, self.keys.clone(), Duration::from_secs(5))
+                .await
+                .map_err(|error| error.to_string())?;
+        if stream.remote_static() != expected_static {
+            return Err("remote Noise static key did not match the bound peer key".into());
+        }
+        Ok(stream)
     }
 
     async fn on_detected(&self, peer: Resonance) {
@@ -1049,7 +1604,10 @@ impl Particle {
         for address in &peer.addrs {
             for attempt in 0..3 {
                 if self
-                    .dial(SocketAddr::new(*address, peer.port), Some(peer.clone()))
+                    .dial(
+                        Route::Direct(SocketAddr::new(*address, peer.port)),
+                        Some(peer.clone()),
+                    )
                     .await
                 {
                     return;
@@ -1059,12 +1617,12 @@ impl Particle {
         }
     }
 
-    async fn dial(&self, address: SocketAddr, discovery: Option<Resonance>) -> bool {
+    async fn dial(&self, route: Route, discovery: Option<Resonance>) -> bool {
         if self.keys.read().expect("key slot lock").is_none() {
             return false;
         }
         match entangle_link::handshake_stream(
-            &Route::Direct(address),
+            &route,
             self.keys.clone(),
             &self.manifest,
             Duration::from_secs(5),
@@ -1132,28 +1690,67 @@ impl Particle {
                     debug!("{error}");
                     return false;
                 }
-                let resonance = discovery.unwrap_or_else(|| Resonance {
-                    particle_id: manifest.particle_id.clone(),
-                    name: manifest.name.clone(),
-                    hostname: address.ip().to_string(),
-                    addrs: vec![address.ip()],
-                    port: manifest.link_port,
-                    context: manifest.context.clone(),
-                    group: None,
-                    proto: manifest.protocol,
+                let route_path = match &route {
+                    Route::Direct(_) => LinkPath::Direct,
+                    Route::Tunnel(_) => LinkPath::Repeater,
+                };
+                let resonance = discovery.unwrap_or_else(|| match &route {
+                    Route::Direct(address) => Resonance {
+                        particle_id: manifest.particle_id.clone(),
+                        name: manifest.name.clone(),
+                        hostname: address.ip().to_string(),
+                        addrs: vec![address.ip()],
+                        port: manifest.link_port,
+                        context: manifest.context.clone(),
+                        group: None,
+                        proto: manifest.protocol,
+                    },
+                    Route::Tunnel(_) => {
+                        let mut resonance = self
+                            .field
+                            .read()
+                            .expect("field lock")
+                            .by_id(&manifest.particle_id)
+                            .map(|record| record.resonance.clone())
+                            .unwrap_or_else(|| Resonance {
+                                particle_id: manifest.particle_id.clone(),
+                                name: manifest.name.clone(),
+                                hostname: "via-repeater".into(),
+                                addrs: vec![],
+                                port: manifest.link_port,
+                                context: manifest.context.clone(),
+                                group: None,
+                                proto: manifest.protocol,
+                            });
+                        resonance.particle_id = manifest.particle_id.clone();
+                        resonance.name = manifest.name.clone();
+                        resonance.context = manifest.context.clone();
+                        resonance.proto = manifest.protocol;
+                        resonance
+                    }
                 });
-                let newly_transitioned = if approved {
-                    self.field.write().expect("field lock").entangle(
-                        resonance,
-                        manifest.clone(),
-                        remote_static,
-                    )
-                } else {
-                    self.field.write().expect("field lock").pend(
-                        resonance,
-                        manifest.clone(),
-                        remote_static,
-                    )
+                let newly_transitioned = {
+                    let mut field = self.field.write().expect("field lock");
+                    match (approved, route_path) {
+                        (true, LinkPath::Direct) => {
+                            field.entangle(resonance, manifest.clone(), remote_static)
+                        }
+                        (false, LinkPath::Direct) => {
+                            field.pend(resonance, manifest.clone(), remote_static)
+                        }
+                        (true, LinkPath::Repeater) => field.entangle_with_path(
+                            resonance,
+                            manifest.clone(),
+                            remote_static,
+                            Some(route_path),
+                        ),
+                        (false, LinkPath::Repeater) => field.pend_with_path(
+                            resonance,
+                            manifest.clone(),
+                            remote_static,
+                            Some(route_path),
+                        ),
+                    }
                 };
                 if approved {
                     if newly_transitioned {
@@ -1212,7 +1809,11 @@ impl Particle {
                 false
             }
             Err(error) => {
-                debug!("handshake to {address} failed: {error}");
+                let route_description = match &route {
+                    Route::Direct(address) => address.to_string(),
+                    Route::Tunnel(opener) => opener.describe(),
+                };
+                debug!("handshake via {route_description} failed: {error}");
                 false
             }
         }
@@ -1278,25 +1879,39 @@ impl Particle {
             return Err("offer label exceeds 200 characters".into());
         }
         let directory = self.data_dir.join("inbox").join(&offer.sync_id);
-        tokio::fs::create_dir_all(&directory)
-            .await
-            .map_err(|e| e.to_string())?;
+        tokio::fs::create_dir_all(&directory).await.map_err(|e| {
+            format!(
+                "could not create inbox directory {}: {e}",
+                directory.display()
+            )
+        })?;
         let mut cleanup = PartialTransferGuard::new(directory.clone());
         let result: Result<String, String> = async {
             let path = directory.join(&name);
-            let mut file = tokio::fs::File::create(&path)
-                .await
-                .map_err(|error| error.to_string())?;
+            let mut file = tokio::fs::File::create(&path).await.map_err(|error| {
+                format!(
+                    "could not create received payload {}: {error}",
+                    path.display()
+                )
+            })?;
             let mut hasher = Sha256::new();
             let mut size = 0_u64;
             while let Some(chunk) = payload.next_chunk().await.map_err(|e| e.to_string())? {
                 hasher.update(&chunk);
                 size = size.saturating_add(chunk.len() as u64);
-                file.write_all(&chunk)
-                    .await
-                    .map_err(|error| error.to_string())?;
+                file.write_all(&chunk).await.map_err(|error| {
+                    format!(
+                        "could not write received payload {}: {error}",
+                        path.display()
+                    )
+                })?;
             }
-            file.flush().await.map_err(|error| error.to_string())?;
+            file.flush().await.map_err(|error| {
+                format!(
+                    "could not flush received payload {}: {error}",
+                    path.display()
+                )
+            })?;
             drop(file);
             let hash = hex::encode(hasher.finalize());
             if size != offer.size || hash != offer.sha256 {
@@ -1304,7 +1919,9 @@ impl Particle {
             }
             let (state, text) = match &offer.kind {
                 StateKind::Json => {
-                    let data = tokio::fs::read(&path).await.map_err(|e| e.to_string())?;
+                    let data = tokio::fs::read(&path).await.map_err(|e| {
+                        format!("could not read received payload {}: {e}", path.display())
+                    })?;
                     (
                         Some(
                             serde_json::from_slice(&data)
@@ -1314,7 +1931,9 @@ impl Particle {
                     )
                 }
                 StateKind::File if size <= 64 * 1024 => {
-                    let data = tokio::fs::read(&path).await.map_err(|e| e.to_string())?;
+                    let data = tokio::fs::read(&path).await.map_err(|e| {
+                        format!("could not read received payload {}: {e}", path.display())
+                    })?;
                     (None, String::from_utf8(data).ok())
                 }
                 StateKind::File => (None, None),
@@ -1444,26 +2063,57 @@ impl LinkHandler for Particle {
                 ));
             }
             let existing = field.by_id(&manifest.particle_id);
-            let resonance = Resonance {
-                particle_id: manifest.particle_id.clone(),
-                name: manifest.name.clone(),
-                hostname: peer.addr.ip().to_string(),
-                addrs: vec![peer.addr.ip()],
-                port: manifest.link_port,
-                context: manifest.context.clone(),
-                group: existing.and_then(|record| record.resonance.group),
-                proto: manifest.protocol,
+            let route_path = if peer.relayed {
+                LinkPath::Repeater
+            } else {
+                LinkPath::Direct
+            };
+            let resonance = if peer.relayed {
+                let mut resonance =
+                    existing
+                        .map(|record| record.resonance)
+                        .unwrap_or_else(|| Resonance {
+                            particle_id: manifest.particle_id.clone(),
+                            name: manifest.name.clone(),
+                            hostname: "via-repeater".into(),
+                            addrs: vec![],
+                            port: manifest.link_port,
+                            context: manifest.context.clone(),
+                            group: None,
+                            proto: manifest.protocol,
+                        });
+                resonance.particle_id = manifest.particle_id.clone();
+                resonance.name = manifest.name.clone();
+                resonance.context = manifest.context.clone();
+                resonance.proto = manifest.protocol;
+                resonance
+            } else {
+                Resonance {
+                    particle_id: manifest.particle_id.clone(),
+                    name: manifest.name.clone(),
+                    hostname: peer.addr.ip().to_string(),
+                    addrs: vec![peer.addr.ip()],
+                    port: manifest.link_port,
+                    context: manifest.context.clone(),
+                    group: existing.and_then(|record| record.resonance.group),
+                    proto: manifest.protocol,
+                }
             };
             let peer_name = manifest.name.clone();
             let particle_id = manifest.particle_id.clone();
             if approved {
-                if field.entangle(resonance, manifest, peer.remote_static) {
+                if field.entangle_with_path(
+                    resonance,
+                    manifest,
+                    peer.remote_static,
+                    Some(route_path),
+                ) {
                     info!("peer entangled: {} ({})", peer_name, particle_id.short());
                 } else {
                     debug!("peer entangled: {} ({})", peer_name, particle_id.short());
                 }
             } else {
-                if field.pend(resonance, manifest, peer.remote_static) {
+                if field.pend_with_path(resonance, manifest, peer.remote_static, Some(route_path)) {
                     info!(
                         "peer awaiting approval: {} ({}); run `entangle peer approve` to verify it",
                         peer_name,
@@ -1529,24 +2179,23 @@ impl Particle {
                 .field
                 .write()
                 .map_err(|_| "peer field lock poisoned".to_owned())?;
-            if field
-                .binding(&offer.from)
-                .is_some_and(|bound| bound != peer_info.remote_static)
-            {
+            if field.binding(&offer.from) != Some(peer_info.remote_static) {
                 return Err("sender key does not match the entangled particle".into());
             }
             let peer = field
                 .by_id(&offer.from)
                 .filter(|peer| peer.state == PeerState::Entangled)
                 .ok_or_else(|| "this machine has not approved the sender yet".to_owned())?;
-            let source_ip = peer_info.addr.ip();
-            if !peer.resonance.addrs.contains(&source_ip) {
-                debug!(
-                    particle_id = %offer.from,
-                    source_ip = %source_ip,
-                    "offer arrived from an address not listed for the sender"
-                );
-                field.add_address(&offer.from, source_ip);
+            if !peer_info.relayed {
+                let source_ip = peer_info.addr.ip();
+                if !peer.resonance.addrs.contains(&source_ip) {
+                    debug!(
+                        particle_id = %offer.from,
+                        source_ip = %source_ip,
+                        "offer arrived from an address not listed for the sender"
+                    );
+                    field.add_address(&offer.from, source_ip);
+                }
             }
         }
         if !self.manifest.accepts.contains(&offer.kind) {
@@ -1590,12 +2239,17 @@ impl Particle {
 }
 
 async fn hash_file(path: &Path) -> Result<(u64, String)> {
-    let mut file = tokio::fs::File::open(path).await?;
+    let mut file = tokio::fs::File::open(path)
+        .await
+        .map_err(|error| anyhow!("could not open {} for hashing: {error}", path.display()))?;
     let mut hasher = Sha256::new();
     let mut buffer = vec![0_u8; 64 * 1024];
     let mut size = 0_u64;
     loop {
-        let read = file.read(&mut buffer).await?;
+        let read = file
+            .read(&mut buffer)
+            .await
+            .map_err(|error| anyhow!("could not read {} while hashing: {error}", path.display()))?;
         if read == 0 {
             break;
         }
@@ -1629,6 +2283,7 @@ mod tests {
             legacy_transfer_path: None,
             max_payload_mb: 2,
             no_mdns: true,
+            relay_only: false,
             log_level: "warn".into(),
         }
     }
@@ -1641,6 +2296,17 @@ mod tests {
             .port()
     }
 
+    fn canonical_temp_root(temp: &tempfile::TempDir) -> PathBuf {
+        #[cfg(target_os = "macos")]
+        {
+            temp.path().canonicalize().unwrap()
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            temp.path().to_path_buf()
+        }
+    }
+
     fn port_other_than(other: u16) -> u16 {
         loop {
             let port = free_port();
@@ -1648,6 +2314,107 @@ mod tests {
                 return port;
             }
         }
+    }
+
+    async fn start_test_repeater(root: PathBuf, port: u16) -> (JoinHandle<()>, String, [u8; 32]) {
+        let store = entangle_repeater::store::Store::new(&root);
+        let private = store.key().unwrap();
+        let public = entangle_transport::public_key(&private);
+        let url = format!("ws://127.0.0.1:{port}/entangle");
+        let server = tokio::spawn(async move {
+            let _ = entangle_repeater::server::serve(entangle_repeater::server::ServerConfig {
+                listen: SocketAddr::from(([127, 0, 0, 1], port)),
+                path: "/entangle".into(),
+                root,
+            })
+            .await;
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        (server, url, public)
+    }
+
+    fn write_repeater_config(root: &Path, url: &str, public: [u8; 32]) {
+        let path = root.join("repeater.json");
+        let config = crate::repeater::RepeaterConfig {
+            url: url.into(),
+            repeater_public_key: hex::encode(public),
+        };
+        std::fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+    }
+
+    async fn enroll_with_test_repeater(
+        identity_root: &Path,
+        repeater_root: &Path,
+        url: &str,
+        repeater_public: [u8; 32],
+        invite_secret: [u8; 32],
+    ) {
+        let identity = identity::claim(identity_root).unwrap();
+        let static_private = identity.static_private;
+        drop(identity);
+        let store = entangle_repeater::store::Store::new(repeater_root);
+        let expires = (chrono::Utc::now() + chrono::Duration::minutes(10)).to_rfc3339();
+        store.add_invite(invite_secret, expires, None).unwrap();
+        entangle_repeater::client::enroll(
+            url,
+            static_private,
+            repeater_public,
+            invite_secret,
+            None,
+        )
+        .await
+        .unwrap();
+    }
+
+    async fn prepare_test_repeater_pair(
+        root_a: &Path,
+        root_b: &Path,
+        repeater_root: &Path,
+        port: u16,
+    ) -> (JoinHandle<()>, String, [u8; 32]) {
+        let (server, url, repeater_public) =
+            start_test_repeater(repeater_root.to_path_buf(), port).await;
+        let key = pairing::initialize(root_a, false).unwrap();
+        pairing::join(root_b, &pairing::encode_code(&key), false).unwrap();
+        enroll_with_test_repeater(root_a, repeater_root, &url, repeater_public, [0x51; 32]).await;
+        enroll_with_test_repeater(root_b, repeater_root, &url, repeater_public, [0x52; 32]).await;
+        write_repeater_config(root_a, &url, repeater_public);
+        write_repeater_config(root_b, &url, repeater_public);
+        (server, url, repeater_public)
+    }
+
+    async fn wait_for_repeater(a: &Particle, b: &Particle) {
+        let a_key = entangle_transport::public_key(&a._identity.static_private);
+        let b_key = entangle_transport::public_key(&b._identity.static_private);
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let a_connected =
+                    a.find_particles(&json!({}))["self"]["repeater"]["connected"] == true;
+                let b_connected =
+                    b.find_particles(&json!({}))["self"]["repeater"]["connected"] == true;
+                let a_lists_b = a
+                    .relay_directory
+                    .lock()
+                    .expect("relay directory lock")
+                    .contains(&b_key);
+                let b_lists_a = b
+                    .relay_directory
+                    .lock()
+                    .expect("relay directory lock")
+                    .contains(&a_key);
+                if a_connected && b_connected && a_lists_b && b_lists_a {
+                    break;
+                }
+                sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("both particles should connect and see each other in the repeater directory");
     }
 
     fn peer_manifest(id: ParticleId) -> Manifest {
@@ -1896,6 +2663,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result["delivered"], true);
+        assert_eq!(result["path"], "direct");
         let observed = b.observe(&json!({ "limit": 20 })).await;
         assert_eq!(observed["states"][0]["state"]["hello"], "world");
         let source = temp.path().join("source.txt");
@@ -2275,8 +3043,11 @@ mod tests {
         .await
         .unwrap();
         assert!(
-            !a.dial(SocketAddr::from(([127, 0, 0, 1], b_port)), None)
-                .await
+            !a.dial(
+                Route::Direct(SocketAddr::from(([127, 0, 0, 1], b_port))),
+                None,
+            )
+            .await
         );
         assert!(a.field.read().unwrap().all().is_empty());
         assert!(b.field.read().unwrap().all().is_empty());
@@ -2373,6 +3144,87 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(error, "sender key does not match the entangled particle");
+        particle.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn unbound_static_key_cannot_receive_sync_accept_for_approved_particle() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("receiver");
+        pairing::initialize(&root, false).unwrap();
+        let port = free_port();
+        let (particle, _) = Particle::start(options("receiver", port, root.clone(), None), None)
+            .await
+            .unwrap();
+        let id = ParticleId::generate();
+        let manifest = peer_manifest(id.clone());
+        let resonance = Resonance {
+            particle_id: id.clone(),
+            name: manifest.name.clone(),
+            hostname: "peer.local.".into(),
+            addrs: vec![],
+            port: manifest.link_port,
+            context: None,
+            group: particle.pairing_group.read().unwrap().clone(),
+            proto: manifest.protocol,
+        };
+        assert!(particle
+            .field
+            .write()
+            .unwrap()
+            .entangle(resonance, manifest, [0x11; 32]));
+        particle.field.write().unwrap().unbind(&id);
+
+        let receiver_keys = particle
+            .keys
+            .read()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .as_ref()
+            .clone();
+        let attacker_keys = LinkKeys {
+            static_private: entangle_transport::generate_static(),
+            psk: receiver_keys.psk,
+        };
+        let mut stream = entangle_transport::connect(
+            SocketAddr::from(([127, 0, 0, 1], port)),
+            &attacker_keys,
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+        let sync_id = "0123456789abcdef0123456789abcdef";
+        entangle_link::write_frame(
+            &mut stream,
+            &entangle_link::Frame::SyncOffer {
+                from: id.clone(),
+                sync_id: sync_id.into(),
+                timeout_secs: 60,
+                kind: StateKind::Json,
+                name: "forged.json".into(),
+                size: 0,
+                sha256: hex::encode(Sha256::digest([])),
+                label: None,
+            },
+        )
+        .await
+        .unwrap();
+        let reply = entangle_link::read_frame(&mut stream).await.unwrap();
+        assert!(matches!(
+            reply,
+            entangle_link::Frame::SyncReject {
+                sync_id: rejected,
+                reason
+            } if rejected == sync_id && reason.contains("sender key")
+        ));
+        assert!(!particle.data_dir.join("inbox").join(sync_id).exists());
+        assert!(!particle
+            .inbox
+            .lock()
+            .await
+            .iter()
+            .any(|item| item.sync_id == sync_id));
         particle.shutdown().await;
     }
 
@@ -2490,5 +3342,410 @@ mod tests {
             .to_string()
             .contains("peer key has been denied"));
         particle.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn relayed_hello_preserves_discovery_addresses_and_never_learns_placeholder() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("node");
+        let (particle, _) = Particle::start(options("receiver", free_port(), root, None), None)
+            .await
+            .unwrap();
+        let id = ParticleId::generate();
+        let manifest = peer_manifest(id.clone());
+        let known_address = "192.0.2.42".parse().unwrap();
+        particle.field.write().unwrap().resonate(Resonance {
+            particle_id: id.clone(),
+            name: manifest.name.clone(),
+            hostname: "peer.local.".into(),
+            addrs: vec![known_address],
+            port: 7338,
+            context: None,
+            group: None,
+            proto: manifest.protocol,
+        });
+
+        particle
+            .on_hello(
+                &PeerInfo {
+                    addr: RELAY_PLACEHOLDER,
+                    remote_static: [0x33; 32],
+                    relayed: true,
+                },
+                manifest,
+            )
+            .await
+            .unwrap();
+
+        let record = particle.field.read().unwrap().by_id(&id).unwrap();
+        assert_eq!(record.resonance.hostname, "peer.local.");
+        assert_eq!(record.resonance.addrs, vec![known_address]);
+        assert_eq!(record.resonance.port, 7338);
+        assert_eq!(record.path, Some(LinkPath::Repeater));
+        let view = particle.find_particles(&json!({"include_unentangled": true}));
+        assert_eq!(view["particles"][0]["path"], "repeater");
+        assert_eq!(view["particles"][0]["addrs"], json!(["192.0.2.42"]));
+        assert!(!view.to_string().contains("0.0.0.0"));
+        particle.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn relay_only_self_reports_listener_and_repeater_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut options = options("relay-only", 0, temp.path().join("node"), None);
+        options.relay_only = true;
+        options.peer.push("127.0.0.1:7337".into());
+        let (particle, manifest) = Particle::start(options, None).await.unwrap();
+        assert_eq!(manifest.link_port, 0);
+        assert!(!particle.link_port_fallback);
+        let view = particle.find_particles(&json!({}));
+        assert_eq!(
+            view["self"]["repeater"],
+            json!({"configured": false, "connected": false, "relay_only": true})
+        );
+        assert_eq!(view["self"]["repeater"].as_object().unwrap().len(), 3);
+        particle.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn relay_only_particles_exchange_json_and_files_through_repeater() {
+        let temp = tempfile::tempdir().unwrap();
+        let temp_root = canonical_temp_root(&temp);
+        let root_a = temp_root.join("a");
+        let root_b = temp_root.join("b");
+        let repeater_root = temp_root.join("repeater");
+        let port = free_port();
+        let (server, _, _) =
+            prepare_test_repeater_pair(&root_a, &root_b, &repeater_root, port).await;
+        let mut options_a = options("particle-a", 0, root_a.clone(), None);
+        let mut options_b = options("particle-b", 0, root_b.clone(), None);
+        options_a.relay_only = true;
+        options_b.relay_only = true;
+        let (a, _) = Particle::start(options_a, None).await.unwrap();
+        let (b, _) = Particle::start(options_b, None).await.unwrap();
+        wait_for_repeater(&a, &b).await;
+        for particle in [&a, &b] {
+            assert_eq!(
+                particle.find_particles(&json!({}))["self"]["repeater"],
+                json!({"configured": true, "connected": true, "relay_only": true})
+            );
+        }
+        approve_pair(&a, &b, &root_a, &root_b).await;
+
+        for (source, target, value) in [
+            (&a, &b, json!({"from": "a"})),
+            (&b, &a, json!({"from": "b"})),
+        ] {
+            let result = source
+                .sync_state(json!({
+                    "particle_id": target.manifest.particle_id.as_str(),
+                    "state": value,
+                    "timeout_secs": 60
+                }))
+                .await
+                .unwrap();
+            assert_eq!(result["path"], "repeater");
+        }
+
+        let bytes = (0..256 * 1024)
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>();
+        let expected_hash = hex::encode(Sha256::digest(&bytes));
+        for (source, target, filename) in [(&a, &b, "a.bin"), (&b, &a, "b.bin")] {
+            let path = temp.path().join(filename);
+            tokio::fs::write(&path, &bytes).await.unwrap();
+            let result = source
+                .sync_state(json!({
+                    "particle_id": target.manifest.particle_id.as_str(),
+                    "file_path": path,
+                    "timeout_secs": 60
+                }))
+                .await
+                .unwrap();
+            assert_eq!(result["path"], "repeater");
+            assert_eq!(result["sha256"], expected_hash);
+            let receiver_path = target
+                .data_dir
+                .join("inbox")
+                .join(result["sync_id"].as_str().unwrap())
+                .join(filename);
+            assert_eq!(tokio::fs::read(receiver_path).await.unwrap(), bytes);
+        }
+
+        for (node, other) in [(&a, &b), (&b, &a)] {
+            let view = node.find_particles(&json!({}));
+            let peer = view["particles"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|peer| peer["particle_id"] == other.manifest.particle_id.as_str())
+                .unwrap();
+            assert_eq!(peer["state"], "entangled");
+            assert_eq!(peer["path"], "repeater");
+            assert_eq!(peer["via_repeater"], true);
+            assert_eq!(peer["addrs"], json!([]));
+            assert!(!view.to_string().contains("0.0.0.0"));
+        }
+
+        a.shutdown().await;
+        b.shutdown().await;
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn normal_particle_uses_repeater_for_relay_only_peer() {
+        let temp = tempfile::tempdir().unwrap();
+        let temp_root = canonical_temp_root(&temp);
+        let root_a = temp_root.join("a");
+        let root_b = temp_root.join("b");
+        let repeater_root = temp_root.join("repeater");
+        let (server, _, _) =
+            prepare_test_repeater_pair(&root_a, &root_b, &repeater_root, free_port()).await;
+        let options_a = options("particle-a", free_port(), root_a.clone(), None);
+        let mut options_b = options("particle-b", 0, root_b.clone(), None);
+        options_b.relay_only = true;
+        let (a, _) = Particle::start(options_a, None).await.unwrap();
+        let (b, _) = Particle::start(options_b, None).await.unwrap();
+        wait_for_repeater(&a, &b).await;
+        approve_pair(&a, &b, &root_a, &root_b).await;
+
+        let result = a
+            .sync_state(json!({
+                "particle_id": b.manifest.particle_id.as_str(),
+                "state": {"route": "repeater"},
+                "timeout_secs": 60
+            }))
+            .await
+            .unwrap();
+        assert_eq!(result["path"], "repeater");
+        let peer = a.find_particles(&json!({}))["particles"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|peer| peer["particle_id"] == b.manifest.particle_id.as_str())
+            .unwrap()
+            .clone();
+        assert_eq!(peer["path"], "repeater");
+        assert_eq!(peer["addrs"], json!([]));
+
+        a.shutdown().await;
+        b.shutdown().await;
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn failed_direct_noise_handshake_falls_back_to_repeater_before_offer() {
+        let temp = tempfile::tempdir().unwrap();
+        let temp_root = canonical_temp_root(&temp);
+        let root_a = temp_root.join("a");
+        let root_b = temp_root.join("b");
+        let repeater_root = temp_root.join("repeater");
+        let (server, _, _) =
+            prepare_test_repeater_pair(&root_a, &root_b, &repeater_root, free_port()).await;
+        let options_a = options("particle-a", free_port(), root_a.clone(), None);
+        let mut options_b = options("particle-b", 0, root_b.clone(), None);
+        options_b.relay_only = true;
+        let (a, _) = Particle::start(options_a, None).await.unwrap();
+        let (b, _) = Particle::start(options_b, None).await.unwrap();
+        wait_for_repeater(&a, &b).await;
+        approve_pair(&a, &b, &root_a, &root_b).await;
+
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let dead_direct_addr = listener.local_addr().unwrap();
+        let unrelated_listener = tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let _ = socket.write_all(b"not a Noise response").await;
+            }
+        });
+        let mut advertised = a
+            .field
+            .read()
+            .unwrap()
+            .by_id(&b.manifest.particle_id)
+            .unwrap()
+            .resonance;
+        advertised.hostname = "127.0.0.1".into();
+        advertised.addrs = vec![dead_direct_addr.ip()];
+        advertised.port = dead_direct_addr.port();
+        a.field.write().unwrap().resonate(advertised);
+
+        let result = a
+            .sync_state(json!({
+                "particle_id": b.manifest.particle_id.as_str(),
+                "state": {"route": "authenticated fallback"},
+                "timeout_secs": 60
+            }))
+            .await
+            .unwrap();
+        assert_eq!(result["path"], "repeater");
+
+        unrelated_listener.abort();
+        a.shutdown().await;
+        b.shutdown().await;
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn normal_particles_prefer_direct_route_with_repeater_available() {
+        let temp = tempfile::tempdir().unwrap();
+        let temp_root = canonical_temp_root(&temp);
+        let root_a = temp_root.join("a");
+        let root_b = temp_root.join("b");
+        let repeater_root = temp_root.join("repeater");
+        let repeater_port = free_port();
+        let port_a = loop {
+            let port = free_port();
+            if port != repeater_port {
+                break port;
+            }
+        };
+        let port_b = loop {
+            let port = free_port();
+            if port != repeater_port && port != port_a {
+                break port;
+            }
+        };
+        let (server, _, _) =
+            prepare_test_repeater_pair(&root_a, &root_b, &repeater_root, repeater_port).await;
+        let options_a = options(
+            "particle-a",
+            port_a,
+            root_a.clone(),
+            Some(format!("127.0.0.1:{port_b}")),
+        );
+        let options_b = options(
+            "particle-b",
+            port_b,
+            root_b.clone(),
+            Some(format!("127.0.0.1:{port_a}")),
+        );
+        let (a, _) = Particle::start(options_a, None).await.unwrap();
+        let (b, _) = Particle::start(options_b, None).await.unwrap();
+        wait_for_repeater(&a, &b).await;
+        approve_pair(&a, &b, &root_a, &root_b).await;
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if a.field
+                    .read()
+                    .unwrap()
+                    .by_id(&b.manifest.particle_id)
+                    .is_some_and(|peer| !peer.resonance.addrs.is_empty())
+                {
+                    break;
+                }
+                sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("direct Hello should preserve a usable TCP address");
+
+        let result = a
+            .sync_state(json!({
+                "particle_id": b.manifest.particle_id.as_str(),
+                "state": {"route": "direct"},
+                "timeout_secs": 60
+            }))
+            .await
+            .unwrap();
+        assert_eq!(result["path"], "direct");
+
+        a.shutdown().await;
+        b.shutdown().await;
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn relay_only_particles_reconnect_after_repeater_restart() {
+        let temp = tempfile::tempdir().unwrap();
+        let temp_root = canonical_temp_root(&temp);
+        let root_a = temp_root.join("a");
+        let root_b = temp_root.join("b");
+        let repeater_root = temp_root.join("repeater");
+        let port = free_port();
+        let (server, url, repeater_public) =
+            prepare_test_repeater_pair(&root_a, &root_b, &repeater_root, port).await;
+        let mut options_a = options("particle-a", 0, root_a.clone(), None);
+        let mut options_b = options("particle-b", 0, root_b.clone(), None);
+        options_a.relay_only = true;
+        options_b.relay_only = true;
+        let (a, _) = Particle::start(options_a, None).await.unwrap();
+        let (b, _) = Particle::start(options_b, None).await.unwrap();
+        for particle in [&a, &b] {
+            particle.reconnect_base_ms.store(100, Ordering::Relaxed);
+            particle.reconnect_cap_ms.store(400, Ordering::Relaxed);
+            particle
+                .repeater_directory_poll_ms
+                .store(100, Ordering::Relaxed);
+        }
+        wait_for_repeater(&a, &b).await;
+        approve_pair(&a, &b, &root_a, &root_b).await;
+
+        server.abort();
+        let _ = server.await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let a_connected =
+                    a.find_particles(&json!({}))["self"]["repeater"]["connected"] == true;
+                let b_connected =
+                    b.find_particles(&json!({}))["self"]["repeater"]["connected"] == true;
+                if !a_connected && !b_connected {
+                    break;
+                }
+                sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("both nodes should observe the repeater disconnect");
+
+        let (server, restarted_url, restarted_public) =
+            start_test_repeater(repeater_root, port).await;
+        assert_eq!(restarted_url, url);
+        assert_eq!(restarted_public, repeater_public);
+        wait_for_repeater(&a, &b).await;
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let a_entangled = a
+                    .field
+                    .read()
+                    .unwrap()
+                    .by_id(&b.manifest.particle_id)
+                    .is_some_and(|peer| peer.state == PeerState::Entangled);
+                let b_entangled = b
+                    .field
+                    .read()
+                    .unwrap()
+                    .by_id(&a.manifest.particle_id)
+                    .is_some_and(|peer| peer.state == PeerState::Entangled);
+                if a_entangled && b_entangled {
+                    break;
+                }
+                sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("both peers should re-establish their approved link");
+        let result = a
+            .sync_state(json!({
+                "particle_id": b.manifest.particle_id.as_str(),
+                "state": {"after_restart": true},
+                "timeout_secs": 60
+            }))
+            .await
+            .unwrap();
+        assert_eq!(result["path"], "repeater");
+
+        a.shutdown().await;
+        b.shutdown().await;
+        server.abort();
+        let _ = server.await;
     }
 }

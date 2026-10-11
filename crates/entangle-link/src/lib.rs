@@ -334,6 +334,18 @@ pub async fn serve_io(
     serve_connection(stream, peer, handler).await
 }
 
+/// Opens a route and completes only the Noise handshake, without sending Hello.
+pub async fn connect_secure(
+    route: &Route,
+    keys: KeySlot,
+    duration: Duration,
+) -> Result<SecureStream, LinkError> {
+    let keys = current_keys(&keys)?;
+    timeout(duration, connect_route(route, &keys, duration))
+        .await
+        .map_err(|_| LinkError::Timeout)?
+}
+
 /// Connects to a peer, exchanges manifests, and returns its static key.
 pub async fn handshake(
     route: &Route,
@@ -419,10 +431,24 @@ pub async fn recv_verify(stream: &mut SecureStream) -> Result<VerifyMessage, Lin
     }
 }
 
-/// Sends a sync offer, streams exactly its declared bytes, and waits for completion.
+/// Opens a link, sends a sync offer, streams its declared bytes, and waits for completion.
 pub async fn offer<R>(
     route: &Route,
     keys: KeySlot,
+    offer: SyncOffer,
+    source: R,
+    duration: Duration,
+) -> Result<OfferOutcome, LinkError>
+where
+    R: AsyncRead + Unpin + Send,
+{
+    let stream = connect_secure(route, keys, duration).await?;
+    offer_on(stream, offer, source, duration).await
+}
+
+/// Sends a sync offer over an already-authenticated link stream.
+pub async fn offer_on<R>(
+    mut stream: SecureStream,
     offer: SyncOffer,
     mut source: R,
     duration: Duration,
@@ -430,11 +456,10 @@ pub async fn offer<R>(
 where
     R: AsyncRead + Unpin + Send,
 {
-    let keys = current_keys(&keys)?;
     timeout(duration, async {
-        let mut stream = connect_route(route, &keys, duration).await?;
         let sync_id = offer.sync_id.clone();
-        write_frame(&mut stream, &offer.clone().into()).await?;
+        let size = offer.size;
+        write_frame(&mut stream, &offer.into()).await?;
         match read_frame(&mut stream).await? {
             Frame::SyncAccept { sync_id: accepted } if accepted == sync_id => {}
             Frame::SyncReject {
@@ -444,7 +469,7 @@ where
             frame => return Err(LinkError::Unexpected(format!("{frame:?}"))),
         }
 
-        send_payload(&mut stream, &mut source, offer.size).await?;
+        send_payload(&mut stream, &mut source, size).await?;
         match read_frame(&mut stream).await? {
             Frame::SyncComplete {
                 sync_id: completed,
@@ -541,6 +566,15 @@ async fn serve_connection(
             }
             Ok(())
         }
+        frame => match offer_from_frame(frame) {
+            Ok(offer) => serve_offer(&mut stream, &peer, &handler, offer).await,
+            Err(frame) => Err(LinkError::Unexpected(format!("{frame:?}"))),
+        },
+    }
+}
+
+fn offer_from_frame(frame: Frame) -> Result<SyncOffer, Box<Frame>> {
+    match frame {
         Frame::SyncOffer {
             from,
             sync_id,
@@ -550,55 +584,55 @@ async fn serve_connection(
             size,
             sha256,
             label,
-        } => {
-            let offer = SyncOffer {
-                from,
-                sync_id: sync_id.clone(),
-                timeout_secs,
-                kind,
-                name,
-                size,
-                sha256,
-                label,
+        } => Ok(SyncOffer {
+            from,
+            sync_id,
+            timeout_secs,
+            kind,
+            name,
+            size,
+            sha256,
+            label,
+        }),
+        frame => Err(Box::new(frame)),
+    }
+}
+
+async fn serve_offer(
+    stream: &mut SecureStream,
+    peer: &PeerInfo,
+    handler: &std::sync::Arc<dyn LinkHandler>,
+    offer: SyncOffer,
+) -> Result<(), LinkError> {
+    let sync_id = offer.sync_id.clone();
+    match handler.on_offer(peer, offer.clone()).await? {
+        SyncDecision::Reject(reason) => {
+            write_frame(stream, &Frame::SyncReject { sync_id, reason }).await
+        }
+        SyncDecision::Accept => {
+            write_frame(
+                stream,
+                &Frame::SyncAccept {
+                    sync_id: sync_id.clone(),
+                },
+            )
+            .await?;
+            let duration =
+                Duration::from_secs(offer.timeout_secs.clamp(MIN_TIMEOUT_SECS, MAX_TIMEOUT_SECS));
+            let result = {
+                let mut payload = PayloadReader::new(stream, offer.size);
+                match timeout(duration, handler.on_accepted(peer, offer, &mut payload)).await {
+                    Ok(Ok(hash)) if payload.is_complete() => Ok(hash),
+                    Ok(Ok(_)) => Err("payload ended before the offered size".to_owned()),
+                    Ok(Err(reason)) => Err(reason),
+                    Err(_) => Err("payload transfer timed out".to_owned()),
+                }
             };
-            match handler.on_offer(&peer, offer.clone()).await? {
-                SyncDecision::Reject(reason) => {
-                    write_frame(&mut stream, &Frame::SyncReject { sync_id, reason }).await
-                }
-                SyncDecision::Accept => {
-                    write_frame(
-                        &mut stream,
-                        &Frame::SyncAccept {
-                            sync_id: sync_id.clone(),
-                        },
-                    )
-                    .await?;
-                    let duration = Duration::from_secs(
-                        offer.timeout_secs.clamp(MIN_TIMEOUT_SECS, MAX_TIMEOUT_SECS),
-                    );
-                    let result = {
-                        let mut payload = PayloadReader::new(&mut stream, offer.size);
-                        match timeout(duration, handler.on_accepted(&peer, offer, &mut payload))
-                            .await
-                        {
-                            Ok(Ok(hash)) if payload.is_complete() => Ok(hash),
-                            Ok(Ok(_)) => Err("payload ended before the offered size".to_owned()),
-                            Ok(Err(reason)) => Err(reason),
-                            Err(_) => Err("payload transfer timed out".to_owned()),
-                        }
-                    };
-                    match result {
-                        Ok(sha256) => {
-                            write_frame(&mut stream, &Frame::SyncComplete { sync_id, sha256 }).await
-                        }
-                        Err(reason) => {
-                            write_frame(&mut stream, &Frame::SyncFailed { sync_id, reason }).await
-                        }
-                    }
-                }
+            match result {
+                Ok(sha256) => write_frame(stream, &Frame::SyncComplete { sync_id, sha256 }).await,
+                Err(reason) => write_frame(stream, &Frame::SyncFailed { sync_id, reason }).await,
             }
         }
-        frame => Err(LinkError::Unexpected(format!("{frame:?}"))),
     }
 }
 
@@ -931,6 +965,27 @@ mod tests {
                 }
             );
         }
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn sync_offer_after_hello_is_rejected_to_preserve_wire_compatibility() {
+        let key = keys();
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let (address, task) = start_listener(
+            key.clone(),
+            Arc::new(accepting_handler(manifest(), Arc::clone(&received))),
+        )
+        .await;
+        let route = Route::Direct(address);
+        let (_, _, stream) =
+            handshake_stream(&route, key_slot(&key), &manifest(), Duration::from_secs(2))
+                .await
+                .unwrap();
+
+        let result = offer_on(stream, make_offer(1), &b"x"[..], Duration::from_secs(2)).await;
+        assert!(result.is_err());
+        assert!(received.lock().unwrap().is_empty());
         task.abort();
     }
 

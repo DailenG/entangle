@@ -626,10 +626,6 @@ fn atomic_write(path: &Path, contents: &[u8]) -> Result<(), TrustError> {
 }
 
 fn replace_file(temporary: &Path, destination: &Path) -> io::Result<()> {
-    #[cfg(windows)]
-    if destination.exists() {
-        fs::remove_file(destination)?;
-    }
     fs::rename(temporary, destination)
 }
 
