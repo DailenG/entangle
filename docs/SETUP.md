@@ -199,13 +199,70 @@ A Quantum Repeater can carry end-to-end encrypted links when devices cannot
 connect directly. Run a repeater on a host reachable by both devices. Keep
 its state directory private and leave the server running.
 
+Using `ws://` is sufficient for confidentiality because device links are
+end-to-end Noise-encrypted; `wss`/TLS support via a reverse proxy is planned.
+
 On the host, choose an address reachable by the devices and start the relay.
-The host prints a short public-key fingerprint; keep the repeater state
-directory private and leave the process running:
+The host prints a short public-key fingerprint:
 
 ```sh
 entangle repeater serve --listen 0.0.0.0:7338
 ```
+
+### Run the repeater as a service
+
+#### systemd (Linux)
+
+Create the service account and install Entangle:
+
+```sh
+sudo useradd --system --create-home --home-dir /var/lib/entangle --shell /usr/sbin/nologin entangle
+curl -fsSL https://raw.githubusercontent.com/DailenG/entangle/main/install.sh | sh
+sudo install -m 0755 ~/.local/bin/entangle /usr/local/bin/entangle
+```
+
+The installer places the binary at `~/.local/bin/entangle` by default.
+System services should not run binaries from a home directory; on SELinux
+systems such as Oracle Linux, systemd can refuse them with `203/EXEC`.
+
+Install and start the unit:
+
+```sh
+sudo install -m 0644 deploy/systemd/entangle-repeater.service /etc/systemd/system/entangle-repeater.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now entangle-repeater
+```
+
+Allow TCP 7338 in the host firewall (for example,
+`sudo ufw allow 7338/tcp`) and in the cloud provider's firewall or security
+group. Check the repeater fingerprint with
+`sudo journalctl -u entangle-repeater`.
+
+Run host-side enrollment commands as the service account:
+
+```sh
+sudo -u entangle env HOME=/var/lib/entangle /usr/local/bin/entangle repeater invite --url ws://HOST:7338/entangle
+sudo -u entangle env HOME=/var/lib/entangle /usr/local/bin/entangle repeater devices
+sudo -u entangle env HOME=/var/lib/entangle /usr/local/bin/entangle repeater revoke <fingerprint>
+```
+
+#### Docker
+
+Build from the repository root and run with a persistent named volume:
+
+```sh
+docker build -t entangle-repeater .
+docker run -d --name entangle-repeater --restart unless-stopped -p 7338:7338 -v entangle-repeater:/var/lib/entangle entangle-repeater
+```
+
+Create host invitations with:
+
+```sh
+docker exec -it entangle-repeater entangle repeater invite --url ws://HOST:7338/entangle
+```
+
+The `entangle-repeater` volume contains the repeater's private key and
+enrollments; back it up and keep it private.
 
 In a human terminal on the host, create a single-use invitation. Share the
 resulting code with the device operator through a trusted human channel; the

@@ -1,0 +1,40 @@
+# Install as /etc/systemd/system/entangle-repeater.service.
+# See docs/SETUP.md for service setup, firewall, and host-side commands.
+[Unit]
+Description=Entangle Quantum Repeater
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=entangle
+Group=entangle
+Environment=HOME=/var/lib/entangle
+WorkingDirectory=/var/lib/entangle
+ExecStart=/usr/local/bin/entangle repeater serve --listen 0.0.0.0:7338
+Restart=on-failure
+RestartSec=5
+UMask=0077
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/entangle
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+
+[Install]
+WantedBy=multi-user.target
