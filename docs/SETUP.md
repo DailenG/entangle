@@ -193,8 +193,6 @@ and `entangle peer emoji` only.
 Received items survive Entangle restarts and MCP client reloads until they are
 collapsed. Collapsing removes the inbox entry; received files remain on disk.
 
-## Troubleshooting
-
 ## Using a repeater
 
 A Quantum Repeater can carry end-to-end encrypted links when devices cannot
@@ -247,6 +245,8 @@ entangle repeater status
 The repeater forwards the end-to-end encrypted link bytes and cannot read
 sync content, pairing keys, or SAS values. It does learn enrolled static
 public keys, declared group IDs, connection timing, and traffic sizes.
+
+## Troubleshooting
 
 - **No peers appear:** check UDP 5353, multicast/VLAN policy, and Wi-Fi client
   isolation. Use `--peer host:7337` when multicast is blocked; `--peer` can be
