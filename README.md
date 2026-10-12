@@ -68,8 +68,12 @@ a temporary ID while the first server is running. See
 and a two-machine smoke test.
 
 The MCP tools are `find_entangled_particles`, `sync_entangled_state`, and
-`observe_entangled_states`. The standalone commands are `entangle serve`
-(default), `entangle node`, and `entangle scan`.
+`observe_entangled_states`. `sync_entangled_state` can target one particle,
+up to 32 selected particles, or every other member of a group; an optional
+group pins a send to that group's authenticated link. Received inbox items
+include their group name, and `observe_entangled_states` can filter by group.
+The standalone commands are `entangle serve` (default), `entangle node`, and
+`entangle scan`.
 
 ## Design and security
 

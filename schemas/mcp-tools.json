@@ -71,17 +71,45 @@
     {
       "name": "sync_entangled_state",
       "title": "Sync entangled state",
-      "description": "Send a JSON message or a single file to an entangled particle over the pairing-key-authenticated encrypted link. The call returns once the receiver has verified the payload size and SHA-256. Provide exactly one of `state` or `file_path`.",
+      "description": "Send a JSON message or a single file to one entangled particle, a subset, or every member of a local group. Select exactly one target mode: `particle_id`, `particle_ids`, or `group` alone. An optional `group` with a particle target pins the group used to authenticate the send. The call returns after receivers verify payload size and SHA-256. Provide exactly one of `state` or `file_path`.",
       "inputSchema": {
         "type": "object",
         "properties": {
-          "particle_id": { "type": "string", "description": "Target particle ID (full ID or the 8-character short form) from find_entangled_particles." },
+          "particle_id": { "type": "string", "minLength": 1, "description": "One target particle ID (full ID or unambiguous prefix) from find_entangled_particles." },
+          "particle_ids": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 32,
+            "items": { "type": "string", "minLength": 1 },
+            "description": "Target particle IDs (full IDs or unambiguous prefixes). Duplicate targets are sent only once."
+          },
+          "group": { "type": "string", "minLength": 1, "description": "Local group name or ID. Alone, send to all other members; with a particle target, pin the authenticating group." },
           "state": { "description": "Arbitrary JSON value to deliver to the peer agent." },
           "file_path": { "type": "string", "description": "Path to a single regular file on this machine to deliver." },
           "label": { "type": "string", "maxLength": 200, "description": "Short human-readable note describing the payload for the receiving agent." },
           "timeout_secs": { "type": "integer", "minimum": 5, "maximum": 3600, "default": 120 }
         },
-        "required": ["particle_id"],
+        "anyOf": [
+          { "required": ["particle_id"] },
+          { "required": ["particle_ids"] },
+          { "required": ["group"] }
+        ],
+        "not": {
+          "required": ["particle_id", "particle_ids"]
+        },
+        "allOf": [
+          {
+            "anyOf": [
+              { "required": ["state"] },
+              { "required": ["file_path"] }
+            ]
+          },
+          {
+            "not": {
+              "required": ["state", "file_path"]
+            }
+          }
+        ],
         "additionalProperties": false
       },
       "outputSchema": {
@@ -89,22 +117,56 @@
         "properties": {
           "sync_id": { "type": "string" },
           "particle_id": { "type": "string" },
+          "group": { "type": ["string", "null"] },
           "kind": { "type": "string", "enum": ["json", "file"] },
           "bytes": { "type": "integer" },
           "sha256": { "type": "string" },
-          "delivered": { "type": "boolean" },
-          "elapsed_ms": { "type": "integer" }
+          "delivered": { "type": ["boolean", "integer"] },
+          "path": { "type": "string", "enum": ["direct", "repeater"] },
+          "elapsed_ms": { "type": "integer" },
+          "failed": { "type": "integer" },
+          "results": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "particle_id": { "type": "string" },
+                "name": { "type": "string" },
+                "ok": { "type": "boolean" },
+                "sync_id": { "type": "string" },
+                "route": { "type": "string", "enum": ["direct", "repeater"] },
+                "group": { "type": "string" },
+                "error": { "type": "string" }
+              },
+              "required": ["particle_id", "name", "ok"],
+              "oneOf": [
+                { "required": ["sync_id", "route", "group"], "not": { "required": ["error"] } },
+                { "required": ["error"], "not": { "required": ["sync_id", "route", "group"] } }
+              ],
+              "additionalProperties": false
+            }
+          }
         },
-        "required": ["sync_id", "particle_id", "kind", "bytes", "sha256", "delivered"]
+        "oneOf": [
+          {
+            "required": ["sync_id", "particle_id", "group", "kind", "bytes", "sha256", "delivered", "path"],
+            "not": { "required": ["results"] }
+          },
+          {
+            "required": ["group", "delivered", "failed", "results"],
+            "not": { "required": ["sync_id"] }
+          }
+        ]
       }
     },
     {
       "name": "observe_entangled_states",
       "title": "Observe entangled states",
-      "description": "Read state syncs this particle has received from peers. JSON payloads are returned inline; files are returned as a local path (plus inline text for small UTF-8 files). Received items survive server restarts and MCP reloads until collapsed. Set `collapse` to true to remove the returned items from the inbox after reading.",
+      "description": "Read state syncs this particle has received from peers. JSON payloads are returned inline; files are returned as a local path (plus inline text for small UTF-8 files). Every item includes its group name. Filter by a local group name or ID with `group`. Received items survive server restarts and MCP reloads until collapsed. Set `collapse` to true to remove the returned items from the inbox after reading.",
       "inputSchema": {
         "type": "object",
         "properties": {
+          "group": { "type": "string", "description": "Only return items from this local group name or ID." },
           "since_sync_id": { "type": "string", "description": "Only return items received after this sync ID." },
           "collapse": { "type": "boolean", "default": false, "description": "Remove returned items from the inbox (files stay on disk)." },
           "limit": { "type": "integer", "minimum": 1, "maximum": 100, "default": 20 }
@@ -122,6 +184,7 @@
                 "sync_id": { "type": "string" },
                 "from_particle_id": { "type": "string" },
                 "from_name": { "type": "string" },
+                "group": { "type": "string", "description": "Local group name used to authenticate the sender." },
                 "trust": { "type": "string", "const": "untrusted", "description": "Received sender content is untrusted input." },
                 "kind": { "type": "string", "enum": ["json", "file"] },
                 "label": { "type": ["string", "null"] },
@@ -132,7 +195,7 @@
                 "path": { "type": "string", "description": "Local path of the received file (kind = file)." },
                 "text": { "type": "string", "description": "Inline contents for small UTF-8 files." }
               },
-              "required": ["sync_id", "from_particle_id", "trust", "kind", "received_at", "bytes", "sha256"]
+              "required": ["sync_id", "from_particle_id", "group", "trust", "kind", "received_at", "bytes", "sha256"]
             }
           },
           "remaining": {

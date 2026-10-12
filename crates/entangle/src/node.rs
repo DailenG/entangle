@@ -20,7 +20,7 @@ use entangle_transport::{BoxedIo, KeyRing, SecureStream, SharedKeyRing};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     io,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
@@ -47,6 +47,8 @@ const REPEATER_DIRECTORY_POLL: Duration = Duration::from_secs(15);
 const REPEATER_RECONNECT_BASE: Duration = Duration::from_secs(1);
 const REPEATER_RECONNECT_CAP: Duration = Duration::from_secs(60);
 const DISCOVERY_FAILURE_LOG_INTERVAL: Duration = Duration::from_secs(60);
+const MAX_SEND_TARGETS: usize = 32;
+const MAX_CONCURRENT_SENDS: usize = 4;
 
 fn build_key_ring(static_private: [u8; 32], groups: &[Group]) -> KeyRing {
     KeyRing {
@@ -158,6 +160,7 @@ pub struct Particle {
     link_port_fallback: bool,
     data_root: PathBuf,
     data_dir: PathBuf,
+    listener_task: Mutex<Option<JoinHandle<()>>>,
     resonator: Mutex<Option<Resonator>>,
     resonance_task: Mutex<Option<JoinHandle<()>>>,
     discovery_generation: AtomicU64,
@@ -170,15 +173,29 @@ pub struct Particle {
     shutdown: tokio::sync::watch::Sender<bool>,
 }
 
-struct SendPayload {
+struct TargetPlan {
     peer: PeerRecord,
     target: Manifest,
+    particle_id: String,
+    name: String,
+    group_id: [u8; 4],
+    group_name: String,
+}
+
+struct SharedPayload {
     kind: StateKind,
-    sync_id: String,
     path: PathBuf,
     name: String,
-    args: Value,
+    size: u64,
+    sha256: String,
+    label: Option<String>,
     timeout_secs: u64,
+}
+
+struct SentState {
+    sync_id: String,
+    route: &'static str,
+    elapsed_ms: u128,
 }
 
 impl Particle {
@@ -266,6 +283,7 @@ impl Particle {
             link_port_fallback,
             data_root: root,
             data_dir,
+            listener_task: Mutex::new(None),
             resonator: Mutex::new(None),
             resonance_task: Mutex::new(None),
             discovery_generation: AtomicU64::new(0),
@@ -281,7 +299,13 @@ impl Particle {
             particle.log_discovery_failure(&error);
         }
         if let Some(listener) = listener {
-            tokio::spawn(listener.run(particle.keys.clone(), particle.clone()));
+            let listener_node = particle.clone();
+            let listener_task = tokio::spawn(async move {
+                let _ = listener
+                    .run(listener_node.keys.clone(), listener_node.clone())
+                    .await;
+            });
+            *particle.listener_task.lock().await = Some(listener_task);
         }
         let group_node = particle.clone();
         tokio::spawn(async move { group_node.group_watch().await });
@@ -965,10 +989,14 @@ impl Particle {
         let _ = tokio::signal::ctrl_c().await;
     }
 
-    /// Unregisters this particle from mDNS.
+    /// Stops this particle's listener and unregisters it from mDNS.
     pub async fn shutdown(&self) {
         let _ = self.shutdown.send(true);
         self.discovery_generation.fetch_add(1, Ordering::SeqCst);
+        if let Some(task) = self.listener_task.lock().await.take() {
+            task.abort();
+            let _ = task.await;
+        }
         if let Some(task) = self.resonance_task.lock().await.take() {
             task.abort();
         }
@@ -1055,6 +1083,20 @@ impl Particle {
             .get("collapse")
             .and_then(Value::as_bool)
             .unwrap_or(false);
+        let group_names: HashMap<String, String> = self
+            .groups
+            .read()
+            .expect("group store lock")
+            .iter()
+            .map(|group| (group.id.clone(), group.meta.name.clone()))
+            .collect();
+        let render_group = |stored: &str| {
+            group_names
+                .get(stored)
+                .cloned()
+                .unwrap_or_else(|| stored.to_owned())
+        };
+        let group_filter = args.get("group").and_then(Value::as_str).map(&render_group);
         let mut inbox = self.inbox.lock().await;
         let start = match since {
             Some(id) => inbox
@@ -1063,7 +1105,17 @@ impl Particle {
                 .map_or(inbox.len(), |index| index + 1),
             None => 0,
         };
-        let selected: Vec<_> = inbox.iter().skip(start).take(limit).cloned().collect();
+        let selected: Vec<_> = inbox
+            .iter()
+            .skip(start)
+            .filter(|item| {
+                group_filter
+                    .as_ref()
+                    .is_none_or(|group| render_group(&item.group) == group.as_str())
+            })
+            .take(limit)
+            .cloned()
+            .collect();
         let collapsed_ids = if collapse {
             let ids: Vec<_> = selected.iter().map(|item| item.sync_id.clone()).collect();
             inbox.retain(|item| !ids.contains(&item.sync_id));
@@ -1080,7 +1132,7 @@ impl Particle {
                     "sync_id": item.sync_id,
                     "from_particle_id": item.from_particle_id,
                     "from_name": item.from_name,
-                    "group": item.group,
+                    "group": render_group(&item.group),
                     "kind": item.kind,
                     "label": item.label,
                     "received_at": item.received_at,
@@ -1104,71 +1156,264 @@ impl Particle {
         json!({ "states": states, "remaining": remaining })
     }
 
-    /// Sends a JSON or file payload to an already-entangled peer.
-    pub async fn sync_state(&self, args: Value) -> Result<Value, String> {
-        if self.keys.read().expect("key ring lock").groups.is_empty() {
-            return Err("the peer isn't a member of any shared group".into());
+    fn group_label(&self, stored: &str) -> String {
+        self.groups
+            .read()
+            .expect("group store lock")
+            .iter()
+            .find(|group| group.id == stored)
+            .map_or_else(|| stored.to_owned(), |group| group.meta.name.clone())
+    }
+
+    fn resolve_group_member(
+        groups: &[Group],
+        identifier: &str,
+    ) -> Result<Option<(String, String)>, String> {
+        let mut matches: Vec<(String, String)> = Vec::new();
+        for member in groups.iter().flat_map(|group| &group.members) {
+            if member.particle_id.starts_with(identifier)
+                && !matches
+                    .iter()
+                    .any(|(particle_id, _)| particle_id == &member.particle_id)
+            {
+                matches.push((member.particle_id.clone(), member.name.clone()));
+            }
         }
-        let peer_id = args
-            .get("particle_id")
-            .and_then(Value::as_str)
-            .ok_or_else(|| "particle_id is required".to_owned())?;
+        if let Some(exact) = matches
+            .iter()
+            .find(|(particle_id, _)| particle_id == identifier)
+        {
+            return Ok(Some(exact.clone()));
+        }
+        match matches.len() {
+            0 => Ok(None),
+            1 => Ok(matches.into_iter().next()),
+            _ => Err(format!("ambiguous particle ID: {identifier}")),
+        }
+    }
+
+    fn plan_target(
+        &self,
+        identifier: &str,
+        pinned: Option<&Group>,
+        fan_out: bool,
+    ) -> Result<TargetPlan, String> {
+        let unreachable = || {
+            if fan_out {
+                "not reachable right now".to_owned()
+            } else {
+                "the peer isn't a member of any shared group".to_owned()
+            }
+        };
+        if let Some(group) = pinned {
+            if !group
+                .members
+                .iter()
+                .any(|member| member.particle_id == identifier)
+            {
+                return Err(format!("not a member of {}", group.meta.name));
+            }
+        }
+        let (peer, bound_key) = {
+            let id = ParticleId::parse(identifier.to_owned())
+                .map_err(|_| "the peer isn't a member of any shared group".to_owned())?;
+            let field = self.field.read().map_err(|_| "peer field lock poisoned")?;
+            let peer = field
+                .resolve(identifier)
+                .into_iter()
+                .next()
+                .filter(|peer| peer.resonance.particle_id == id)
+                .ok_or_else(unreachable)?;
+            let bound_key = field.binding(&peer.resonance.particle_id);
+            (peer, bound_key)
+        };
+        let particle_id = peer.resonance.particle_id.as_str().to_owned();
+        let static_key = peer.static_key.ok_or_else(unreachable)?;
+        if bound_key != Some(static_key) || peer.state != PeerState::Entangled {
+            return Err(unreachable());
+        }
+        let (group_id, group_name) = match pinned {
+            Some(group) => {
+                let member = group.members.iter().any(|member| {
+                    member.particle_id == particle_id
+                        && member.static_key == hex::encode(static_key)
+                });
+                if !member {
+                    return Err(format!("not a member of {}", group.meta.name));
+                }
+                (groups::group_id_bytes(&group.key), group.meta.name.clone())
+            }
+            None => {
+                let group_id = self
+                    .select_peer_group(&peer, &static_key)
+                    .ok_or_else(|| "the peer isn't a member of any shared group".to_owned())?;
+                (group_id, self.group_label(&hex::encode(group_id)))
+            }
+        };
+        let target = peer.manifest.clone().ok_or_else(unreachable)?;
+        Ok(TargetPlan {
+            particle_id,
+            name: peer.resonance.name.clone(),
+            peer,
+            target,
+            group_id,
+            group_name,
+        })
+    }
+
+    /// Sends a JSON or file payload to one peer, a subset of peers, or a whole group.
+    pub async fn sync_state(self: &Arc<Self>, args: Value) -> Result<Value, String> {
         let has_state = args.get("state").is_some();
         let has_file = args.get("file_path").is_some();
         if has_state == has_file {
             return Err("provide exactly one of state or file_path".into());
         }
-        let peer = {
-            let peers = self
-                .field
-                .read()
-                .map_err(|_| "peer field lock poisoned".to_owned())?;
-            let matched = peers.resolve(peer_id);
-            if matched.is_empty() {
-                return Err("the peer isn't a member of any shared group".into());
-            }
-            if matched.len() > 1 {
-                return Err(format!("ambiguous particle ID: {peer_id}"));
-            }
-            matched.into_iter().next().unwrap()
-        };
-        let target_peer_id = peer.resonance.particle_id.clone();
-        if peer.state != PeerState::Entangled
-            || peer.static_key.is_none_or(|key| {
-                self.group_names_for_peer(peer.resonance.particle_id.as_str(), &key)
-                    .is_empty()
-            })
-        {
-            return Err("the peer isn't a member of any shared group".into());
+        let single = args.get("particle_id");
+        let subset = args.get("particle_ids");
+        if single.is_some() && subset.is_some() {
+            return Err("provide either particle_id or particle_ids, not both".into());
         }
-        let target = peer
-            .manifest
-            .clone()
-            .ok_or_else(|| "peer manifest missing".to_owned())?;
+        if single.is_none() && subset.is_none() && args.get("group").is_none() {
+            return Err("provide exactly one of particle_id, particle_ids, or group".into());
+        }
+        let local_groups = self.groups.read().expect("group store lock").clone();
+        let pinned = match args.get("group") {
+            Some(value) => {
+                let name = value
+                    .as_str()
+                    .ok_or_else(|| "group must be a group name or ID".to_owned())?;
+                Some(
+                    local_groups
+                        .iter()
+                        .find(|group| group.meta.name == name || group.id == name)
+                        .cloned()
+                        .ok_or_else(|| format!("this machine isn't in a group named {name}"))?,
+                )
+            }
+            None => None,
+        };
+        let identifiers = if let Some(value) = single {
+            vec![value
+                .as_str()
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| "particle_id must be a particle ID".to_owned())?
+                .to_owned()]
+        } else if let Some(value) = subset {
+            let entries = value
+                .as_array()
+                .ok_or_else(|| "particle_ids must be an array of particle IDs".to_owned())?;
+            if entries.is_empty() || entries.len() > MAX_SEND_TARGETS {
+                return Err(format!(
+                    "particle_ids must contain between 1 and {MAX_SEND_TARGETS} particle IDs"
+                ));
+            }
+            entries
+                .iter()
+                .map(|entry| {
+                    entry
+                        .as_str()
+                        .filter(|value| !value.is_empty())
+                        .map(str::to_owned)
+                        .ok_or_else(|| "particle_ids must contain particle IDs".to_owned())
+                })
+                .collect::<Result<Vec<_>, String>>()?
+        } else {
+            let group = pinned.as_ref().ok_or_else(|| {
+                "provide exactly one of particle_id, particle_ids, or group".to_owned()
+            })?;
+            let members: Vec<String> = group
+                .members
+                .iter()
+                .filter(|member| member.particle_id != self.manifest.particle_id.as_str())
+                .map(|member| member.particle_id.clone())
+                .collect();
+            if members.is_empty() {
+                return Err(format!("group {} has no other members", group.meta.name));
+            }
+            members
+        };
+        let fan_out = single.is_none();
+        let mut seen = HashSet::new();
+        let mut seen_inputs = HashSet::new();
+        let mut plans = Vec::new();
+        let mut failures = Vec::new();
+        for identifier in identifiers {
+            if !seen_inputs.insert(identifier.clone()) {
+                continue;
+            }
+            let (particle_id, member_name) =
+                match Self::resolve_group_member(&local_groups, &identifier) {
+                    Ok(Some(member)) => member,
+                    Ok(None) => {
+                        failures.push((
+                            identifier.clone(),
+                            identifier.clone(),
+                            pinned.as_ref().map_or_else(
+                                || "the peer isn't a member of any shared group".to_owned(),
+                                |group| format!("not a member of {}", group.meta.name),
+                            ),
+                        ));
+                        continue;
+                    }
+                    Err(error) => {
+                        failures.push((identifier.clone(), identifier, error));
+                        continue;
+                    }
+                };
+            if !seen.insert(particle_id.clone()) {
+                continue;
+            }
+            if particle_id == self.manifest.particle_id.as_str() {
+                if fan_out {
+                    continue;
+                }
+                failures.push((
+                    particle_id,
+                    member_name,
+                    "cannot send state to this machine".to_owned(),
+                ));
+                continue;
+            }
+            match self.plan_target(&particle_id, pinned.as_ref(), fan_out) {
+                Ok(plan) => plans.push(plan),
+                Err(error) => failures.push((particle_id, member_name, error)),
+            }
+        }
+        if plans.is_empty() {
+            if !fan_out {
+                return Err(failures.into_iter().next().map_or_else(
+                    || "the peer isn't a member of any shared group".to_owned(),
+                    |(_, _, error)| error,
+                ));
+            }
+            let reason = failures
+                .iter()
+                .map(|(identifier, _, error)| format!("{identifier}: {error}"))
+                .collect::<Vec<_>>()
+                .join("; ");
+            return Err(format!("no target could be used ({reason})"));
+        }
         let kind = if has_state {
             StateKind::Json
         } else {
             StateKind::File
         };
-        if !target.accepts.contains(&kind) {
-            return Err(format!(
-                "particle does not accept {} payloads",
-                kind_name(&kind)
-            ));
-        }
         let timeout_secs = args
             .get("timeout_secs")
             .and_then(Value::as_u64)
             .unwrap_or(120)
             .clamp(MIN_TIMEOUT_SECS, MAX_TIMEOUT_SECS);
-        let sync_id = uuid::Uuid::new_v4().simple().to_string();
         let (path, name, cleanup) = if has_state {
-            let path = self.data_dir.join("outbox").join(format!("{sync_id}.json"));
+            let payload_id = uuid::Uuid::new_v4().simple().to_string();
+            let path = self
+                .data_dir
+                .join("outbox")
+                .join(format!("{payload_id}.json"));
             let bytes = serde_json::to_vec(&args["state"]).map_err(|e| e.to_string())?;
             tokio::fs::write(&path, bytes)
                 .await
                 .map_err(|e| format!("could not write outbox payload {}: {e}", path.display()))?;
-            (path, format!("{sync_id}.json"), true)
+            (path, format!("{payload_id}.json"), true)
         } else {
             let input = PathBuf::from(args["file_path"].as_str().unwrap_or_default());
             let metadata = tokio::fs::metadata(&input)
@@ -1184,49 +1429,186 @@ impl Particle {
                 .to_owned();
             (input, name, false)
         };
-        let result = self
-            .send_file(SendPayload {
-                peer,
-                target,
-                kind,
-                sync_id,
-                path: path.clone(),
-                name,
-                args,
-                timeout_secs,
-            })
-            .await;
-        if result.is_ok() {
-            if let Ok(mut field) = self.field.write() {
-                field.touch(&target_peer_id);
+        let hashed = hash_file(&path)
+            .await
+            .map_err(|error| format!("could not hash payload {}: {error}", path.display()));
+        let hashed = match hashed {
+            Ok(hashed) => hashed,
+            Err(error) => {
+                if cleanup {
+                    let _ = tokio::fs::remove_file(&path).await;
+                }
+                return Err(error);
             }
-        }
+        };
+        let payload = Arc::new(SharedPayload {
+            kind,
+            path: path.clone(),
+            name,
+            size: hashed.0,
+            sha256: hashed.1,
+            label: args.get("label").and_then(Value::as_str).map(str::to_owned),
+            timeout_secs,
+        });
+        let result = if fan_out {
+            self.fan_out_send(plans, failures, &payload, pinned.as_ref())
+                .await
+        } else {
+            let plan = plans.into_iter().next().expect("one planned target");
+            self.send_file(&plan, &payload).await.map(|sent| {
+                json!({
+                    "sync_id": sent.sync_id,
+                    "particle_id": plan.particle_id,
+                    "group": plan.group_name,
+                    "kind": kind_name(&payload.kind),
+                    "bytes": payload.size,
+                    "sha256": payload.sha256,
+                    "delivered": true,
+                    "path": sent.route,
+                    "elapsed_ms": sent.elapsed_ms
+                })
+            })
+        };
         if cleanup {
             let _ = tokio::fs::remove_file(path).await;
         }
         result
     }
 
-    async fn send_file(&self, payload: SendPayload) -> Result<Value, String> {
-        let SendPayload {
+    async fn fan_out_send(
+        self: &Arc<Self>,
+        plans: Vec<TargetPlan>,
+        mut failures: Vec<(String, String, String)>,
+        payload: &Arc<SharedPayload>,
+        pinned: Option<&Group>,
+    ) -> Result<Value, String> {
+        let mut ready = Vec::new();
+        for plan in plans {
+            if !plan.target.accepts.contains(&payload.kind) {
+                failures.push((
+                    plan.particle_id,
+                    plan.name,
+                    format!(
+                        "particle does not accept {} payloads",
+                        kind_name(&payload.kind)
+                    ),
+                ));
+            } else if payload.size > plan.target.max_payload_bytes {
+                failures.push((
+                    plan.particle_id,
+                    plan.name,
+                    format!(
+                        "payload is {} bytes, exceeding peer limit of {} bytes",
+                        payload.size, plan.target.max_payload_bytes
+                    ),
+                ));
+            } else {
+                ready.push(plan);
+            }
+        }
+        if ready.is_empty() {
+            let reason = failures
+                .iter()
+                .map(|(particle_id, _, error)| format!("{particle_id}: {error}"))
+                .collect::<Vec<_>>()
+                .join("; ");
+            return Err(format!("no target could be used ({reason})"));
+        }
+        let permits = Arc::new(Semaphore::new(MAX_CONCURRENT_SENDS));
+        let mut tasks = tokio::task::JoinSet::new();
+        for plan in ready {
+            let particle = Arc::clone(self);
+            let payload = Arc::clone(payload);
+            let permits = Arc::clone(&permits);
+            tasks.spawn(async move {
+                let _permit = permits.acquire().await;
+                let sent = particle.send_file(&plan, &payload).await;
+                (plan, sent)
+            });
+        }
+        let mut results: Vec<Value> = failures
+            .into_iter()
+            .map(|(particle_id, name, error)| {
+                json!({ "particle_id": particle_id, "name": name, "ok": false, "error": error })
+            })
+            .collect();
+        while let Some(joined) = tasks.join_next().await {
+            let (plan, sent) = joined.map_err(|error| format!("send task failed: {error}"))?;
+            results.push(match sent {
+                Ok(sent) => json!({
+                    "particle_id": plan.particle_id,
+                    "name": plan.name,
+                    "ok": true,
+                    "sync_id": sent.sync_id,
+                    "route": sent.route,
+                    "group": plan.group_name
+                }),
+                Err(error) => json!({
+                    "particle_id": plan.particle_id,
+                    "name": plan.name,
+                    "ok": false,
+                    "error": error
+                }),
+            });
+        }
+        results.sort_by(|left, right| {
+            left["name"]
+                .as_str()
+                .cmp(&right["name"].as_str())
+                .then_with(|| {
+                    left["particle_id"]
+                        .as_str()
+                        .cmp(&right["particle_id"].as_str())
+                })
+        });
+        let delivered = results
+            .iter()
+            .filter(|result| result["ok"] == Value::Bool(true))
+            .count();
+        let failed = results.len() - delivered;
+        Ok(json!({
+            "group": pinned.map(|group| group.meta.name.clone()),
+            "delivered": delivered,
+            "failed": failed,
+            "results": results
+        }))
+    }
+
+    async fn send_file(
+        &self,
+        plan: &TargetPlan,
+        payload: &SharedPayload,
+    ) -> Result<SentState, String> {
+        let TargetPlan {
             peer,
             target,
+            group_id,
+            ..
+        } = plan;
+        let SharedPayload {
             kind,
-            sync_id,
             path,
             name,
-            args,
+            size,
+            sha256,
+            label,
             timeout_secs,
         } = payload;
-        let (size, sha256) = hash_file(&path)
-            .await
-            .map_err(|error| format!("could not hash payload {}: {error}", path.display()))?;
+        let (size, timeout_secs) = (*size, *timeout_secs);
+        let group_id = *group_id;
+        if !target.accepts.contains(kind) {
+            return Err(format!(
+                "particle does not accept {} payloads",
+                kind_name(kind)
+            ));
+        }
         if size > target.max_payload_bytes {
             return Err(format!(
                 "payload is {size} bytes, exceeding peer limit of {} bytes",
                 target.max_payload_bytes
             ));
         }
+        let sync_id = uuid::Uuid::new_v4().simple().to_string();
         let remote_key = self
             .field
             .read()
@@ -1234,9 +1616,6 @@ impl Particle {
             .binding(&peer.resonance.particle_id)
             .filter(|bound| peer.static_key == Some(*bound))
             .ok_or_else(|| "peer has no authenticated static key".to_owned())?;
-        let group_id = self
-            .select_peer_group(&peer, &remote_key)
-            .ok_or_else(|| "the peer isn't a member of any shared group".to_owned())?;
         let started = std::time::Instant::now();
         let direct_socket = if self.options.relay_only || peer.resonance.port == 0 {
             None
@@ -1298,8 +1677,7 @@ impl Particle {
             };
             return Err(format!("{reason}; {hint}"));
         };
-        let label = args.get("label").and_then(Value::as_str).map(str::to_owned);
-        let source = tokio::fs::File::open(&path)
+        let source = tokio::fs::File::open(path)
             .await
             .map_err(|error| format!("could not open payload {}: {error}", path.display()))?;
         let result = entangle_link::offer_on(
@@ -1308,11 +1686,11 @@ impl Particle {
                 from: self.manifest.particle_id.clone(),
                 sync_id: sync_id.clone(),
                 timeout_secs,
-                kind: kind.clone(),
-                name,
+                kind: (*kind).clone(),
+                name: (*name).clone(),
                 size,
-                sha256: sha256.clone(),
-                label,
+                sha256: (*sha256).clone(),
+                label: label.clone(),
             },
             source,
             Duration::from_secs(timeout_secs),
@@ -1323,7 +1701,7 @@ impl Particle {
         match outcome {
             entangle_link::OfferOutcome::Complete {
                 sha256: remote_hash,
-            } if remote_hash == sha256 => {}
+            } if remote_hash == *sha256 => {}
             entangle_link::OfferOutcome::Complete { .. } => {
                 return Err("receiver reported a mismatched SHA-256".into());
             }
@@ -1331,16 +1709,14 @@ impl Particle {
                 return Err(format!("receiver failed state sync: {reason}"));
             }
         }
-        Ok(json!({
-            "sync_id": sync_id,
-            "particle_id": peer.resonance.particle_id,
-            "kind": kind_name(&kind),
-            "bytes": size,
-            "sha256": sha256,
-            "delivered": true,
-            "path": link_path,
-            "elapsed_ms": started.elapsed().as_millis()
-        }))
+        if let Ok(mut field) = self.field.write() {
+            field.touch(&peer.resonance.particle_id);
+        }
+        Ok(SentState {
+            sync_id,
+            route: link_path,
+            elapsed_ms: started.elapsed().as_millis(),
+        })
     }
 
     async fn sync_handshake(
@@ -2160,6 +2536,37 @@ mod tests {
         .unwrap();
     }
 
+    #[test]
+    fn group_member_prefix_resolution_rejects_ambiguous_prefixes() {
+        let group = Group {
+            id: groups::group_id(&[0x73; 32]),
+            key: [0x73; 32],
+            meta: groups::GroupMeta {
+                version: 1,
+                name: "work".into(),
+                role: groups::Role::Admin,
+                created_at: chrono::Utc::now().to_rfc3339(),
+            },
+            members: [
+                "deadbeef000000000000000000000001",
+                "deadbeef000000000000000000000002",
+            ]
+            .into_iter()
+            .map(|particle_id| Member {
+                particle_id: particle_id.into(),
+                name: particle_id.into(),
+                static_key: String::new(),
+                added_by: String::new(),
+                added_at: String::new(),
+            })
+            .collect(),
+        };
+        assert_eq!(
+            Particle::resolve_group_member(&[group], "deadbeef").unwrap_err(),
+            "ambiguous particle ID: deadbeef"
+        );
+    }
+
     fn prepare_group_pair(root_a: &Path, root_b: &Path, key: [u8; 32]) {
         let (id_a, private_a) = saved_identity(root_a);
         let (id_b, private_b) = saved_identity(root_b);
@@ -2417,10 +2824,212 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result["delivered"], true);
+        assert_eq!(result["group"], "test");
         let observed = b.observe(&json!({ "limit": 20 })).await;
         assert_eq!(observed["states"][0]["group"], "test");
         a.shutdown().await;
         b.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn group_and_subset_sends_filter_by_authenticated_group() {
+        let temp = tempfile::tempdir().unwrap();
+        let root_a = temp.path().join("a");
+        let root_b = temp.path().join("b");
+        let root_c = temp.path().join("c");
+        let (id_a, private_a) = saved_identity(&root_a);
+        let (id_b, private_b) = saved_identity(&root_b);
+        let (id_c, private_c) = saved_identity(&root_c);
+        let member_a_work = test_member(&id_a, "particle-a", &private_a, id_a.as_str());
+        let member_b_work = test_member(&id_b, "particle-b", &private_b, id_a.as_str());
+        let member_c_work = test_member(&id_c, "particle-c", &private_c, id_a.as_str());
+        let member_a_home = member_a_work.clone();
+        let member_b_home = member_b_work.clone();
+        let work_members = vec![
+            member_a_work.clone(),
+            member_b_work.clone(),
+            member_c_work.clone(),
+        ];
+        let home_members = vec![member_a_home, member_b_home];
+        for (root, role) in [
+            (&root_a, groups::Role::Admin),
+            (&root_b, groups::Role::Member),
+            (&root_c, groups::Role::Member),
+        ] {
+            insert_test_group(root, "work", [0x71; 32], work_members.clone(), role);
+        }
+        insert_test_group(
+            &root_a,
+            "home",
+            [0x72; 32],
+            home_members.clone(),
+            groups::Role::Admin,
+        );
+        insert_test_group(
+            &root_b,
+            "home",
+            [0x72; 32],
+            home_members,
+            groups::Role::Member,
+        );
+
+        let a_port = free_port();
+        let b_port = port_other_than(a_port);
+        let c_port = loop {
+            let port = free_port();
+            if port != a_port && port != b_port {
+                break port;
+            }
+        };
+        let mut options_b = options(
+            "particle-b",
+            b_port,
+            root_b,
+            Some(format!("127.0.0.1:{a_port}")),
+        );
+        options_b.no_mdns = true;
+        let mut options_c = options(
+            "particle-c",
+            c_port,
+            root_c,
+            Some(format!("127.0.0.1:{a_port}")),
+        );
+        options_c.no_mdns = true;
+        let (b, _) = Particle::start(options_b, None).await.unwrap();
+        let (c, _) = Particle::start(options_c, None).await.unwrap();
+        let mut options_a = options("particle-a", a_port, root_a, None);
+        options_a.peer = vec![format!("127.0.0.1:{b_port}"), format!("127.0.0.1:{c_port}")];
+        let (a, _) = Particle::start(options_a, None).await.unwrap();
+        wait_for_group_pair(&a, &b).await;
+        wait_for_group_pair(&a, &c).await;
+
+        let group_send = a
+            .sync_state(json!({
+                "group": "work",
+                "state": { "message": "to all" }
+            }))
+            .await
+            .unwrap();
+        assert_eq!(group_send["group"], "work");
+        assert_eq!(group_send["delivered"], 2);
+        assert_eq!(group_send["failed"], 0);
+        let results = group_send["results"].as_array().unwrap();
+        assert_eq!(results[0]["name"], "particle-b");
+        assert_eq!(results[1]["name"], "particle-c");
+        for observer in [&b, &c] {
+            let observed = observer.observe(&json!({ "group": "work" })).await;
+            assert_eq!(observed["states"].as_array().unwrap().len(), 1);
+            assert_eq!(observed["states"][0]["group"], "work");
+        }
+
+        let c_before = c.observe(&json!({})).await["states"]
+            .as_array()
+            .unwrap()
+            .len();
+        let subset = a
+            .sync_state(json!({
+                "particle_ids": [id_b.as_str()],
+                "state": { "message": "only B" }
+            }))
+            .await
+            .unwrap();
+        assert_eq!(subset["delivered"], 1);
+        assert_eq!(subset["results"].as_array().unwrap().len(), 1);
+        assert_eq!(subset["results"][0]["particle_id"], id_b.as_str());
+        assert_eq!(
+            c.observe(&json!({})).await["states"]
+                .as_array()
+                .unwrap()
+                .len(),
+            c_before
+        );
+
+        let pinned = a
+            .sync_state(json!({
+                "group": "home",
+                "particle_ids": [id_b.as_str(), id_c.as_str()],
+                "state": { "message": "home members only" }
+            }))
+            .await
+            .unwrap();
+        assert_eq!(pinned["group"], "home");
+        assert_eq!(pinned["delivered"], 1);
+        assert_eq!(pinned["failed"], 1);
+        let pinned_results = pinned["results"].as_array().unwrap();
+        let c_result = pinned_results
+            .iter()
+            .find(|result| result["particle_id"] == id_c.as_str())
+            .unwrap();
+        assert_eq!(c_result["ok"], false);
+        assert_eq!(c_result["error"], "not a member of home");
+
+        let home_id = groups::group_id(&[0x72; 32]);
+        let home_items = b.observe(&json!({ "group": home_id })).await;
+        let home_states = home_items["states"].as_array().unwrap();
+        assert!(!home_states.is_empty());
+        assert!(home_states.iter().all(|item| item["group"] == "home"));
+
+        c.shutdown().await;
+        let with_unreachable = a
+            .sync_state(json!({
+                "group": "work",
+                "state": { "message": "B remains reachable" }
+            }))
+            .await
+            .unwrap();
+        assert_eq!(with_unreachable["delivered"], 1);
+        assert_eq!(with_unreachable["failed"], 1);
+        let unreachable_result = with_unreachable["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|result| result["particle_id"] == id_c.as_str())
+            .unwrap();
+        assert_eq!(unreachable_result["ok"], false);
+        assert_eq!(
+            std::fs::read_dir(a.data_dir.join("outbox"))
+                .unwrap()
+                .count(),
+            0
+        );
+
+        a.shutdown().await;
+        b.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn sync_target_arguments_are_validated() {
+        let temp = tempfile::tempdir().unwrap();
+        let (particle, _) = Particle::start(
+            options("particle", free_port(), temp.path().join("data"), None),
+            None,
+        )
+        .await
+        .unwrap();
+        let missing = particle
+            .sync_state(json!({ "state": { "message": "missing target" } }))
+            .await
+            .unwrap_err();
+        assert!(missing.contains("particle_id, particle_ids, or group"));
+        let conflicting = particle
+            .sync_state(json!({
+                "particle_id": "abc",
+                "particle_ids": ["def"],
+                "state": { "message": "conflicting target modes" }
+            }))
+            .await
+            .unwrap_err();
+        assert!(conflicting.contains("not both"));
+        let conflicting_payloads = particle
+            .sync_state(json!({
+                "particle_id": "abc",
+                "state": { "message": "both payloads" },
+                "file_path": "/unused"
+            }))
+            .await
+            .unwrap_err();
+        assert!(conflicting_payloads.contains("exactly one of state or file_path"));
+        particle.shutdown().await;
     }
 
     #[tokio::test]
