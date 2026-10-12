@@ -259,7 +259,7 @@ pre {
   [data-direction="swap"] .hero-canvas { aspect-ratio: 4 / 3; }
   [data-direction="spacelike"] .hero { min-height: calc(100svh - var(--header-h)); }
   [data-direction="spacelike"] .hero-inner { padding-top: 56px; padding-bottom: 72px; }
-  [data-direction="spacelike"] .hero-caption { bottom: 12px; font-size: 11.5px; }
+  [data-direction="spacelike"] .hero-caption { font-size: 11.5px; }
 }
 
 /* Sections */
@@ -292,6 +292,7 @@ section { padding: 88px 0; border-bottom: 1px solid var(--line); }
 @media (max-width: 900px) { .install-grid { grid-template-columns: 1fr; } }
 
 .site-footer { padding: 36px 0 48px; color: var(--muted); font-size: 14px; }
+@media (min-width: 901px) { .site-footer { padding-bottom: 84px; } }
 .site-footer .wrap { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 12px 24px; align-items: center; }
 .site-footer a { color: var(--body); text-decoration: none; }
 .site-footer a:hover { color: var(--ink); }
@@ -314,7 +315,7 @@ section { padding: 88px 0; border-bottom: 1px solid var(--line); }
   padding: 14px 16px 16px; background: var(--surface); color: var(--ink);
   border: 1px solid var(--line-strong); border-radius: var(--radius-md);
   box-shadow: 0 12px 32px -16px rgba(0, 0, 0, 0.35);
-  font-size: 13px;
+  font-size: 13px; max-height: calc(100vh - 90px); overflow-y: auto;
 }
 .dir-picker.is-open { display: block; }
 .dir-picker-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 2px; }
@@ -357,10 +358,11 @@ section { padding: 88px 0; border-bottom: 1px solid var(--line); }
   .dir-toggle strong { color: var(--ink); font-weight: 600; }
   .dir-toggle .icon { width: 16px; height: 16px; color: var(--eyebrow); }
   [data-direction="spacelike"] .dir-toggle { position: absolute; right: 20px; bottom: 14px; z-index: 2; margin: 0; }
-  [data-direction="spacelike"] .hero-caption { max-width: calc(100% - 200px); }
+  [data-direction="spacelike"] .hero-caption { bottom: 66px; max-width: calc(100% - 48px); }
   .dir-picker {
     position: fixed; left: 0; right: 0; bottom: 0; width: auto; max-width: 560px; margin: 0 auto; z-index: 60;
     padding: 16px 20px calc(18px + env(safe-area-inset-bottom)); border-radius: var(--radius-lg) var(--radius-lg) 0 0;
+    max-height: calc(100svh - 24px); overflow-y: auto;
   }
   .dir-options label { min-height: 44px; }
   .dir-backdrop.is-open { display: block; position: fixed; inset: 0; z-index: 55; background: rgba(0, 0, 0, 0.45); }

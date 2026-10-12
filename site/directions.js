@@ -316,8 +316,10 @@
         ctx.strokeStyle = c.ink; ctx.lineWidth = 2; ctx.beginPath(); ctx.moveTo(px((lb + 0.5) / BINS * 180), py(ls) - 5); ctx.lineTo(px((lb + 0.5) / BINS * 180), py(ls) + 5); ctx.stroke();
       }
       // legend
-      ctx.font = sans(12.5, 500); ctx.textAlign = "left";
+      ctx.font = sans(narrow ? 11.5 : 12.5, 500); ctx.textAlign = "left";
       var lx = px(8), ly = py(0.88);
+      var lw = Math.max(ctx.measureText("any local hidden-variable model").width, ctx.measureText("measured \u00b7 quantum: \u2212cos \u03b8").width) + 30;
+      ctx.fillStyle = c.surface; ctx.globalAlpha = fade * 0.92; ctx.fillRect(lx - 8, ly - 12, lw + 16, 46); ctx.globalAlpha = fade;
       ctx.strokeStyle = c.a; ctx.lineWidth = 2; ctx.beginPath(); ctx.moveTo(lx, ly); ctx.lineTo(lx + 22, ly); ctx.stroke();
       ctx.fillStyle = c.body; ctx.fillText("measured \u00b7 quantum: \u2212cos \u03b8", lx + 30, ly + 4);
       ctx.setLineDash([5, 5]); ctx.strokeStyle = c.b; ctx.lineWidth = 1.5; ctx.beginPath(); ctx.moveTo(lx, ly + 22); ctx.lineTo(lx + 22, ly + 22); ctx.stroke(); ctx.setLineDash([]);
@@ -411,7 +413,12 @@
     if (params.get("picker") === "open") open();
     backdrop.addEventListener("click", close);
     picker.querySelector(".dir-picker-close").addEventListener("click", close);
-    figure.setAttribute("role", "button"); figure.setAttribute("tabindex", "0"); figure.setAttribute("aria-label", "Open the direction picker");
+    var sheetMq = window.matchMedia("(max-width: 900px)");
+    function syncFigureRole() {
+      if (sheetMq.matches) { figure.setAttribute("role", "button"); figure.setAttribute("tabindex", "0"); figure.setAttribute("aria-label", "Open the direction picker"); }
+      else { figure.removeAttribute("role"); figure.removeAttribute("tabindex"); figure.removeAttribute("aria-label"); }
+    }
+    syncFigureRole(); if (sheetMq.addEventListener) sheetMq.addEventListener("change", syncFigureRole); else sheetMq.addListener(syncFigureRole);
     figure.addEventListener("click", function () { if (isSheet()) open(); });
     figure.addEventListener("keydown", function (e) { if ((e.key === "Enter" || e.key === " ") && isSheet()) { e.preventDefault(); open(); } });
     picker.addEventListener("change", function (e) {
