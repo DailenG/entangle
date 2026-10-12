@@ -132,7 +132,8 @@ this machine and compare the cards themselves.
 
 Quantum Repeater administration is also human-only. Agents may run `entangle
 repeater devices` and `entangle repeater status`, but must never run
-`repeater invite`, `repeater join`, `repeater revoke`, or `repeater leave`.
+`repeater invite`, `repeater join`, `repeater approve`, `repeater revoke`, or
+`repeater leave`.
 In `find_entangled_particles`, `path` is the route used by the most recent
 successful Hello (`direct`, `repeater`, or `null` if unknown). `via_repeater`
 means the peer is currently present in this node's live repeater directory;

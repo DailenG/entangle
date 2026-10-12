@@ -12,7 +12,7 @@ pub use client::{
 };
 pub use invite::{decode, encode, Invite};
 pub use server::{serve, ServerConfig};
-pub use store::{Device, Devices, InviteRecord, Invites, Store};
+pub use store::{Device, Devices, EnrollmentRequest, InviteRecord, Invites, Store};
 
 #[cfg(test)]
 mod integration_tests;

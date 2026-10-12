@@ -4,9 +4,10 @@ use crate::invite::secret_hash;
 use chrono::{DateTime, Utc};
 use rand::RngCore;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
-    fs::{self, OpenOptions},
+    fs::{self, File, OpenOptions},
     io::{self, Write},
     path::{Component, Path, PathBuf},
     sync::{
@@ -34,10 +35,13 @@ pub enum StoreError {
     /// The host's stored private key is malformed.
     #[error("invalid repeater key")]
     InvalidKey,
+    /// A device fingerprint did not select exactly one enrolled device.
+    #[error("fingerprint must match exactly one device")]
+    InvalidDeviceFingerprint,
 }
 
 /// An enrolled repeater device.
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct Device {
     /// Optional operator-supplied enrollment label.
     pub label: Option<String>,
@@ -45,6 +49,9 @@ pub struct Device {
     pub enrolled_at: String,
     /// Whether the repeater must refuse this device.
     pub revoked: bool,
+    /// Whether the host explicitly denied an enrollment request.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub denied: bool,
 }
 
 /// Persistent repeater device allowlist.
@@ -72,6 +79,21 @@ pub struct InviteRecord {
 pub struct Invites {
     /// Available and previously consumed invitation records.
     pub invites: Vec<InviteRecord>,
+}
+
+/// A device awaiting host approval to enroll.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct EnrollmentRequest {
+    /// Lowercase hex encoding of the device's authenticated static public key.
+    pub key: String,
+    /// Optional operator-supplied device label.
+    pub label: Option<String>,
+    /// Source IP address of the request.
+    pub source: String,
+    /// RFC 3339 request admission time.
+    pub requested_at: String,
+    /// The three-symbol short authentication string.
+    pub sas: [u8; 3],
 }
 
 /// Metadata used by the server to detect device-file changes.
@@ -143,6 +165,62 @@ impl Store {
         )
     }
 
+    /// Loads pending enrollment requests, or an empty list if absent.
+    pub fn requests(&self) -> Result<Vec<EnrollmentRequest>, StoreError> {
+        load_json(&self.root.join("requests.json"))
+    }
+
+    /// Atomically replaces the server-owned pending enrollment request list.
+    pub fn save_requests(&self, value: &[EnrollmentRequest]) -> Result<(), StoreError> {
+        atomic_write(
+            &self.root.join("requests.json"),
+            &serde_json::to_vec_pretty(value)?,
+        )
+    }
+
+    /// Writes an approval or denial for an authenticated device key.
+    pub fn decide_device(
+        &self,
+        key: [u8; 32],
+        label: Option<String>,
+        approved: bool,
+    ) -> Result<(), StoreError> {
+        self.update_devices(|devices| {
+            devices.devices.insert(
+                hex::encode(key),
+                Device {
+                    label,
+                    enrolled_at: Utc::now().to_rfc3339(),
+                    revoked: !approved,
+                    denied: !approved,
+                },
+            );
+            Ok(())
+        })
+    }
+
+    /// Revokes the uniquely selected device by its short fingerprint.
+    pub fn revoke_device(&self, fingerprint: &str) -> Result<(), StoreError> {
+        self.update_devices(|devices| {
+            let matches = devices
+                .devices
+                .keys()
+                .filter(|key| {
+                    hex::decode(key)
+                        .ok()
+                        .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
+                        .is_some_and(|public| short_fingerprint(&public).starts_with(fingerprint))
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            if matches.len() != 1 {
+                return Err(StoreError::InvalidDeviceFingerprint);
+            }
+            devices.devices.get_mut(&matches[0]).unwrap().revoked = true;
+            Ok(())
+        })
+    }
+
     /// Loads invitations, or an empty list if the file is absent.
     pub fn invites(&self) -> Result<Invites, StoreError> {
         load_json(&self.root.join("invites.json"))
@@ -201,16 +279,17 @@ impl Store {
         }
         invites.invites[index].used = true;
         self.save_invites(&invites)?;
-        let enrollment = self.devices().and_then(|mut devices| {
+        let enrollment = self.update_devices(|devices| {
             devices.devices.insert(
                 hex::encode(key),
                 Device {
                     label: label.or(invite_label),
                     enrolled_at: now.to_rfc3339(),
                     revoked: false,
+                    denied: false,
                 },
             );
-            self.save_devices(&devices)
+            Ok(())
         });
         if let Err(error) = enrollment {
             invites.invites[index].used = false;
@@ -237,6 +316,22 @@ impl Store {
     pub fn device_stamp(&self) -> Result<Option<FileStamp>, StoreError> {
         stamp(&self.root.join("devices.json"))
     }
+
+    fn update_devices<T>(
+        &self,
+        update: impl FnOnce(&mut Devices) -> Result<T, StoreError>,
+    ) -> Result<T, StoreError> {
+        let lock = open_private_lock_file(&self.root.join("devices.lock"))?;
+        lock.lock()?;
+        let mut devices = self.devices()?;
+        let result = update(&mut devices)?;
+        self.save_devices(&devices)?;
+        Ok(result)
+    }
+}
+
+fn short_fingerprint(public: &[u8; 32]) -> String {
+    hex::encode(Sha256::digest(public))[..8].to_owned()
 }
 
 fn load_json<T: DeserializeOwned + Default>(path: &Path) -> Result<T, StoreError> {
@@ -310,6 +405,48 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), StoreError> {
     }
     result?;
     Ok(())
+}
+
+fn open_private_lock_file(path: &Path) -> Result<File, StoreError> {
+    reject_symlink_components(path)?;
+    let parent = path.parent().ok_or(StoreError::UnsafePath)?;
+    match fs::symlink_metadata(parent) {
+        Ok(metadata) if metadata.file_type().is_dir() => {}
+        Ok(_) => return Err(StoreError::UnsafePath),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => fs::create_dir_all(parent)?,
+        Err(error) => return Err(error.into()),
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
+    }
+    reject_symlink_components(path)?;
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_file() => {}
+        Ok(_) => return Err(StoreError::UnsafePath),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    let mut options = OpenOptions::new();
+    options.create(true).read(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options.open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(StoreError::UnsafePath);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if file.metadata()?.permissions().mode() & 0o777 != 0o600 {
+            file.set_permissions(fs::Permissions::from_mode(0o600))?;
+        }
+    }
+    Ok(file)
 }
 
 fn replace_file(temporary: &Path, destination: &Path) -> io::Result<()> {
@@ -403,10 +540,139 @@ mod tests {
                 label: Some("device".into()),
                 enrolled_at: "2026-01-01T00:00:00Z".into(),
                 revoked: false,
+                denied: false,
             },
         );
         store.save_devices(&second).unwrap();
         assert_eq!(store.devices().unwrap().devices.len(), 1);
+    }
+
+    #[test]
+    fn concurrent_decisions_and_invite_enrollments_preserve_all_devices() {
+        use std::{
+            sync::{Arc, Barrier},
+            thread,
+        };
+
+        const N: usize = 12;
+        let root = tempfile::tempdir().unwrap();
+        let root_path = test_root_path(root.path());
+        let store = Store::new(&root_path);
+        let secrets = (0..N)
+            .map(|index| [index as u8 + 150; 32])
+            .collect::<Vec<_>>();
+        let expires_at = (Utc::now() + chrono::Duration::hours(1)).to_rfc3339();
+        for secret in &secrets {
+            store
+                .add_invite(*secret, expires_at.clone(), Some("invite".into()))
+                .unwrap();
+        }
+
+        let barrier = Arc::new(Barrier::new(N * 2));
+        let mut workers = Vec::with_capacity(N * 2);
+        let mut expected = Vec::with_capacity(N * 2);
+        for (index, secret) in secrets.into_iter().enumerate() {
+            let decision_key = [index as u8 + 1; 32];
+            let invite_key = [index as u8 + 65; 32];
+            expected.push(decision_key);
+            expected.push(invite_key);
+
+            let decision_store = store.clone();
+            let decision_barrier = Arc::clone(&barrier);
+            workers.push(thread::spawn(move || {
+                decision_barrier.wait();
+                decision_store
+                    .decide_device(decision_key, Some("approved".into()), true)
+                    .unwrap();
+            }));
+
+            let invite_store = store.clone();
+            let invite_barrier = Arc::clone(&barrier);
+            workers.push(thread::spawn(move || {
+                invite_barrier.wait();
+                assert!(invite_store
+                    .consume_invite(&secret, invite_key, None)
+                    .unwrap());
+            }));
+        }
+        for worker in workers {
+            worker.join().unwrap();
+        }
+
+        let devices = store.devices().unwrap();
+        assert_eq!(devices.devices.len(), N * 2);
+        for key in expected {
+            assert!(devices.devices.contains_key(&hex::encode(key)));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(root_path.join("devices.lock"))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+    }
+
+    #[test]
+    fn revokes_the_uniquely_matching_fingerprint() {
+        let root = tempfile::tempdir().unwrap();
+        let store = Store::new(test_root_path(root.path()));
+        let public = [42; 32];
+        store
+            .decide_device(public, Some("device".into()), true)
+            .unwrap();
+
+        let fingerprint = short_fingerprint(&public);
+        store.revoke_device(&fingerprint[..4]).unwrap();
+
+        let devices = store.devices().unwrap();
+        assert!(devices.devices[&hex::encode(public)].revoked);
+    }
+
+    #[test]
+    fn denied_device_field_round_trips_and_old_json_defaults_to_false() {
+        let denied = Device {
+            label: Some("device".into()),
+            enrolled_at: "2026-01-01T00:00:00Z".into(),
+            revoked: true,
+            denied: true,
+        };
+        let encoded = serde_json::to_value(&denied).unwrap();
+        assert_eq!(encoded["denied"], true);
+        assert_eq!(serde_json::from_value::<Device>(encoded).unwrap(), denied);
+
+        let old = serde_json::json!({
+            "label": "device",
+            "enrolled_at": "2026-01-01T00:00:00Z",
+            "revoked": true
+        });
+        let old: Device = serde_json::from_value(old).unwrap();
+        assert!(old.revoked);
+        assert!(!old.denied);
+        assert!(serde_json::to_value(old).unwrap().get("denied").is_none());
+    }
+
+    #[test]
+    fn request_list_uses_private_atomic_store_file() {
+        let root = tempfile::tempdir().unwrap();
+        let root_path = test_root_path(root.path());
+        let store = Store::new(&root_path);
+        let request = EnrollmentRequest {
+            key: hex::encode([7; 32]),
+            label: Some("device".into()),
+            source: "127.0.0.1".into(),
+            requested_at: "2026-01-01T00:00:00Z".into(),
+            sas: [1, 2, 3],
+        };
+        store.save_requests(std::slice::from_ref(&request)).unwrap();
+        assert_eq!(store.requests().unwrap(), vec![request]);
+        store.save_requests(&[]).unwrap();
+        assert!(store.requests().unwrap().is_empty());
     }
 
     #[test]

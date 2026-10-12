@@ -4,8 +4,10 @@ use crate::wire::{
     Frame, CLOSE, DATA, INCOMING, LIST, LIST_REPLY, MAX_MESSAGE, OPEN, OPEN_FAIL, PING, PONG,
     SESSION_STREAM,
 };
+use entangle_core::sas;
 use entangle_transport::BoxedIo;
 use futures_util::{SinkExt, StreamExt};
+use rand::RngCore;
 use serde_json::json;
 use snow::{params::NoiseParams, Builder, TransportState};
 use std::{
@@ -51,9 +53,24 @@ pub enum ClientError {
     /// The repeater session has ended.
     #[error("repeater session is closed")]
     SessionClosed,
+    /// The administrator did not decide before the enrollment request expired.
+    #[error("repeater enrollment request timed out")]
+    RequestTimeout,
+    /// The repeater has reached its pending request capacity.
+    #[error("the repeater has too many pending requests; try again shortly")]
+    Busy,
     /// A protocol JSON payload could not be encoded or decoded.
     #[error("repeater JSON failed: {0}")]
     Json(#[from] serde_json::Error),
+}
+
+/// Result of an administrator-approved request enrollment.
+#[derive(Debug, Eq, PartialEq)]
+pub enum RequestOutcome {
+    /// The host approved the device and authenticated this repeater key.
+    Approved { repeater_public: [u8; 32] },
+    /// The host denied the request.
+    Denied,
 }
 
 impl From<tokio_tungstenite::tungstenite::Error> for ClientError {
@@ -230,6 +247,227 @@ pub async fn enroll(
     .await?;
     let _ = ws.close(None).await;
     Ok(())
+}
+
+/// Requests host approval for this device over the unauthenticated request path.
+pub async fn request<F>(
+    url: &str,
+    private: [u8; 32],
+    label: Option<&str>,
+    on_sas: F,
+) -> Result<RequestOutcome, ClientError>
+where
+    F: FnOnce([u8; 32], sas::Sas) + Send,
+{
+    tokio::time::timeout(
+        Duration::from_secs(10 * 60 + 30),
+        request_inner(url, private, label, on_sas),
+    )
+    .await
+    .map_err(|_| ClientError::RequestTimeout)?
+}
+
+async fn request_inner<F>(
+    url: &str,
+    private: [u8; 32],
+    label: Option<&str>,
+    on_sas: F,
+) -> Result<RequestOutcome, ClientError>
+where
+    F: FnOnce([u8; 32], sas::Sas) + Send,
+{
+    let request_url = request_url(url);
+    let (mut ws, mut transport, repeater_public) =
+        request_handshake_with_timeout(&request_url, private, label, HANDSHAKE_TIMEOUT).await?;
+    let reply = recv_request_json(&mut ws, &mut transport).await?;
+    if reply.get("ok") != Some(&serde_json::Value::Bool(true)) {
+        if reply.get("error").and_then(serde_json::Value::as_str) == Some("busy") {
+            return Err(ClientError::Busy);
+        }
+        return Err(ClientError::Protocol);
+    }
+    let device_public = entangle_transport::public_key(&private);
+    let short_authentication_string =
+        sas_exchange_client(&mut ws, &mut transport, device_public, repeater_public).await?;
+    on_sas(repeater_public, short_authentication_string);
+
+    let outcome = wait_for_request_outcome(&mut ws, &mut transport, repeater_public).await?;
+    let _ = ws.close(None).await;
+    Ok(outcome)
+}
+
+fn request_url(url: &str) -> String {
+    let (base, query) = url.split_once('?').unwrap_or((url, ""));
+    let base = base.trim_end_matches('/');
+    if query.is_empty() {
+        format!("{base}/request")
+    } else {
+        format!("{base}/request?{query}")
+    }
+}
+
+async fn request_handshake_with_timeout(
+    url: &str,
+    private: [u8; 32],
+    label: Option<&str>,
+    timeout: Duration,
+) -> Result<(Socket, TransportState, [u8; 32]), ClientError> {
+    tokio::time::timeout(timeout, async {
+        let (mut ws, _) = connect_async(url).await?;
+        let mut state = Builder::new(
+            "Noise_XX_25519_ChaChaPoly_BLAKE2s"
+                .parse()
+                .expect("valid request Noise pattern"),
+        )
+        .local_private_key(&private)
+        .map_err(|error| ClientError::Noise(error.to_string()))?
+        .build_initiator()
+        .map_err(|error| ClientError::Noise(error.to_string()))?;
+        let mut message = vec![0; u16::MAX as usize];
+        let size = state
+            .write_message(&[], &mut message)
+            .map_err(|error| ClientError::Noise(error.to_string()))?;
+        ws.send(Message::Binary(message[..size].to_vec())).await?;
+        let Some(Message::Binary(message)) = ws.next().await.transpose()? else {
+            return Err(ClientError::Protocol);
+        };
+        let mut plaintext = vec![0; u16::MAX as usize];
+        state
+            .read_message(&message, &mut plaintext)
+            .map_err(|error| ClientError::Noise(error.to_string()))?;
+        let repeater_public: [u8; 32] = state
+            .get_remote_static()
+            .and_then(|key| key.try_into().ok())
+            .ok_or_else(|| ClientError::Protocol)?;
+        let mut message = vec![0; u16::MAX as usize];
+        let size = state
+            .write_message(
+                &serde_json::to_vec(&json!({"v": 1, "mode": "request", "label": label}))?,
+                &mut message,
+            )
+            .map_err(|error| ClientError::Noise(error.to_string()))?;
+        ws.send(Message::Binary(message[..size].to_vec())).await?;
+        let transport = state
+            .into_transport_mode()
+            .map_err(|error| ClientError::Noise(error.to_string()))?;
+        Ok((ws, transport, repeater_public))
+    })
+    .await
+    .map_err(|_| ClientError::HandshakeTimeout)?
+}
+
+async fn send_request_json(
+    ws: &mut Socket,
+    transport: &mut TransportState,
+    value: &serde_json::Value,
+) -> Result<(), ClientError> {
+    let mut encrypted = vec![0; MAX_MESSAGE];
+    let size = transport
+        .write_message(&serde_json::to_vec(value)?, &mut encrypted)
+        .map_err(|error| ClientError::Noise(error.to_string()))?;
+    ws.send(Message::Binary(encrypted[..size].to_vec())).await?;
+    Ok(())
+}
+
+async fn recv_request_json(
+    ws: &mut Socket,
+    transport: &mut TransportState,
+) -> Result<serde_json::Value, ClientError> {
+    let Some(message) = ws.next().await else {
+        return Err(ClientError::SessionClosed);
+    };
+    let Message::Binary(message) = message? else {
+        return Err(ClientError::Protocol);
+    };
+    let mut plaintext = vec![0; u16::MAX as usize];
+    let size = transport
+        .read_message(&message, &mut plaintext)
+        .map_err(|error| ClientError::Noise(error.to_string()))?;
+    Ok(serde_json::from_slice(&plaintext[..size])?)
+}
+
+async fn sas_exchange_client(
+    ws: &mut Socket,
+    transport: &mut TransportState,
+    local: [u8; 32],
+    remote: [u8; 32],
+) -> Result<sas::Sas, ClientError> {
+    let role = sas::role(&local, &remote).ok_or(ClientError::Protocol)?;
+    let mut nonce = [0; 32];
+    rand::rngs::OsRng.fill_bytes(&mut nonce);
+    match role {
+        sas::Role::Committer => {
+            let commit = sas::commitment(&nonce, &local, &remote);
+            send_request_json(ws, transport, &json!({"commit": hex::encode(commit)})).await?;
+            let remote_nonce =
+                parse_request_bytes(&recv_request_json(ws, transport).await?, "nonce")?;
+            send_request_json(ws, transport, &json!({"nonce": hex::encode(nonce)})).await?;
+            Ok(sas::derive(&local, &remote, &nonce, &remote_nonce))
+        }
+        sas::Role::Revealer => {
+            let commit = parse_request_bytes(&recv_request_json(ws, transport).await?, "commit")?;
+            send_request_json(ws, transport, &json!({"nonce": hex::encode(nonce)})).await?;
+            let remote_nonce =
+                parse_request_bytes(&recv_request_json(ws, transport).await?, "nonce")?;
+            if !crate::server::verify_sas_commitment(&commit, &remote_nonce, &remote, &local) {
+                return Err(ClientError::Protocol);
+            }
+            Ok(sas::derive(&remote, &local, &remote_nonce, &nonce))
+        }
+    }
+}
+
+fn parse_request_bytes(value: &serde_json::Value, field: &str) -> Result<[u8; 32], ClientError> {
+    let text = value
+        .get(field)
+        .and_then(serde_json::Value::as_str)
+        .ok_or(ClientError::Protocol)?;
+    hex::decode(text)
+        .ok()
+        .and_then(|bytes| bytes.try_into().ok())
+        .ok_or(ClientError::Protocol)
+}
+
+async fn wait_for_request_outcome(
+    ws: &mut Socket,
+    transport: &mut TransportState,
+    repeater_public: [u8; 32],
+) -> Result<RequestOutcome, ClientError> {
+    loop {
+        let Some(message) = ws.next().await else {
+            return Err(ClientError::SessionClosed);
+        };
+        match message? {
+            Message::Ping(payload) => {
+                ws.send(Message::Pong(payload)).await?;
+            }
+            Message::Binary(message) => {
+                let reply = recv_request_json_from_message(transport, &message)?;
+                let approved = reply
+                    .get("approved")
+                    .and_then(serde_json::Value::as_bool)
+                    .ok_or(ClientError::Protocol)?;
+                return Ok(if approved {
+                    RequestOutcome::Approved { repeater_public }
+                } else {
+                    RequestOutcome::Denied
+                });
+            }
+            Message::Close(_) => return Err(ClientError::SessionClosed),
+            _ => {}
+        }
+    }
+}
+
+fn recv_request_json_from_message(
+    transport: &mut TransportState,
+    message: &[u8],
+) -> Result<serde_json::Value, ClientError> {
+    let mut plaintext = vec![0; u16::MAX as usize];
+    let size = transport
+        .read_message(message, &mut plaintext)
+        .map_err(|error| ClientError::Noise(error.to_string()))?;
+    Ok(serde_json::from_slice(&plaintext[..size])?)
 }
 
 fn start_session(ws: Socket, noise: TransportState, static_public: [u8; 32]) -> RepeaterClient {
@@ -779,6 +1017,18 @@ mod tests {
     use super::*;
     use tokio::net::TcpListener;
     use tokio_tungstenite::accept_async;
+
+    #[test]
+    fn request_url_handles_trailing_slashes_and_queries() {
+        assert_eq!(
+            request_url("ws://repeater.example/entangle/"),
+            "ws://repeater.example/entangle/request"
+        );
+        assert_eq!(
+            request_url("wss://repeater.example/entangle?token=abc"),
+            "wss://repeater.example/entangle/request?token=abc"
+        );
+    }
 
     #[test]
     fn stream_id_allocator_skips_reserved_session_id_on_wrap() {

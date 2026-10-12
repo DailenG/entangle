@@ -2326,6 +2326,7 @@ mod tests {
                 listen: SocketAddr::from(([127, 0, 0, 1], port)),
                 path: "/entangle".into(),
                 root,
+                requests: true,
             })
             .await;
         });

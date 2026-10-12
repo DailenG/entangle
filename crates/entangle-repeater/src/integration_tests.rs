@@ -43,10 +43,14 @@ fn test_root_path(path: &Path) -> std::path::PathBuf {
 }
 
 async fn start_server() -> TestServer {
-    start_server_with_timeout(Duration::from_secs(10)).await
+    start_server_with_options(Duration::from_secs(10), true).await
 }
 
 async fn start_server_with_timeout(handshake_timeout: Duration) -> TestServer {
+    start_server_with_options(handshake_timeout, true).await
+}
+
+async fn start_server_with_options(handshake_timeout: Duration, requests: bool) -> TestServer {
     let root = tempfile::tempdir().unwrap();
     let root_path = test_root_path(root.path());
     let store = Store::new(&root_path);
@@ -59,6 +63,7 @@ async fn start_server_with_timeout(handshake_timeout: Duration) -> TestServer {
             listen: addr,
             path: "/entangle".into(),
             root: root_path.clone(),
+            requests,
         },
         handshake_timeout,
     ));
@@ -423,13 +428,9 @@ async fn enrollment_rejects_unenrolled_reused_and_expired_credentials_and_revoke
     let mut live = client::connect(&server.url, enrolled, server.public, "aaaaaaaa")
         .await
         .unwrap();
-    let mut devices = store.devices().unwrap();
-    devices
-        .devices
-        .get_mut(&hex::encode(entangle_transport::public_key(&enrolled)))
-        .unwrap()
-        .revoked = true;
-    store.save_devices(&devices).unwrap();
+    let enrolled_public = entangle_transport::public_key(&enrolled);
+    let fingerprint = hex::encode(Sha256::digest(enrolled_public))[..8].to_owned();
+    store.revoke_device(&fingerprint).unwrap();
     let frame = tokio::time::timeout(Duration::from_secs(3), live.recv_frame())
         .await
         .unwrap()
@@ -506,4 +507,154 @@ async fn forwarding_does_not_expose_end_to_end_noise_plaintext() {
     assert!(!forwarded
         .windows(marker.len())
         .any(|window| window == marker));
+}
+
+async fn request_once(
+    server: &TestServer,
+    private: [u8; 32],
+    label: Option<&str>,
+) -> (
+    tokio::task::JoinHandle<Result<client::RequestOutcome, client::ClientError>>,
+    tokio::sync::oneshot::Receiver<([u8; 32], entangle_core::sas::Sas)>,
+) {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let url = server.url.clone();
+    let label = label.map(str::to_owned);
+    let handle = tokio::spawn(async move {
+        let result = client::request(&url, private, label.as_deref(), move |public, sas| {
+            let _ = tx.send((public, sas));
+        })
+        .await;
+        result
+    });
+    (handle, rx)
+}
+
+async fn wait_for_request(server: &TestServer) -> crate::store::EnrollmentRequest {
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if let Some(request) = server_store(server).requests().unwrap().into_iter().next() {
+                return request;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn request_approve_matches_sas_and_connects() {
+    let server = start_server().await;
+    let private = entangle_transport::generate_static();
+    let (handle, sas_rx) = request_once(&server, private, Some("alice")).await;
+    let (_, sas) = sas_rx.await.unwrap();
+    let request = wait_for_request(&server).await;
+    assert_eq!(request.sas, sas);
+    let key = entangle_transport::public_key(&private);
+    server_store(&server)
+        .decide_device(key, request.label, true)
+        .unwrap();
+    let outcome = handle.await.unwrap().unwrap();
+    assert_eq!(
+        outcome,
+        client::RequestOutcome::Approved {
+            repeater_public: server.public
+        }
+    );
+    assert!(server_store(&server).device_allowed(&key).unwrap());
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let _client = client::connect(&server.url, private, server.public, "aaaaaaaa")
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn request_deny_rejects_session() {
+    let server = start_server().await;
+    let private = entangle_transport::generate_static();
+    let (handle, _sas_rx) = request_once(&server, private, None).await;
+    let request = wait_for_request(&server).await;
+    server_store(&server)
+        .decide_device(
+            entangle_transport::public_key(&private),
+            request.label,
+            false,
+        )
+        .unwrap();
+    assert_eq!(
+        handle.await.unwrap().unwrap(),
+        client::RequestOutcome::Denied
+    );
+    assert!(
+        client::connect(&server.url, private, server.public, "aaaaaaaa")
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn disconnected_request_is_removed() {
+    let server = start_server().await;
+    let private = entangle_transport::generate_static();
+    let (handle, _sas_rx) = request_once(&server, private, None).await;
+    let _ = wait_for_request(&server).await;
+    handle.abort();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if server_store(&server).requests().unwrap().is_empty() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn second_request_from_same_ip_is_busy() {
+    let server = start_server().await;
+    let first_private = entangle_transport::generate_static();
+    let second_private = entangle_transport::generate_static();
+    let (first, _sas_rx) = request_once(&server, first_private, None).await;
+    let _ = wait_for_request(&server).await;
+    let second = client::request(&server.url, second_private, None, |_public, _sas| {}).await;
+    assert!(matches!(second, Err(client::ClientError::Busy)));
+    first.abort();
+}
+
+#[tokio::test]
+async fn disabled_requests_keep_invites_working() {
+    let server = start_server_with_options(Duration::from_secs(10), false).await;
+    let private = entangle_transport::generate_static();
+    assert!(
+        client::request(&server.url, private, None, |_public, _sas| {})
+            .await
+            .is_err()
+    );
+    enroll(&server, private, [99; 32]).await;
+    let _client = client::connect(&server.url, private, server.public, "aaaaaaaa")
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn revoked_request_can_be_approved_again() {
+    let server = start_server().await;
+    let private = entangle_transport::generate_static();
+    let key = entangle_transport::public_key(&private);
+    server_store(&server)
+        .decide_device(key, Some("old".into()), false)
+        .unwrap();
+    let (handle, _sas_rx) = request_once(&server, private, Some("new")).await;
+    let request = wait_for_request(&server).await;
+    server_store(&server)
+        .decide_device(key, request.label, true)
+        .unwrap();
+    assert!(matches!(
+        handle.await.unwrap().unwrap(),
+        client::RequestOutcome::Approved { .. }
+    ));
+    assert!(server_store(&server).device_allowed(&key).unwrap());
 }
