@@ -44,14 +44,14 @@
       <div class="hero-copy">
         <span class="eyebrow" data-copy="eyebrow">Local-first MCP · Agent to agent</span>
         <h1 class="hero-title" data-copy="title">Two agents, one state.</h1>
-        <p class="hero-lead" data-copy="lead">Entangle lets AI agents on your network find each other, pair under a human's eye, and share files and JSON over end-to-end encrypted links. Nothing in between can read them.</p>
+        <p class="hero-lead" data-copy="lead">Entangle lets AI agents on your network find each other, join a group with one short code, and share files and JSON over end-to-end encrypted links. Nothing in between can read them.</p>
         <div class="hero-actions">
           <a class="btn btn-primary btn-lg" href="#install"><svg class="icon" aria-hidden="true"><use href="#i-download"/></svg>Install</a>
           <a class="btn btn-secondary btn-lg" href="https://github.com/DailenG/entangle"><svg class="icon" aria-hidden="true"><use href="#i-github"/></svg>View on GitHub</a>
         </div>
         <ul class="hero-facts">
           <li class="fact-badge">Experimental</li>
-          <li>v0.5.0</li>
+          <li>v0.7.0</li>
           <li>Rust, one binary</li>
           <li>Windows, macOS, Linux</li>
           <li>MIT or Apache-2.0</li>
@@ -153,6 +153,11 @@ observe_entangled_states</pre></div>
         <h2>One binary, no administrator rights.</h2>
         <p>The installer verifies SHA-256 checksums, installs into your user directory, and prints a PATH hint if you need one. Then register it with your MCP client. Entangle is experimental: until 1.0, commands and the wire protocol can change between releases.</p>
       </div>
+      <div class="agent-install">
+        <h3>Or let your agent do it</h3>
+        <p>Paste this into the agent on each machine. It installs Entangle, registers it with its MCP client and checks the result, and it asks before installs, firewall changes or config edits. You type the group commands and reload the client.</p>
+        <pre>Read https://raw.githubusercontent.com/DailenG/entangle/main/docs/AGENT_SETUP.md and follow it to set up Entangle on this machine.</pre>
+      </div>
       <div class="install-grid">
         <div><h3>macOS and Linux</h3><pre>curl -fsSL https://raw.githubusercontent.com/DailenG/entangle/main/install.sh | sh</pre></div>
         <div><h3>Windows PowerShell</h3><pre>irm https://raw.githubusercontent.com/DailenG/entangle/main/install.ps1 | iex</pre></div>
@@ -167,7 +172,7 @@ observe_entangled_states</pre></div>
 
 <footer class="site-footer">
   <div class="wrap">
-    <span>Entangle 0.5.0 · Experimental · MIT or Apache-2.0 · Built by Dailen Gunter</span>
+    <span>Entangle 0.7.0 · Experimental · MIT or Apache-2.0 · Built by Dailen Gunter</span>
     <nav aria-label="Footer">
       <a href="https://github.com/DailenG/entangle">GitHub</a>
       <a href="https://github.com/DailenG/entangle/blob/main/docs/SETUP.md">Setup</a>

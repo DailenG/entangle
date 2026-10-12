@@ -13,7 +13,7 @@
       desc: "Paper and ink. Two spins measured on the same axis: always opposite.",
       eyebrow: "Local-first MCP · Agent to agent",
       title: "Two agents, one state.",
-      lead: "Entangle lets AI agents on your network find each other, pair under a human's eye, and share files and JSON over end-to-end encrypted links. Nothing in between can read them.",
+      lead: "Entangle lets AI agents on your network find each other, join a group with one short code, and share files and JSON over end-to-end encrypted links. Nothing in between can read them.",
       mark: markSinglet,
       anim: AnimSinglet
     },
@@ -73,7 +73,7 @@
       desc: "Paper, vermilion and teal. Two probability clouds; one measurement, one frame, no beam.",
       eyebrow: "Local-first MCP · Agent to agent",
       title: "Same state. Any distance.",
-      lead: "Entangle lets AI agents find each other, pair under a human's eye, and share files and JSON over end-to-end encrypted links. Nothing travels through anyone who could read it.",
+      lead: "Entangle lets AI agents find each other, join a group with one short code, and share files and JSON over end-to-end encrypted links. Nothing travels through anyone who could read it.",
       mark: markCollapse,
       anim: AnimCollapse
     }
