@@ -55,9 +55,9 @@ Use this when several devices should join the same group during one onboarding s
 These lines were captured during the local run with three joiners:
 
 ```text
-Joined work (4f41e624) via work. 2 members.
-Joined work (4f41e624) via work. 3 members.
-Joined work (4f41e624) via work. 4 members.
+Joined work (a10bc07d) via pc-a. 2 members.
+Joined work (a10bc07d) via pc-a. 3 members.
+Joined work (a10bc07d) via pc-a. 4 members.
 3 of 3 joined; invite closed.
 ```
 

@@ -49,8 +49,8 @@ Use this when you are connecting your first two devices in one group.
 These lines were captured during the local two-device run:
 
 ```text
-Created group work (d8a1da2a). You are its admin.
-Joined work (d8a1da2a) via work. 2 members.
+Created group work (c55cd167). You are its admin.
+Joined work (c55cd167) via pc-a. 2 members.
 1 of 1 joined; invite closed.
 ```
 

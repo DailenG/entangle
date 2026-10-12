@@ -49,13 +49,14 @@ Use this when a group already exists and you want to enroll one more device.
 
 ## It worked if
 
-The local join transcript contained:
+The initial and later join transcripts contained:
 
 ```text
-Joined work (d8a1da2a) via work. 2 members.
+Joined work (53e3e217) via pc-a. 2 members.
+Joined work (53e3e217) via pc-a. 3 members.
 ```
 
-The inviter transcript then contained:
+Each inviter transcript contained:
 
 ```text
 1 of 1 joined; invite closed.
