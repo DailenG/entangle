@@ -428,13 +428,9 @@ async fn enrollment_rejects_unenrolled_reused_and_expired_credentials_and_revoke
     let mut live = client::connect(&server.url, enrolled, server.public, "aaaaaaaa")
         .await
         .unwrap();
-    let mut devices = store.devices().unwrap();
-    devices
-        .devices
-        .get_mut(&hex::encode(entangle_transport::public_key(&enrolled)))
-        .unwrap()
-        .revoked = true;
-    store.save_devices(&devices).unwrap();
+    let enrolled_public = entangle_transport::public_key(&enrolled);
+    let fingerprint = hex::encode(Sha256::digest(enrolled_public))[..8].to_owned();
+    store.revoke_device(&fingerprint).unwrap();
     let frame = tokio::time::timeout(Duration::from_secs(3), live.recv_frame())
         .await
         .unwrap()

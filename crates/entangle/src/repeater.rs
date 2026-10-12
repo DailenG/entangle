@@ -259,29 +259,14 @@ pub async fn run(
                 bail!("fingerprint must be a 1-8 character lowercase hex prefix");
             }
             let store = Store::new(repeater_root(options, root));
-            let mut devices = store.devices()?;
-            let matches = devices
-                .devices
-                .keys()
-                .filter(|key| {
-                    hex::decode(key)
-                        .ok()
-                        .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
-                        .is_some_and(|public| short_fingerprint(&public).starts_with(&fingerprint))
-                })
-                .cloned()
-                .collect::<Vec<_>>();
-            if matches.len() != 1 {
-                bail!("fingerprint must match exactly one device");
-            }
-            devices.devices.get_mut(&matches[0]).unwrap().revoked = true;
-            store.save_devices(&devices)?;
+            store.revoke_device(&fingerprint)?;
         }
         RepeaterCommand::Join { code, label } => {
             if code.starts_with("ws://") || code.starts_with("wss://") {
                 return request_join(code, label, options, output).await;
             }
             let parsed = invite::decode(&code)?;
+            validate_label(label.as_deref())?;
             let host = websocket_host(&parsed.url)?.to_owned();
             let root = options.data_root();
             let static_private = match crate::identity::read_saved(&root)? {
@@ -300,7 +285,7 @@ pub async fn run(
                 static_private,
                 parsed.repeater_public_key,
                 parsed.secret,
-                None,
+                label.as_deref(),
             )
             .await
             .with_context(|| format!("could not join the Quantum Repeater at {host}"))?;
