@@ -453,7 +453,7 @@ dependencies = [
 
 [[package]]
 name = "entangle"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -488,7 +488,7 @@ dependencies = [
 
 [[package]]
 name = "entangle-core"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "hex",
  "rand",
@@ -500,7 +500,7 @@ dependencies = [
 
 [[package]]
 name = "entangle-link"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "async-trait",
  "entangle-core",
@@ -514,7 +514,7 @@ dependencies = [
 
 [[package]]
 name = "entangle-mcp"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "async-trait",
  "serde_json",
@@ -524,7 +524,7 @@ dependencies = [
 
 [[package]]
 name = "entangle-repeater"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "chrono",
  "data-encoding",
@@ -546,7 +546,7 @@ dependencies = [
 
 [[package]]
 name = "entangle-resonance"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "entangle-core",
  "gethostname",
@@ -560,7 +560,7 @@ dependencies = [
 
 [[package]]
 name = "entangle-transport"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "snow",
  "thiserror 2.0.21",
