@@ -1,7 +1,7 @@
 //! Noise-protected control frames and bounded state-sync payload streams.
 
 use async_trait::async_trait;
-use entangle_core::{Manifest, Member, ParticleId, StateKind};
+use entangle_core::{GroupUpdate, Manifest, Member, ParticleId, StateKind};
 use entangle_transport::{
     self, KeyRing, SecureStream, SharedKeyRing, TransportError, MAX_PLAINTEXT,
 };
@@ -60,6 +60,8 @@ pub struct PeerInfo {
     pub group: [u8; 4],
     /// Whether this connection arrived through a tunnel.
     pub relayed: bool,
+    /// Group key epoch negotiated by the Noise transport.
+    pub epoch: u32,
 }
 
 /// Control protocol message; each frame is one encrypted Noise message.
@@ -81,6 +83,14 @@ pub enum Frame {
         /// Number of records newly added.
         added: u32,
     },
+    /// Signed group update history needed to reach this link's key epoch.
+    GroupUpdates { updates: Vec<GroupUpdate> },
+    /// Acknowledges the last applied group update epoch.
+    GroupUpdatesAck { epoch: u32 },
+    /// Requests removal of the authenticated sender from this group.
+    Leave,
+    /// Acknowledges a leave notice.
+    LeaveAck,
     /// Announces a payload to the receiver.
     SyncOffer {
         /// Sender's particle identity.
@@ -209,6 +219,9 @@ pub enum LinkError {
     /// The peer failed an application operation.
     #[error("{0}")]
     Handler(String),
+    /// The update chain was applied; the connection must be redialed at the new epoch.
+    #[error("group key epoch changed; reload keys and redial")]
+    Stale,
 }
 
 /// Reader for the exact-size raw payload following an accepted offer.
@@ -284,6 +297,47 @@ pub trait LinkHandler: Send + Sync + 'static {
     ) -> Result<u32, LinkError> {
         Ok(0)
     }
+
+    /// Returns this particle's current group epoch.
+    fn group_epoch(&self, _peer: &PeerInfo) -> u32 {
+        0
+    }
+
+    /// Enables the signed-update prelude for this link handler.
+    fn supports_group_updates(&self) -> bool {
+        false
+    }
+
+    /// Returns the authenticated current member associated with this peer.
+    fn peer_particle_id(&self, _peer: &PeerInfo) -> Option<ParticleId> {
+        None
+    }
+
+    /// Returns signed updates after the given epoch for a current member.
+    fn updates_since(&self, _peer: &PeerInfo, _epoch: u32) -> Vec<GroupUpdate> {
+        Vec::new()
+    }
+
+    /// Applies updates relayed by an authenticated current member.
+    fn on_updates(
+        &self,
+        _peer: &PeerInfo,
+        _sender: &ParticleId,
+        _updates: Vec<GroupUpdate>,
+    ) -> Result<u32, LinkError> {
+        Ok(self.group_epoch(_peer))
+    }
+
+    /// Handles a leave notice from an authenticated current member.
+    fn on_leave(&self, _peer: &PeerInfo, _sender: &ParticleId) -> Result<(), LinkError> {
+        Ok(())
+    }
+
+    /// Records a peer that acknowledged a signed update epoch.
+    fn on_updates_ack(&self, _peer: &PeerInfo, _epoch: u32) {}
+
+    /// Records that a peer completed a link at its current signed update epoch.
+    fn on_link_epoch(&self, _peer: &PeerInfo, _epoch: u32) {}
 }
 
 /// Bound TCP listener for short-lived encrypted control connections.
@@ -325,13 +379,17 @@ pub async fn serve_io(
     handler: Arc<dyn LinkHandler>,
 ) -> Result<(), LinkError> {
     let current = current_keys(&keys)?;
-    let stream = entangle_transport::accept_io(io, &current, HANDSHAKE_TIMEOUT).await?;
+    let mut stream = entangle_transport::accept_io(io, &current, HANDSHAKE_TIMEOUT).await?;
     let peer = PeerInfo {
         addr: peer_addr,
         remote_static: stream.remote_static(),
         group: stream.group_id(),
         relayed,
+        epoch: stream.epoch(),
     };
+    if handler.supports_group_updates() {
+        synchronize_updates(&mut stream, &peer, handler.as_ref()).await?;
+    }
     serve_connection(stream, peer, handler).await
 }
 
@@ -346,6 +404,36 @@ pub async fn connect_secure(
     timeout(duration, connect_route(route, &keys, group_id, duration))
         .await
         .map_err(|_| LinkError::Timeout)?
+}
+
+/// Opens a route and exchanges any necessary signed group updates.
+pub async fn connect_secure_with_handler(
+    route: &Route,
+    keys: SharedKeyRing,
+    group_id: [u8; 4],
+    handler: &dyn LinkHandler,
+    duration: Duration,
+) -> Result<SecureStream, LinkError> {
+    let keys = current_keys(&keys)?;
+    timeout(duration, async {
+        let mut stream = connect_route(route, &keys, group_id, duration).await?;
+        let peer = PeerInfo {
+            addr: match route {
+                Route::Direct(addr) => *addr,
+                Route::Tunnel(_) => SocketAddr::from(([0, 0, 0, 0], 0)),
+            },
+            remote_static: stream.remote_static(),
+            group: stream.group_id(),
+            relayed: matches!(route, Route::Tunnel(_)),
+            epoch: stream.epoch(),
+        };
+        if handler.supports_group_updates() {
+            synchronize_updates(&mut stream, &peer, handler).await?;
+        }
+        Ok(stream)
+    })
+    .await
+    .map_err(|_| LinkError::Timeout)?
 }
 
 /// Connects to a peer, exchanges manifests, and returns its static key.
@@ -369,9 +457,45 @@ pub async fn handshake_stream(
     manifest: &Manifest,
     duration: Duration,
 ) -> Result<(Manifest, [u8; 32], SecureStream), LinkError> {
+    handshake_stream_inner(route, keys, group_id, manifest, duration, None).await
+}
+
+/// Connects, catches up signed group updates, and then exchanges manifests.
+pub async fn handshake_stream_with_handler(
+    route: &Route,
+    keys: SharedKeyRing,
+    group_id: [u8; 4],
+    manifest: &Manifest,
+    handler: &dyn LinkHandler,
+    duration: Duration,
+) -> Result<(Manifest, [u8; 32], SecureStream), LinkError> {
+    handshake_stream_inner(route, keys, group_id, manifest, duration, Some(handler)).await
+}
+
+async fn handshake_stream_inner(
+    route: &Route,
+    keys: SharedKeyRing,
+    group_id: [u8; 4],
+    manifest: &Manifest,
+    duration: Duration,
+    handler: Option<&dyn LinkHandler>,
+) -> Result<(Manifest, [u8; 32], SecureStream), LinkError> {
     let keys = current_keys(&keys)?;
     timeout(duration, async {
         let mut stream = connect_route(route, &keys, group_id, duration).await?;
+        let peer = PeerInfo {
+            addr: match route {
+                Route::Direct(addr) => *addr,
+                Route::Tunnel(_) => SocketAddr::from(([0, 0, 0, 0], 0)),
+            },
+            remote_static: stream.remote_static(),
+            group: stream.group_id(),
+            relayed: matches!(route, Route::Tunnel(_)),
+            epoch: stream.epoch(),
+        };
+        if let Some(handler) = handler.filter(|handler| handler.supports_group_updates()) {
+            synchronize_updates(&mut stream, &peer, handler).await?;
+        }
         write_frame(
             &mut stream,
             &Frame::Hello {
@@ -402,6 +526,81 @@ pub async fn handshake_stream(
     })
     .await
     .map_err(|_| LinkError::Timeout)?
+}
+
+async fn synchronize_updates(
+    stream: &mut SecureStream,
+    peer: &PeerInfo,
+    handler: &dyn LinkHandler,
+) -> Result<(), LinkError> {
+    let local_epoch = handler.group_epoch(peer);
+    let link_epoch = stream.epoch();
+    let updates = if local_epoch > link_epoch {
+        let updates = handler.updates_since(peer, link_epoch);
+        if updates.is_empty() {
+            return Err(LinkError::Stale);
+        }
+        oldest_updates_that_fit(updates, link_epoch)?
+    } else {
+        Vec::new()
+    };
+    write_frame(stream, &Frame::GroupUpdates { updates }).await?;
+    match read_frame(stream).await? {
+        Frame::GroupUpdates { updates } if !updates.is_empty() => {
+            let sender = handler.peer_particle_id(peer).ok_or_else(|| {
+                LinkError::Handler("update sender is not a current group member".into())
+            })?;
+            let epoch = handler.on_updates(peer, &sender, updates)?;
+            write_frame(stream, &Frame::GroupUpdatesAck { epoch }).await?;
+            Err(LinkError::Stale)
+        }
+        Frame::GroupUpdates { updates } if updates.is_empty() && local_epoch > link_epoch => {
+            match read_frame(stream).await? {
+                Frame::GroupUpdatesAck { epoch } if epoch > link_epoch && epoch <= local_epoch => {
+                    handler.on_updates_ack(peer, epoch);
+                    Err(LinkError::Stale)
+                }
+                frame => Err(LinkError::Unexpected(format!("{frame:?}"))),
+            }
+        }
+        Frame::GroupUpdates { updates } if updates.is_empty() && local_epoch == link_epoch => {
+            handler.on_link_epoch(peer, link_epoch);
+            Ok(())
+        }
+        frame => Err(LinkError::Unexpected(format!("{frame:?}"))),
+    }
+}
+
+fn oldest_updates_that_fit(
+    updates: Vec<GroupUpdate>,
+    link_epoch: u32,
+) -> Result<Vec<GroupUpdate>, LinkError> {
+    let mut selected = Vec::new();
+    let mut expected_epoch = Some(
+        link_epoch
+            .checked_add(1)
+            .ok_or_else(|| LinkError::Handler("group update epoch overflow".into()))?,
+    );
+    for update in updates {
+        if expected_epoch != Some(update.epoch) {
+            return Err(LinkError::Handler(
+                "group update history is not contiguous".into(),
+            ));
+        }
+        let mut candidate = selected.clone();
+        candidate.push(update.clone());
+        let frame = Frame::GroupUpdates { updates: candidate };
+        if serde_json::to_vec(&frame)?.len() > MAX_FRAME_BYTES {
+            if selected.is_empty() {
+                return Err(LinkError::Oversize);
+            }
+            break;
+        }
+        let update_epoch = update.epoch;
+        selected.push(update);
+        expected_epoch = update_epoch.checked_add(1);
+    }
+    Ok(selected)
 }
 
 /// Opens a link, sends a sync offer, streams its declared bytes, and waits for completion.
@@ -486,6 +685,19 @@ pub async fn introduce_on<H: LinkHandler + ?Sized>(
     .map_err(|_| LinkError::Timeout)?
 }
 
+/// Sends a leave notice and waits for the authenticated member's acknowledgement.
+pub async fn leave_on(mut stream: SecureStream, duration: Duration) -> Result<(), LinkError> {
+    timeout(duration, async {
+        write_frame(&mut stream, &Frame::Leave).await?;
+        match read_frame(&mut stream).await? {
+            Frame::LeaveAck => Ok(()),
+            frame => Err(LinkError::Unexpected(format!("{frame:?}"))),
+        }
+    })
+    .await
+    .map_err(|_| LinkError::Timeout)?
+}
+
 async fn connect_route(
     route: &Route,
     keys: &KeyRing,
@@ -542,6 +754,13 @@ async fn serve_connection(
     handler: std::sync::Arc<dyn LinkHandler>,
 ) -> Result<(), LinkError> {
     match read_frame(&mut stream).await? {
+        Frame::Leave => {
+            let sender = handler.peer_particle_id(&peer).ok_or_else(|| {
+                LinkError::Handler("leave sender is not a current group member".into())
+            })?;
+            handler.on_leave(&peer, &sender)?;
+            write_frame(&mut stream, &Frame::LeaveAck).await
+        }
         Frame::Hello { manifest } => {
             let sender = manifest.particle_id.clone();
             let own = handler.on_hello(&peer, manifest).await?;
@@ -677,10 +896,11 @@ pub async fn read_frame(stream: &mut SecureStream) -> Result<Frame, LinkError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use entangle_core::{ParticleId, PROTOCOL_VERSION};
+    use entangle_core::{GroupUpdate, ParticleId, UpdateKind, PROTOCOL_VERSION};
     use sha2::{Digest, Sha256};
     use std::{
-        collections::HashMap,
+        collections::{BTreeMap, HashMap},
+        sync::atomic::{AtomicU32, Ordering},
         sync::{Arc, Mutex, RwLock},
     };
 
@@ -703,7 +923,13 @@ mod tests {
     fn keys() -> KeyRing {
         KeyRing {
             static_private: entangle_transport::generate_static(),
-            groups: HashMap::from([(GROUP, [0x33; 32])]),
+            groups: HashMap::from([(
+                GROUP,
+                entangle_transport::GroupKeys {
+                    current: 0,
+                    keys: BTreeMap::from([(0, [0x33; 32])]),
+                },
+            )]),
         }
     }
 
@@ -722,6 +948,105 @@ mod tests {
             manifest,
             received,
             relayed: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    struct CatchUpHandler {
+        manifest: Manifest,
+        particle_id: ParticleId,
+        epoch: AtomicU32,
+        updates: Vec<GroupUpdate>,
+        received_updates: Mutex<Vec<GroupUpdate>>,
+        acknowledged: Mutex<Vec<u32>>,
+    }
+
+    fn group_update(epoch: u32) -> GroupUpdate {
+        GroupUpdate {
+            group_id: "42424242".into(),
+            epoch,
+            key_hex: "44".repeat(32),
+            admin: "admin".into(),
+            admin_sign_key: "sign-key".into(),
+            revoked: Vec::new(),
+            kind: UpdateKind::Rekey,
+            issued_by: "admin".into(),
+            issued_at: "2026-10-12T00:00:00Z".into(),
+            signature: "signature".into(),
+        }
+    }
+
+    fn group_update_with_revocations(epoch: u32) -> GroupUpdate {
+        let mut update = group_update(epoch);
+        update.revoked = (0..40)
+            .map(|_| entangle_core::Revocation {
+                particle_id: ParticleId::generate().to_string(),
+                static_key: "55".repeat(32),
+            })
+            .collect();
+        update
+    }
+
+    #[async_trait]
+    impl LinkHandler for CatchUpHandler {
+        async fn on_hello(
+            &self,
+            _peer: &PeerInfo,
+            _manifest: Manifest,
+        ) -> Result<Manifest, LinkError> {
+            Ok(self.manifest.clone())
+        }
+
+        async fn on_offer(
+            &self,
+            _peer: &PeerInfo,
+            _offer: SyncOffer,
+        ) -> Result<SyncDecision, LinkError> {
+            Ok(SyncDecision::Reject("not accepted".into()))
+        }
+
+        async fn on_accepted(
+            &self,
+            _peer: &PeerInfo,
+            _offer: SyncOffer,
+            _payload: &mut PayloadReader<'_>,
+        ) -> Result<String, String> {
+            Err("should not be called".into())
+        }
+
+        fn group_epoch(&self, _peer: &PeerInfo) -> u32 {
+            self.epoch.load(Ordering::SeqCst)
+        }
+
+        fn supports_group_updates(&self) -> bool {
+            true
+        }
+
+        fn peer_particle_id(&self, _peer: &PeerInfo) -> Option<ParticleId> {
+            Some(self.particle_id.clone())
+        }
+
+        fn updates_since(&self, _peer: &PeerInfo, epoch: u32) -> Vec<GroupUpdate> {
+            self.updates
+                .iter()
+                .filter(|update| update.epoch > epoch)
+                .cloned()
+                .collect()
+        }
+
+        fn on_updates(
+            &self,
+            _peer: &PeerInfo,
+            _sender: &ParticleId,
+            updates: Vec<GroupUpdate>,
+        ) -> Result<u32, LinkError> {
+            let epoch = updates.iter().map(|update| update.epoch).max().unwrap_or(0);
+            self.received_updates.lock().unwrap().extend(updates);
+            self.epoch.store(epoch, Ordering::SeqCst);
+            Ok(epoch)
+        }
+
+        fn on_updates_ack(&self, _peer: &PeerInfo, epoch: u32) {
+            self.acknowledged.lock().unwrap().push(epoch);
         }
     }
 
@@ -891,6 +1216,199 @@ mod tests {
             }
         );
         assert_eq!(*received.lock().unwrap(), payload);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn same_epoch_with_handler_completes_the_link() {
+        let key = keys();
+        let expected = manifest();
+        let remote = Arc::new(CatchUpHandler {
+            manifest: expected.clone(),
+            particle_id: ParticleId::generate(),
+            epoch: AtomicU32::new(0),
+            updates: Vec::new(),
+            received_updates: Mutex::new(Vec::new()),
+            acknowledged: Mutex::new(Vec::new()),
+        });
+        let local = CatchUpHandler {
+            manifest: manifest(),
+            particle_id: ParticleId::generate(),
+            epoch: AtomicU32::new(0),
+            updates: Vec::new(),
+            received_updates: Mutex::new(Vec::new()),
+            acknowledged: Mutex::new(Vec::new()),
+        };
+        let (address, task) = start_listener(key.clone(), remote as Arc<dyn LinkHandler>).await;
+        let (peer, _, _) = handshake_stream_with_handler(
+            &Route::Direct(address),
+            key_slot(&key),
+            GROUP,
+            &manifest(),
+            &local,
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+        assert_eq!(peer, expected);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn behind_member_applies_updates_and_acknowledges_before_linking() {
+        let group_key_0 = [0x33; 32];
+        let group_key_1 = [0x44; 32];
+        let mut responder_keys = keys();
+        responder_keys.groups.insert(
+            GROUP,
+            entangle_transport::GroupKeys {
+                current: 1,
+                keys: BTreeMap::from([(0, group_key_0), (1, group_key_1)]),
+            },
+        );
+        let mut initiator_keys = keys();
+        initiator_keys.groups.insert(
+            GROUP,
+            entangle_transport::GroupKeys {
+                current: 0,
+                keys: BTreeMap::from([(0, group_key_0)]),
+            },
+        );
+        let update = group_update(1);
+        let responder = Arc::new(CatchUpHandler {
+            manifest: manifest(),
+            particle_id: ParticleId::generate(),
+            epoch: AtomicU32::new(1),
+            updates: vec![update.clone()],
+            received_updates: Mutex::new(Vec::new()),
+            acknowledged: Mutex::new(Vec::new()),
+        });
+        let initiator = CatchUpHandler {
+            manifest: manifest(),
+            particle_id: ParticleId::generate(),
+            epoch: AtomicU32::new(0),
+            updates: Vec::new(),
+            received_updates: Mutex::new(Vec::new()),
+            acknowledged: Mutex::new(Vec::new()),
+        };
+        let (address, task) =
+            start_listener(responder_keys, responder.clone() as Arc<dyn LinkHandler>).await;
+        let result = connect_secure_with_handler(
+            &Route::Direct(address),
+            key_slot(&initiator_keys),
+            GROUP,
+            &initiator,
+            Duration::from_secs(2),
+        )
+        .await;
+        assert!(matches!(result, Err(LinkError::Stale)));
+        assert_eq!(*initiator.received_updates.lock().unwrap(), vec![update]);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if responder.acknowledged.lock().unwrap().contains(&1) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the ahead member should receive an update acknowledgement");
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn oversized_update_history_catches_up_over_multiple_links() {
+        let updates = (1..=17)
+            .map(group_update_with_revocations)
+            .collect::<Vec<_>>();
+        assert!(
+            serde_json::to_vec(&Frame::GroupUpdates {
+                updates: updates.clone()
+            })
+            .unwrap()
+            .len()
+                > MAX_FRAME_BYTES
+        );
+        let mut responder_keys = keys();
+        responder_keys.groups.insert(
+            GROUP,
+            entangle_transport::GroupKeys {
+                current: 17,
+                keys: (0..=17)
+                    .map(|epoch| (epoch, if epoch == 0 { [0x33; 32] } else { [0x44; 32] }))
+                    .collect(),
+            },
+        );
+        let mut initiator_keys = keys();
+        initiator_keys.groups.insert(
+            GROUP,
+            entangle_transport::GroupKeys {
+                current: 0,
+                keys: BTreeMap::from([(0, [0x33; 32])]),
+            },
+        );
+        let responder = Arc::new(CatchUpHandler {
+            manifest: manifest(),
+            particle_id: ParticleId::generate(),
+            epoch: AtomicU32::new(17),
+            updates: updates.clone(),
+            received_updates: Mutex::new(Vec::new()),
+            acknowledged: Mutex::new(Vec::new()),
+        });
+        let initiator = CatchUpHandler {
+            manifest: manifest(),
+            particle_id: ParticleId::generate(),
+            epoch: AtomicU32::new(0),
+            updates: Vec::new(),
+            received_updates: Mutex::new(Vec::new()),
+            acknowledged: Mutex::new(Vec::new()),
+        };
+        let initiator_keys = key_slot(&initiator_keys);
+        let (address, task) =
+            start_listener(responder_keys, responder.clone() as Arc<dyn LinkHandler>).await;
+        let mut redials = 0;
+        while initiator.epoch.load(Ordering::SeqCst) < 17 {
+            let result = connect_secure_with_handler(
+                &Route::Direct(address),
+                Arc::clone(&initiator_keys),
+                GROUP,
+                &initiator,
+                Duration::from_secs(2),
+            )
+            .await;
+            assert!(matches!(result, Err(LinkError::Stale)));
+            redials += 1;
+            let epoch = initiator.epoch.load(Ordering::SeqCst);
+            let mut keys = initiator_keys.write().unwrap();
+            let mut updated = (**keys).clone();
+            let group_keys = updated.groups.get_mut(&GROUP).unwrap();
+            group_keys.current = epoch;
+            group_keys.keys.insert(epoch, [0x44; 32]);
+            *keys = Arc::new(updated);
+        }
+        assert!(redials > 1);
+        assert_eq!(*initiator.received_updates.lock().unwrap(), updates);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if responder.acknowledged.lock().unwrap().len() == redials {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the ahead member should receive every partial update acknowledgement");
+
+        let final_link = connect_secure_with_handler(
+            &Route::Direct(address),
+            Arc::clone(&initiator_keys),
+            GROUP,
+            &initiator,
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+        drop(final_link);
         task.abort();
     }
 
@@ -1077,7 +1595,13 @@ mod tests {
     async fn wrong_group_key_is_reported_as_a_handshake_error() {
         let server_key = keys();
         let mut client_key = server_key.clone();
-        client_key.groups.get_mut(&GROUP).unwrap()[0] ^= 0x80;
+        client_key
+            .groups
+            .get_mut(&GROUP)
+            .unwrap()
+            .keys
+            .get_mut(&0)
+            .unwrap()[0] ^= 0x80;
         let (address, task) =
             start_listener(server_key, Arc::new(RejectingHandler(manifest()))).await;
         let route = Route::Direct(address);

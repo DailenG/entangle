@@ -587,7 +587,7 @@ mod tests {
                 .find(|(key, _)| *key == "proto")
                 .unwrap()
                 .1,
-            "4"
+            "5"
         );
     }
 

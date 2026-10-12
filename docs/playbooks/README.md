@@ -13,5 +13,5 @@ Use these walkthroughs for common group, network, repeater, and client setups.
 | 07 | [Laptop away from home](07-laptop-away-from-home.md) | A configured laptop must connect while off its home LAN | Laptop and reachable repeater |
 | 08 | [Agents coordinating a test across machines](08-agents-coordinating-a-test-across-machines.md) | Agents need to coordinate a multi-machine test | Agents on two or more devices |
 | 09 | [Windows with omp](09-windows-omp.md) | You are installing and configuring Entangle on Windows with omp | Windows device and its group peers |
-| 10 | Leaving a group, removing a device, rekeying — coming with member removal | Membership administration is available | Group members |
+| 10 | [Leave, remove, rekey, and hand off](10-leave-remove-rekey.md) | A member leaves or an admin changes group membership or keys | Group members |
 | 11 | [Troubleshooting](11-troubleshooting.md) | Discovery, linking, invitations, or repeater enrollment fails | The affected device and relevant peers |

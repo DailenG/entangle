@@ -114,6 +114,13 @@ The inviter should stay online briefly after onboarding: existing group
 members learn about newcomers when the inviter next links to them, using
 one-hop member introductions.
 
+Group membership administration is human-only. The group admin can use
+`entangle group remove <group> <member>` to remove a member and rotate the key,
+`entangle group rekey <group>` to rotate the key without changing membership,
+and `entangle group admin <group> <member>` to hand administration to a
+current member. An admin must hand off administration before leaving a group
+with other members. See [playbook 10](playbooks/10-leave-remove-rekey.md).
+
 ## Register as an MCP server
 
 Each device runs its own Entangle process. The default name is

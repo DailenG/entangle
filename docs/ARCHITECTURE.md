@@ -22,21 +22,33 @@ eight eight-hex group IDs. Group keys are never advertised.
 ## Groups and link
 
 Each machine can belong to up to eight groups stored at
-`<data_root>/groups/<id>/{key,meta.json,members.json}`. The `key` file contains
-the 32-byte group key as lowercase hex; `meta.json` stores the group's name and
-local role, and `members.json` maps particle IDs to names and Noise static
-public keys. Files and directories use private permissions. The group ID is
-the first four bytes of
+`<data_root>/groups/<id>/{key,meta.json,members.json,keys.json,updates.json}`.
+The `key` file contains the current 32-byte group key as lowercase hex;
+`meta.json` stores the group name, epoch, admin identity and signing key, and
+the current revocation set. `members.json` maps particle IDs to names, Noise
+static public keys, and signing public keys. `keys.json` retains up to 16 prior
+epoch keys and `updates.json` retains the corresponding signed update chain.
+Files and directories use private permissions. The group ID is the first four
+bytes of
 `SHA-256("entangle-group-id-v1" || key)`, encoded as eight lowercase hex
-characters. Its Noise PSK is
+characters at creation; it remains stable when the key rotates. Its Noise PSK is
 `SHA-256("entangle-group-psk-v1" || key)`.
 
-Protocol version 4 binds each link to one group. Before the Noise handshake,
-the initiator writes a 9-byte preface: `ENTG`, preface version `1`, and the
-four group-ID bytes. Both sides use the unchanged
+Group admins sign updates with an Ed25519 key derived from the particle's
+static private key. Updates form a contiguous epoch chain and carry the new
+group key, admin, and revocation set. A member verifies each signature against
+the current admin key before applying the next epoch. Updates can be relayed by
+any current member; a removed member cannot pass current membership checks.
+
+Protocol version 5 binds each link to a group and epoch. Before the Noise
+handshake, the initiator writes a 13-byte preface: `ENTG`, preface version `2`,
+the four group-ID bytes, and the requested epoch as a big-endian `u32`.
+Responders negotiate retained epochs with plaintext acknowledgements; a peer
+outside the retained-key window is rejected before Noise. Both sides use the
+unchanged
 `Noise_XXpsk3_25519_ChaChaPoly_BLAKE2s` pattern, the selected group's PSK at
 position 3, and the prologue
-`b"entangle-link-v4" || group_id_bytes`. A responder rejects malformed
+`b"entangle-link-v5" || group_id_bytes || epoch_be`. A responder rejects malformed
 prefaces and IDs for groups it does not have. Persistent particles store their
 32-byte Noise static private key as 64 lowercase hex characters at
 `<data_root>/noise_static.key`; ephemeral identities keep their static key in
@@ -90,8 +102,8 @@ sequenceDiagram
     B-->>A: MCP notification
 ```
 
-Protocol version 4 is not wire-compatible with earlier versions; all devices
-must use version 4 to communicate. MCP continues to use JSON-RPC 2.0 with
+Protocol version 5 is not wire-compatible with earlier versions; all devices
+must use version 5 to communicate. MCP continues to use JSON-RPC 2.0 with
 newline-delimited messages on stdio. Logs go to stderr; stdout belongs
 exclusively to MCP.
 

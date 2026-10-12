@@ -120,6 +120,20 @@ pub fn claim(root: &Path) -> Result<Identity, IdentityError> {
     persistent(id, lock, root)
 }
 
+pub fn is_running(root: &Path) -> bool {
+    let lock_path = root.join("identity.lock");
+    let Ok(lock) = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(lock_path)
+    else {
+        return false;
+    };
+    matches!(lock.try_lock(), Err(std::fs::TryLockError::WouldBlock))
+}
+
 /// Reads a saved identity without acquiring its process lock or creating files.
 pub fn read_saved(root: &Path) -> Result<Option<(ParticleId, [u8; 32])>, IdentityError> {
     let identity_path = root.join("identity");

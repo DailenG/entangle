@@ -1,5 +1,5 @@
 use crate::{
-    groups::{self, Group, GroupError, GroupMeta, Member, Role},
+    groups::{self, Group, GroupError, GroupMeta, Member},
     identity,
     invite::code::InviteCode,
 };
@@ -26,6 +26,7 @@ use tokio::{
 };
 
 const MAX_FRAME_BYTES: usize = 64 * 1024;
+const JOIN_GRANT_FRAME_MARGIN: usize = 4 * 1024;
 const SESSION_TIMEOUT: Duration = Duration::from_secs(30);
 const SPAKE_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_SESSIONS: usize = 8;
@@ -203,7 +204,14 @@ impl InviteServer {
         else {
             return Err(GroupError::MissingIdentity(root).into());
         };
-        groups::find(&root, &group_id)?.ok_or_else(|| GroupError::NotFound(group_id.clone()))?;
+        let group = groups::find(&root, &group_id)?
+            .ok_or_else(|| GroupError::NotFound(group_id.clone()))?;
+        if group.outdated {
+            return Err(GroupError::Outdated {
+                name: group.meta.name,
+            }
+            .into());
+        }
         Ok(Self {
             root,
             group_id,
@@ -316,8 +324,9 @@ impl InviteServer {
             .send(
                 stream,
                 &Message::GroupInfo {
-                    name: group.meta.name,
-                    group_id: group.id,
+                    name: group.meta.name.clone(),
+                    group_id: group.id.clone(),
+                    epoch: group.meta.epoch,
                     inviter_name: self.inviter_name.clone(),
                 },
             )
@@ -333,10 +342,12 @@ impl InviteServer {
                 particle_id,
                 name,
                 static_key,
+                sign_key,
             } => Member {
                 particle_id,
                 name,
                 static_key,
+                sign_key,
                 added_by: self.inviter_id.clone(),
                 added_at: Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
             },
@@ -349,6 +360,43 @@ impl InviteServer {
         let joined_name = request.name.clone();
         self.state.reserve().await?;
         *reserved = true;
+        let current = groups::find(&self.root, &self.group_id)?
+            .ok_or_else(|| GroupError::NotFound(self.group_id.clone()))?;
+        if current
+            .meta
+            .revoked
+            .iter()
+            .any(|revocation| revocation.particle_id == request.particle_id)
+        {
+            if current.meta.admin != self.inviter_id {
+                sender
+                    .send(
+                        stream,
+                        &Message::Decline {
+                            reason: DeclineReason::Removed,
+                        },
+                    )
+                    .await?;
+                return Err(InviteError::Declined {
+                    reason: DeclineReason::Removed.as_str().to_owned(),
+                    group_name: Some(current.meta.name),
+                });
+            }
+            let Some((_, static_private)) =
+                identity::read_saved(&self.root).map_err(|error| GroupError::Malformed {
+                    path: self.root.clone(),
+                    reason: error.to_string(),
+                })?
+            else {
+                return Err(GroupError::MissingIdentity(self.root.clone()).into());
+            };
+            groups::issue_unrevoke_update(
+                &self.root,
+                &self.group_id,
+                &request.particle_id,
+                &static_private,
+            )?;
+        }
         let mut proposed = groups::find(&self.root, &self.group_id)?
             .ok_or_else(|| GroupError::NotFound(self.group_id.clone()))?;
         if let Some(existing) = proposed
@@ -365,17 +413,8 @@ impl InviteServer {
                 .members
                 .sort_by(|left, right| left.particle_id.cmp(&right.particle_id));
         }
-        sender
-            .send(
-                stream,
-                &Message::JoinGrant {
-                    name: proposed.meta.name,
-                    key_hex: hex::encode(proposed.key),
-                    created_at: proposed.meta.created_at,
-                    members: proposed.members,
-                },
-            )
-            .await?;
+        let grant = bounded_join_grant(&proposed)?;
+        sender.send(stream, &grant).await?;
         if receiver.receive::<_, Message>(stream).await? != Message::Done {
             return Err(InviteError::Message("expected Done".into()));
         }
@@ -398,12 +437,53 @@ impl InviteServer {
     }
 }
 
+fn bounded_join_grant(group: &Group) -> Result<Message, InviteError> {
+    let mut first_update = 0;
+    loop {
+        let updates = group.updates[first_update..].to_vec();
+        let oldest_key_epoch = updates.first().map(|update| update.epoch.saturating_sub(1));
+        let retained_keys = oldest_key_epoch
+            .into_iter()
+            .flat_map(|oldest| {
+                group
+                    .retained_keys
+                    .range(oldest..)
+                    .map(|(epoch, key)| (*epoch, hex::encode(key)))
+            })
+            .collect();
+        let grant = Message::JoinGrant {
+            group_id: group.id.clone(),
+            name: group.meta.name.clone(),
+            key_hex: hex::encode(group.key),
+            created_at: group.meta.created_at.clone(),
+            epoch: group.meta.epoch,
+            admin: group.meta.admin.clone(),
+            admin_sign_key: group.meta.admin_sign_key.clone(),
+            revoked: group.meta.revoked.clone(),
+            members: group.members.clone(),
+            retained_keys,
+            updates,
+        };
+        let plaintext_len = serde_json::to_vec(&grant)
+            .map_err(|error| InviteError::Message(error.to_string()))?
+            .len();
+        if plaintext_len + 16 <= MAX_FRAME_BYTES - JOIN_GRANT_FRAME_MARGIN {
+            return Ok(grant);
+        }
+        if first_update == group.updates.len() {
+            return Err(InviteError::Oversize);
+        }
+        first_update += 1;
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum Message {
     GroupInfo {
         name: String,
         group_id: String,
+        epoch: u32,
         inviter_name: String,
     },
     Decline {
@@ -413,12 +493,20 @@ enum Message {
         particle_id: String,
         name: String,
         static_key: String,
+        sign_key: String,
     },
     JoinGrant {
+        group_id: String,
         name: String,
         key_hex: String,
         created_at: String,
+        epoch: u32,
+        admin: String,
+        admin_sign_key: String,
+        revoked: Vec<entangle_core::Revocation>,
         members: Vec<Member>,
+        retained_keys: Vec<(u32, String)>,
+        updates: Vec<entangle_core::GroupUpdate>,
     },
     Done,
     Committed,
@@ -429,6 +517,7 @@ enum Message {
 enum DeclineReason {
     AlreadyMember,
     NameTaken,
+    Removed,
 }
 
 impl DeclineReason {
@@ -436,6 +525,7 @@ impl DeclineReason {
         match self {
             Self::AlreadyMember => "already_member",
             Self::NameTaken => "name_taken",
+            Self::Removed => "removed",
         }
     }
 }
@@ -444,6 +534,29 @@ impl DeclineReason {
 pub struct Joined {
     pub group: Group,
     pub inviter_name: String,
+    pub refreshed: bool,
+}
+
+enum JoinMutation {
+    Inserted(String),
+    Refreshed {
+        previous: Box<Group>,
+        installed: Box<Group>,
+    },
+}
+
+struct GroupGrant {
+    group_id: String,
+    name: String,
+    key_hex: String,
+    created_at: String,
+    epoch: u32,
+    admin: String,
+    admin_sign_key: String,
+    revoked: Vec<entangle_core::Revocation>,
+    members: Vec<Member>,
+    retained_keys: Vec<(u32, String)>,
+    updates: Vec<entangle_core::GroupUpdate>,
 }
 
 /// Joins an inviter over an arbitrary byte stream.
@@ -487,7 +600,7 @@ where
     else {
         return Err(GroupError::MissingIdentity(root.to_owned()).into());
     };
-    let mut inserted_group = None;
+    let mut mutation = None;
     let result = timeout(
         session_timeout,
         join_inner(
@@ -497,7 +610,7 @@ where
             local_name,
             particle_name,
             (id, static_private),
-            &mut inserted_group,
+            &mut mutation,
         ),
     )
     .await;
@@ -508,10 +621,19 @@ where
     match result {
         Ok(joined) => Ok(joined),
         Err(error) => {
-            if let Some(group_id) = inserted_group.take() {
-                match groups::leave(root, &group_id) {
-                    Ok(_) | Err(GroupError::NotFound(_)) => Err(InviteError::Incomplete),
-                    Err(error) => Err(error.into()),
+            if let Some(mutation) = mutation.take() {
+                match mutation {
+                    JoinMutation::Inserted(group_id) => match groups::leave(root, &group_id) {
+                        Ok(_) | Err(GroupError::NotFound(_)) => Err(InviteError::Incomplete),
+                        Err(error) => Err(error.into()),
+                    },
+                    JoinMutation::Refreshed {
+                        previous,
+                        installed,
+                    } => match groups::restore_existing_if_unchanged(root, *previous, &installed) {
+                        Ok(_) => Err(InviteError::Incomplete),
+                        Err(error) => Err(error.into()),
+                    },
                 }
             } else {
                 Err(error)
@@ -527,12 +649,13 @@ async fn join_inner<S>(
     local_name: Option<&str>,
     particle_name: &str,
     identity: (entangle_core::ParticleId, [u8; 32]),
-    inserted_group: &mut Option<String>,
+    mutation: &mut Option<JoinMutation>,
 ) -> Result<Joined, InviteError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let (id, static_private) = identity;
+    let local_groups = groups::list(root)?;
     let (spake, local_msg) = Spake2::<Ed25519Group>::start_b(
         &Password::new(code.to_string().as_bytes()),
         &Identity::new(ID_INVITER),
@@ -555,26 +678,37 @@ where
 
     let mut sender = SecureJson::new(keys.enc_joiner);
     let mut receiver = SecureJson::new(keys.enc_inviter);
-    let (name, group_id, inviter_name) = match receiver.receive::<_, Message>(stream).await? {
-        Message::GroupInfo {
-            name,
-            group_id,
-            inviter_name,
-        } => (name, group_id, inviter_name),
-        message => {
-            return Err(InviteError::Message(format!(
-                "expected group info, got {message:?}"
-            )))
-        }
-    };
-    let local_group_name = local_name.unwrap_or(&name);
+    let (name, group_id, inviter_epoch, inviter_name) =
+        match receiver.receive::<_, Message>(stream).await? {
+            Message::GroupInfo {
+                name,
+                group_id,
+                epoch,
+                inviter_name,
+            } => (name, group_id, epoch, inviter_name),
+            message => {
+                return Err(InviteError::Message(format!(
+                    "expected group info, got {message:?}"
+                )))
+            }
+        };
+    let existing_group = local_groups
+        .iter()
+        .find(|group| group.id == group_id)
+        .cloned();
+    let refresh_existing = existing_group
+        .as_ref()
+        .is_some_and(|group| !group.outdated && group.meta.epoch < inviter_epoch);
+    let local_group_name = existing_group
+        .as_ref()
+        .map(|group| group.meta.name.as_str())
+        .unwrap_or_else(|| local_name.unwrap_or(&name));
     groups::validate_name(local_group_name)?;
-    let local_groups = groups::list(root)?;
-    let decline = if local_groups.iter().any(|group| group.id == group_id) {
+    let decline = if existing_group.is_some() && !refresh_existing {
         Some(DeclineReason::AlreadyMember)
     } else if local_groups
         .iter()
-        .any(|group| group.meta.name == local_group_name)
+        .any(|group| group.id != group_id && group.meta.name == local_group_name)
     {
         Some(DeclineReason::NameTaken)
     } else {
@@ -584,12 +718,14 @@ where
         let group_name = match reason {
             DeclineReason::AlreadyMember => &name,
             DeclineReason::NameTaken => local_group_name,
+            DeclineReason::Removed => &name,
         };
         sender.send(stream, &Message::Decline { reason }).await?;
         return Err(InviteError::Declined {
             reason: match reason {
                 DeclineReason::AlreadyMember => "already_member",
                 DeclineReason::NameTaken => "name_taken",
+                DeclineReason::Removed => "removed",
             }
             .to_owned(),
             group_name: Some(group_name.to_owned()),
@@ -602,60 +738,133 @@ where
                 particle_id: id.to_string(),
                 name: particle_name.to_owned(),
                 static_key: hex::encode(entangle_transport::public_key(&static_private)),
+                sign_key: groups::signing_public_key(&static_private),
             },
         )
         .await?;
     let grant = match receiver.receive::<_, Message>(stream).await? {
+        Message::Decline { reason } => {
+            return Err(InviteError::Declined {
+                reason: reason.as_str().to_owned(),
+                group_name: (reason == DeclineReason::Removed).then(|| name.clone()),
+            });
+        }
         Message::JoinGrant {
+            group_id,
             name,
             key_hex,
             created_at,
+            epoch,
+            admin,
+            admin_sign_key,
+            revoked,
             members,
-        } => (name, key_hex, created_at, members),
+            retained_keys,
+            updates,
+        } => GroupGrant {
+            group_id,
+            name,
+            key_hex,
+            created_at,
+            epoch,
+            admin,
+            admin_sign_key,
+            revoked,
+            members,
+            retained_keys,
+            updates,
+        },
         message => {
             return Err(InviteError::Message(format!(
                 "expected join grant, got {message:?}"
             )))
         }
     };
-    if grant.0 != name
-        || grant.1.len() != 64
+    if grant.group_id != group_id
+        || grant.name != name
+        || grant.key_hex.len() != 64
         || !grant
-            .1
+            .key_hex
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
     {
         return Err(InviteError::Message("invalid join grant".into()));
     }
-    let key: [u8; 32] = hex::decode(&grant.1)
+    let key: [u8; 32] = hex::decode(&grant.key_hex)
         .map_err(|_| InviteError::Message("invalid group key".into()))?
         .try_into()
         .map_err(|_| InviteError::Message("invalid group key".into()))?;
-    if groups::group_id(&key) != group_id {
-        return Err(InviteError::Message(
-            "group ID does not match the granted key".into(),
-        ));
-    }
-    let group = groups::insert(
-        root,
-        key,
-        GroupMeta {
-            version: 1,
-            name: local_group_name.to_owned(),
-            role: Role::Member,
-            created_at: grant.2,
-        },
-        grant.3,
+    let meta = GroupMeta {
+        version: 2,
+        name: local_group_name.to_owned(),
+        created_at: grant.created_at.clone(),
+        epoch: grant.epoch,
+        admin: grant.admin.clone(),
+        admin_sign_key: grant.admin_sign_key.clone(),
+        revoked: grant.revoked.clone(),
+        leaving: false,
+    };
+    let known_predecessor = existing_group.as_ref().and_then(|previous| {
+        let next_epoch = previous.meta.epoch.checked_add(1)?;
+        grant
+            .updates
+            .first()
+            .filter(|update| update.epoch == next_epoch)
+            .map(|_| {
+                (
+                    previous.meta.admin.as_str(),
+                    previous.meta.admin_sign_key.as_str(),
+                )
+            })
+    });
+    let mut retained_keys = groups::validate_join_history(
+        &grant.group_id,
+        &meta,
+        &key,
+        &grant.retained_keys,
+        &grant.updates,
+        known_predecessor,
     )?;
-    *inserted_group = Some(group.id.clone());
+    let group = Group {
+        id: grant.group_id,
+        key,
+        meta,
+        members: grant.members,
+        retained_keys: {
+            if let Some(previous) = existing_group.as_ref().filter(|_| refresh_existing) {
+                groups::merge_previous_retained_keys(&mut retained_keys, previous);
+            }
+            retained_keys
+        },
+        updates: grant.updates,
+        outdated: false,
+    };
+    let group = if refresh_existing {
+        let expected_epoch = existing_group
+            .as_ref()
+            .expect("refresh requires an existing group")
+            .meta
+            .epoch;
+        let previous = groups::replace_existing(root, group.clone(), expected_epoch)?;
+        *mutation = Some(JoinMutation::Refreshed {
+            previous: Box::new(previous),
+            installed: Box::new(group.clone()),
+        });
+        group
+    } else {
+        let inserted = groups::insert_group(root, group.clone())?;
+        *mutation = Some(JoinMutation::Inserted(inserted.id.clone()));
+        inserted
+    };
     sender.send(stream, &Message::Done).await?;
     if receiver.receive::<_, Message>(stream).await? != Message::Committed {
         return Err(InviteError::Message("expected commit confirmation".into()));
     }
-    *inserted_group = None;
+    *mutation = None;
     Ok(Joined {
         group,
         inviter_name,
+        refreshed: refresh_existing,
     })
 }
 
@@ -840,6 +1049,7 @@ mod tests {
             particle_id: id.clone(),
             name: name.into(),
             static_key: hex::encode(entangle_transport::public_key(&identity.static_private)),
+            sign_key: groups::signing_public_key(&identity.static_private),
             added_by: id,
             added_at: Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
         };
@@ -853,10 +1063,14 @@ mod tests {
             root,
             [0x42; 32],
             GroupMeta {
-                version: 1,
+                version: 2,
                 name: "work".into(),
-                role: Role::Admin,
                 created_at: Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
+                epoch: 0,
+                admin: member.particle_id.clone(),
+                admin_sign_key: member.sign_key.clone(),
+                revoked: vec![],
+                leaving: false,
             },
             vec![member],
         )
@@ -899,6 +1113,101 @@ mod tests {
         )
     }
 
+    #[tokio::test]
+    async fn admin_reinvitation_unrevokes_a_removed_particle_before_granting() {
+        let inviter_root = tempfile::tempdir().unwrap();
+        let group = setup_group(inviter_root.path());
+        let joiner_root = tempfile::tempdir().unwrap();
+        let removed = saved_member(joiner_root.path(), "removed");
+        groups::add_member(inviter_root.path(), &group.id, removed.clone()).unwrap();
+        let admin_private = identity::read_saved(inviter_root.path())
+            .unwrap()
+            .unwrap()
+            .1;
+        let revoked = groups::issue_update(
+            inviter_root.path(),
+            &group.id,
+            entangle_core::UpdateKind::Remove {
+                particle_id: removed.particle_id.clone(),
+            },
+            &admin_private,
+        )
+        .unwrap();
+        let server = server(inviter_root.path(), &revoked, 1, DEFAULT_TTL);
+
+        let joined = successful_join(&server, joiner_root.path(), "removed")
+            .await
+            .unwrap();
+        let inviter_group = groups::find(inviter_root.path(), &group.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(joined.group.meta.epoch, 2);
+        assert_eq!(inviter_group.meta.epoch, 2);
+        assert_eq!(joined.group.key, revoked.key);
+        assert!(joined.group.meta.revoked.is_empty());
+        assert!(inviter_group.meta.revoked.is_empty());
+        assert!(joined
+            .group
+            .members
+            .iter()
+            .any(|member| member.particle_id == removed.particle_id));
+    }
+
+    #[tokio::test]
+    async fn non_admin_inviter_declines_a_revoked_particle() {
+        let admin_root = tempfile::tempdir().unwrap();
+        let group = setup_group(admin_root.path());
+        let inviter_root = tempfile::tempdir().unwrap();
+        let inviter = saved_member(inviter_root.path(), "member");
+        let joiner_root = tempfile::tempdir().unwrap();
+        let removed = saved_member(joiner_root.path(), "removed");
+        groups::add_member(admin_root.path(), &group.id, inviter.clone()).unwrap();
+        groups::add_member(admin_root.path(), &group.id, removed.clone()).unwrap();
+        let admin_private = identity::read_saved(admin_root.path()).unwrap().unwrap().1;
+        let revoked = groups::issue_update(
+            admin_root.path(),
+            &group.id,
+            entangle_core::UpdateKind::Remove {
+                particle_id: removed.particle_id.clone(),
+            },
+            &admin_private,
+        )
+        .unwrap();
+        groups::insert_with_id(
+            inviter_root.path(),
+            revoked.id.clone(),
+            revoked.key,
+            revoked.meta.clone(),
+            revoked.members.clone(),
+        )
+        .unwrap();
+        let server = InviteServer::new(
+            inviter_root.path(),
+            revoked.id.clone(),
+            inviter.particle_id,
+            code(),
+            1,
+            DEFAULT_TTL,
+        )
+        .unwrap();
+
+        let result = successful_join(&server, joiner_root.path(), "removed").await;
+        assert!(
+            matches!(
+                &result,
+                Err(InviteError::Declined { reason, group_name })
+                    if reason == "removed" && group_name.as_deref() == Some("work")
+            ),
+            "unexpected invitation result: {result:?}"
+        );
+        let unchanged = groups::find(inviter_root.path(), &revoked.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(unchanged.meta.epoch, revoked.meta.epoch);
+        assert_eq!(unchanged.meta.revoked, revoked.meta.revoked);
+        assert_eq!(server.state().counts().await, (0, 1));
+    }
+
     async fn successful_join(
         server: &InviteServer,
         root: &Path,
@@ -926,7 +1235,12 @@ mod tests {
         let joined = successful_join(&server, joiner_root.path(), "joiner")
             .await
             .unwrap();
-        assert_eq!(joined.group.meta.role, Role::Member);
+        let joiner_id = identity::read_saved(joiner_root.path())
+            .unwrap()
+            .unwrap()
+            .0
+            .to_string();
+        assert!(!joined.group.meta.is_admin(&joiner_id));
         assert_eq!(joined.group.members.len(), 2);
         assert!(joined
             .group
@@ -1043,6 +1357,7 @@ mod tests {
                     particle_id: joiner_id.to_string(),
                     name: "joiner".into(),
                     static_key: hex::encode(entangle_transport::public_key(&joiner_private)),
+                    sign_key: groups::signing_public_key(&joiner_private),
                 },
             )
             .await
@@ -1116,6 +1431,246 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(server.state().counts().await, (1, 1));
+    }
+
+    #[tokio::test]
+    async fn failed_refresh_confirmation_does_not_restore_a_member_who_left() {
+        let inviter_root = tempfile::tempdir().unwrap();
+        let group = setup_group(inviter_root.path());
+        let joiner_root = tempfile::tempdir().unwrap();
+        let joiner_member = saved_member(joiner_root.path(), "joiner");
+        let departed_root = tempfile::tempdir().unwrap();
+        let departed = saved_member(departed_root.path(), "departed");
+        groups::add_member(inviter_root.path(), &group.id, joiner_member.clone()).unwrap();
+        groups::add_member(inviter_root.path(), &group.id, departed.clone()).unwrap();
+        let admin_private = identity::read_saved(inviter_root.path())
+            .unwrap()
+            .unwrap()
+            .1;
+        let grant = groups::issue_update(
+            inviter_root.path(),
+            &group.id,
+            entangle_core::UpdateKind::Rekey,
+            &admin_private,
+        )
+        .unwrap();
+        let mut local_meta = group.meta.clone();
+        local_meta.name = "local-work".into();
+        groups::insert_with_id(
+            joiner_root.path(),
+            group.id.clone(),
+            group.key,
+            local_meta,
+            grant.members.clone(),
+        )
+        .unwrap();
+
+        let (joiner_stream, mut inviter_stream) = duplex(1024 * 1024);
+        let (installed_tx, installed_rx) = tokio::sync::oneshot::channel();
+        let (continue_tx, continue_rx) = tokio::sync::oneshot::channel();
+        let invitation_group = grant.clone();
+        let inviter_task = tokio::spawn(async move {
+            let (spake, local_msg) = Spake2::<Ed25519Group>::start_a(
+                &Password::new(code().to_string().as_bytes()),
+                &Identity::new(ID_INVITER),
+                &Identity::new(ID_JOINER),
+            );
+            write_tagged_frame(&mut inviter_stream, FRAME_SPAKE, &local_msg)
+                .await
+                .unwrap();
+            let peer_frame = read_frame(&mut inviter_stream).await.unwrap();
+            let peer_msg = tagged_body(&peer_frame, FRAME_SPAKE).unwrap();
+            let shared = spake.finish(peer_msg).unwrap();
+            let keys = DerivedKeys::new(&shared);
+            let confirmation_frame = read_frame(&mut inviter_stream).await.unwrap();
+            let confirmation = tagged_body(&confirmation_frame, FRAME_CONFIRM).unwrap();
+            assert!(bool::from(keys.confirm_joiner.ct_eq(confirmation)));
+            write_tagged_frame(&mut inviter_stream, FRAME_CONFIRM, &keys.confirm_inviter)
+                .await
+                .unwrap();
+
+            let mut sender = SecureJson::new(keys.enc_inviter);
+            let mut receiver = SecureJson::new(keys.enc_joiner);
+            sender
+                .send(
+                    &mut inviter_stream,
+                    &Message::GroupInfo {
+                        name: invitation_group.meta.name.clone(),
+                        group_id: invitation_group.id.clone(),
+                        epoch: invitation_group.meta.epoch,
+                        inviter_name: "inviter".into(),
+                    },
+                )
+                .await
+                .unwrap();
+            assert!(matches!(
+                receiver
+                    .receive::<_, Message>(&mut inviter_stream)
+                    .await
+                    .unwrap(),
+                Message::JoinRequest { .. }
+            ));
+            sender
+                .send(
+                    &mut inviter_stream,
+                    &bounded_join_grant(&invitation_group).unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                receiver
+                    .receive::<_, Message>(&mut inviter_stream)
+                    .await
+                    .unwrap(),
+                Message::Done
+            );
+            installed_tx.send(()).unwrap();
+            continue_rx.await.unwrap();
+            drop(inviter_stream);
+        });
+        let joiner_path = joiner_root.path().to_path_buf();
+        let joiner_task = tokio::spawn(async move {
+            join_with_timeout(
+                joiner_stream,
+                &joiner_path,
+                code(),
+                None,
+                "joiner",
+                Duration::from_secs(5),
+            )
+            .await
+        });
+
+        installed_rx.await.unwrap();
+        groups::remove_member(joiner_root.path(), &group.id, &departed.particle_id).unwrap();
+        continue_tx.send(()).unwrap();
+
+        assert!(matches!(
+            joiner_task.await.unwrap(),
+            Err(InviteError::Group(GroupError::Conflict { name })) if name == "local-work"
+        ));
+        let current = groups::find(joiner_root.path(), &group.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(current.meta.epoch, grant.meta.epoch);
+        assert!(!current
+            .members
+            .iter()
+            .any(|member| member.particle_id == departed.particle_id));
+        inviter_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn oversized_update_history_is_bounded_and_invitation_succeeds() {
+        let inviter_root = tempfile::tempdir().unwrap();
+        let admin = saved_member(inviter_root.path(), "inviter");
+        let revoked = (0..40)
+            .map(|index| entangle_core::Revocation {
+                particle_id: entangle_core::ParticleId::generate().to_string(),
+                static_key: format!("{index:064x}"),
+            })
+            .collect::<Vec<_>>();
+        let group = groups::insert(
+            inviter_root.path(),
+            [0x52; 32],
+            GroupMeta {
+                version: 2,
+                name: "work".into(),
+                created_at: Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
+                epoch: 0,
+                admin: admin.particle_id.clone(),
+                admin_sign_key: admin.sign_key.clone(),
+                revoked: revoked.clone(),
+                leaving: false,
+            },
+            vec![admin],
+        )
+        .unwrap();
+        let admin_private = identity::read_saved(inviter_root.path())
+            .unwrap()
+            .unwrap()
+            .1;
+        let mut group = group;
+        for _ in 0..17 {
+            group = groups::issue_update(
+                inviter_root.path(),
+                &group.id,
+                entangle_core::UpdateKind::Rekey,
+                &admin_private,
+            )
+            .unwrap();
+        }
+        assert!(group
+            .updates
+            .iter()
+            .all(|update| update.revoked.len() == 40));
+        let full_grant = Message::JoinGrant {
+            group_id: group.id.clone(),
+            name: group.meta.name.clone(),
+            key_hex: hex::encode(group.key),
+            created_at: group.meta.created_at.clone(),
+            epoch: group.meta.epoch,
+            admin: group.meta.admin.clone(),
+            admin_sign_key: group.meta.admin_sign_key.clone(),
+            revoked: group.meta.revoked.clone(),
+            members: group.members.clone(),
+            retained_keys: group
+                .retained_keys
+                .iter()
+                .map(|(epoch, key)| (*epoch, hex::encode(key)))
+                .collect(),
+            updates: group.updates.clone(),
+        };
+        assert!(
+            serde_json::to_vec(&full_grant).unwrap().len() + 16 > MAX_FRAME_BYTES,
+            "the regression fixture must exceed the invite frame limit"
+        );
+        let bounded = bounded_join_grant(&group).unwrap();
+        let Message::JoinGrant {
+            retained_keys,
+            updates,
+            ..
+        } = bounded
+        else {
+            unreachable!()
+        };
+        assert!(updates.len() < group.updates.len());
+        assert!(
+            serde_json::to_vec(&Message::JoinGrant {
+                group_id: group.id.clone(),
+                name: group.meta.name.clone(),
+                key_hex: hex::encode(group.key),
+                created_at: group.meta.created_at.clone(),
+                epoch: group.meta.epoch,
+                admin: group.meta.admin.clone(),
+                admin_sign_key: group.meta.admin_sign_key.clone(),
+                revoked: group.meta.revoked.clone(),
+                members: group.members.clone(),
+                retained_keys: retained_keys.clone(),
+                updates: updates.clone(),
+            })
+            .unwrap()
+            .len()
+                + 16
+                <= MAX_FRAME_BYTES - JOIN_GRANT_FRAME_MARGIN
+        );
+        let oldest_key_epoch = updates.first().unwrap().epoch.saturating_sub(1);
+        assert!(retained_keys
+            .iter()
+            .all(|(epoch, _)| *epoch >= oldest_key_epoch));
+
+        let invite_server = server(inviter_root.path(), &group, 1, DEFAULT_TTL);
+        let joiner_root = tempfile::tempdir().unwrap();
+        let _joiner = saved_member(joiner_root.path(), "joiner");
+        let joined = successful_join(&invite_server, joiner_root.path(), "joiner")
+            .await
+            .unwrap();
+        assert_eq!(joined.group.meta.epoch, 17);
+        assert_eq!(
+            joined.group.updates.first().unwrap().epoch,
+            updates.first().unwrap().epoch
+        );
+        assert_eq!(joined.group.updates.last().unwrap().epoch, 17);
     }
 
     #[tokio::test]
@@ -1205,6 +1760,7 @@ mod tests {
                     particle_id: good_id.to_string(),
                     name: "good-joiner".into(),
                     static_key: hex::encode(entangle_transport::public_key(&good_private)),
+                    sign_key: groups::signing_public_key(&good_private),
                 },
             )
             .await
@@ -1275,12 +1831,16 @@ mod tests {
             already_root.path(),
             group.key,
             GroupMeta {
-                version: 1,
+                version: 2,
                 name: "work".into(),
-                role: Role::Member,
                 created_at: group.meta.created_at.clone(),
+                epoch: 0,
+                admin: group.meta.admin.clone(),
+                admin_sign_key: group.meta.admin_sign_key.clone(),
+                revoked: vec![],
+                leaving: false,
             },
-            vec![already_member],
+            vec![group.members[0].clone(), already_member],
         )
         .unwrap();
         assert!(matches!(
@@ -1296,10 +1856,14 @@ mod tests {
             taken_root.path(),
             [0x11; 32],
             GroupMeta {
-                version: 1,
+                version: 2,
                 name: "work".into(),
-                role: Role::Admin,
                 created_at: Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
+                epoch: 0,
+                admin: _taken.particle_id.clone(),
+                admin_sign_key: _taken.sign_key.clone(),
+                revoked: vec![],
+                leaving: false,
             },
             vec![_taken],
         )
