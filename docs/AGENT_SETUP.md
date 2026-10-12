@@ -7,6 +7,7 @@ have `entangle` on `PATH`, Entangle registered as an MCP server in your own MCP
 client configuration, and its group members discoverable. Ask the human before
 using `sudo`, installing system packages, changing firewall rules, or editing
 a configuration file you did not create; show them the proposed diff first.
+For scenario walkthroughs, see the [playbooks](playbooks/README.md).
 
 ### Running commands on Windows
 
@@ -109,8 +110,8 @@ proceeding.
 
 ## Groups
 
-Human-only commands: `group create`, `group invite`, `group join`, `group
-leave`, `group remove`, `group rekey`, and `group admin`. Agents may run
+Human-only commands: `group create`, `group invite`, `group join`, and
+`group leave`. Agents may run
 `entangle group list`, `entangle group members <name>`, and `entangle peer
 list`. One device invites with `entangle group invite <name> [--count N]`;
 the human enters the one-time code on each other device with

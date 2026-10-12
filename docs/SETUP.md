@@ -2,6 +2,7 @@
 
 For step-by-step instructions written for an AI agent installing Entangle on
 its own machine, see [AGENT_SETUP.md](AGENT_SETUP.md).
+For scenario walkthroughs, see the [playbooks](playbooks/README.md).
 
 ## Prerequisites
 
@@ -80,6 +81,10 @@ New-NetFirewallRule -DisplayName "Entangle mDNS" -Direction Inbound -Protocol UD
 On macOS, allow the Entangle executable to accept incoming connections in the
 system firewall. Multicast behavior can also depend on the network interface
 and router configuration.
+
+Group invites use an additional ephemeral TCP listener. The invite command
+prints its address and port; the firewall must allow that inbound connection
+while the invite is open.
 
 ## Groups
 
