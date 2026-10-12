@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Entangle: encrypted state sync between AI agents</title>
-<meta name="description" content="Entangle is an open-source Rust MCP server. AI agents on your network find each other over mDNS, a human approves each pairing with a three-emoji check, and files and JSON move over end-to-end Noise-encrypted links, directly or through a self-hosted Quantum Repeater.">
+<meta name="description" content="Entangle is an open-source Rust MCP server. AI agents on your network find each other over mDNS, devices join a group with one short code, and files and JSON move over end-to-end Noise-encrypted links, directly or through a self-hosted Quantum Repeater.">
 <meta name="color-scheme" content="light dark">
 <link rel="preload" href="assets/fonts/inter-latin.woff2" as="font" type="font/woff2" crossorigin>
 <link rel="stylesheet" href="styles.css">
@@ -68,21 +68,20 @@
     <div class="wrap">
       <div class="section-head">
         <span class="eyebrow">How it works</span>
-        <h2>Discover, pair, sync.</h2>
-        <p>Each machine runs one Entangle process as an MCP stdio server. Discovery is automatic, pairing is a human step, and every sync is encrypted end to end.</p>
+        <h2>Discover, join, sync.</h2>
+        <p>Each machine runs one Entangle process as an MCP stdio server. Discovery is automatic, joining is a human step, and every sync is encrypted end to end.</p>
       </div>
       <ol class="steps">
         <li>
           <div><h3>Resonance</h3></div>
-          <div><p>Particles advertise over mDNS on the local network and publish only a public pairing-group ID, never the key. Where multicast is blocked, static <code>--peer</code> entries do the same job.</p>
+          <div><p>Particles advertise over mDNS on the local network and publish only public group IDs, never a key. Where multicast is blocked, static <code>--peer</code> entries do the same job.</p>
           <pre>entangle scan</pre></div>
         </li>
         <li>
-          <div><h3>Pairing, by a human</h3></div>
-          <div><p>One person creates a pairing code, another enters it. On first contact both machines derive three emoji from a commit-then-reveal exchange; the humans compare and approve. Agents never see the code and cannot approve.</p>
-          <pre>entangle pair init
-entangle pair join &lt;code&gt;
-entangle peer approve</pre></div>
+          <div><h3>Joining, by a human</h3></div>
+          <div><p>One device opens an invite and shows a short one-time code; every other device enters it once, in any order. The code drives a password-authenticated key exchange, so typing it correctly proves both ends to each other, and each new member is introduced to the rest of the group. Agents never see the code and cannot invite.</p>
+          <pre>entangle group create work --invite 4
+entangle group join 4-ion-quark-muon</pre></div>
         </li>
         <li>
           <div><h3>State sync</h3></div>
@@ -104,8 +103,8 @@ observe_entangled_states</pre></div>
       </div>
       <ul class="facts">
         <li><strong>It sees</strong><span>Enrolled device public keys, the declared group ID, connection timing, traffic sizes.</span></li>
-        <li><strong>It cannot see</strong><span>Particle names, pairing keys, the verification emoji, or any synced content.</span></li>
-        <li><strong>Enrollment</strong><span>A single-use invite code from the host, or a join request the host approves after comparing emoji. Devices pin the repeater's static key; revocation by fingerprint.</span></li>
+        <li><strong>It cannot see</strong><span>Particle names, group keys, invite codes, or any synced content.</span></li>
+        <li><strong>Enrollment</strong><span>A one-time invite code from the host. Devices pin the repeater's static key; revocation by fingerprint.</span></li>
         <li><strong>Runs as</strong><span><code>entangle repeater serve</code> on a VPS or home box, as a systemd unit or a Docker container.</span></li>
         <li><strong>Relay-only</strong><span><code>--relay-only</code> removes the TCP listener and mDNS for machines that must never accept a direct link.</span></li>
       </ul>
