@@ -82,12 +82,14 @@ enum Command {
 enum GroupCommand {
     /// Create a group for this machine.
     Create {
+        #[arg(id = "group_name", value_name = "NAME")]
         name: String,
         #[arg(long)]
         invite: Option<u8>,
     },
     /// Invite devices to join a group.
     Invite {
+        #[arg(id = "group_name", value_name = "NAME")]
         name: String,
         #[arg(long, default_value_t = 1)]
         count: u8,
@@ -109,12 +111,16 @@ enum GroupCommand {
     },
     /// List members of a group.
     Members {
+        #[arg(id = "group_name", value_name = "NAME")]
         name: String,
         #[arg(long)]
         json: bool,
     },
     /// Leave a group.
-    Leave { name: String },
+    Leave {
+        #[arg(id = "group_name", value_name = "NAME")]
+        name: String,
+    },
 }
 
 #[tokio::main]
@@ -739,6 +745,27 @@ fn short_particle_id(id: &str) -> &str {
 mod tests {
     use super::*;
 
+    fn parse_cli_without_name_env(args: &[&str]) -> Cli {
+        static ENTANGLE_NAME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _lock = ENTANGLE_NAME_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous_name = std::env::var_os("ENTANGLE_NAME");
+        std::env::remove_var("ENTANGLE_NAME");
+        let parsed = Cli::try_parse_from(args.iter().copied());
+        if let Some(previous_name) = previous_name {
+            std::env::set_var("ENTANGLE_NAME", previous_name);
+        }
+        parsed.unwrap()
+    }
+
+    fn group_command(cli: Cli) -> GroupCommand {
+        match cli.command {
+            Some(Command::Group { command }) => command,
+            other => panic!("expected group command, got {other:?}"),
+        }
+    }
+
     fn options(data_root: &std::path::Path) -> Options {
         Options {
             name: Some("local".into()),
@@ -754,6 +781,61 @@ mod tests {
             relay_only: false,
             log_level: "warn".into(),
         }
+    }
+
+    #[test]
+    fn group_create_keeps_particle_name_separate_from_group_name() {
+        let cli =
+            parse_cli_without_name_env(&["entangle", "--name", "pc-a", "group", "create", "work"]);
+        assert_eq!(cli.options.name.as_deref(), Some("pc-a"));
+        assert!(matches!(
+            group_command(cli),
+            GroupCommand::Create { name, .. } if name == "work"
+        ));
+    }
+
+    #[test]
+    fn group_create_without_particle_name_keeps_group_name() {
+        let cli = parse_cli_without_name_env(&["entangle", "group", "create", "work"]);
+        assert_eq!(cli.options.name, None);
+        assert!(matches!(
+            group_command(cli),
+            GroupCommand::Create { name, .. } if name == "work"
+        ));
+    }
+
+    #[test]
+    fn group_invite_keeps_particle_name_separate_from_group_name() {
+        let cli = parse_cli_without_name_env(&[
+            "entangle", "--name", "pc-a", "group", "invite", "work", "--count", "2",
+        ]);
+        assert_eq!(cli.options.name.as_deref(), Some("pc-a"));
+        assert!(matches!(
+            group_command(cli),
+            GroupCommand::Invite { name, count: 2 } if name == "work"
+        ));
+    }
+
+    #[test]
+    fn group_invite_without_particle_name_keeps_group_name() {
+        let cli =
+            parse_cli_without_name_env(&["entangle", "group", "invite", "work", "--count", "2"]);
+        assert_eq!(cli.options.name, None);
+        assert!(matches!(
+            group_command(cli),
+            GroupCommand::Invite { name, count: 2 } if name == "work"
+        ));
+    }
+
+    #[test]
+    fn group_members_keeps_particle_name_separate_from_group_name() {
+        let cli =
+            parse_cli_without_name_env(&["entangle", "--name", "pc-a", "group", "members", "work"]);
+        assert_eq!(cli.options.name.as_deref(), Some("pc-a"));
+        assert!(matches!(
+            group_command(cli),
+            GroupCommand::Members { name, .. } if name == "work"
+        ));
     }
 
     #[test]
