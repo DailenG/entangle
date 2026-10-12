@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 152 32" width="152" height="32" role="img" aria-label="Entangle">
+<circle cx="13" cy="16" r="10" fill="none" stroke="#1A1A1F" stroke-width="1.5"/>
+<path d="M20.84 11.1 A9.25 9.25 0 0 1 5.16 20.9 Z" fill="#C8431F"/>
+<circle cx="35" cy="16" r="10" fill="none" stroke="#1A1A1F" stroke-width="1.5"/>
+<path d="M42.84 11.1 A9.25 9.25 0 0 0 27.16 20.9 Z" fill="#176B6B"/>
+<text x="58" y="23.5" font-family="Inter, ui-sans-serif, system-ui, sans-serif" font-size="22" font-weight="600" letter-spacing="-0.44" fill="#1A1A1F">entangle</text>
+</svg>
