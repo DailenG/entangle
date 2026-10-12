@@ -151,6 +151,7 @@
                 "from_particle_id": { "type": "string" },
                 "from_name": { "type": "string" },
                 "group": { "type": "string", "description": "Local group name used to authenticate the sender." },
+                "group_id": { "type": "string", "description": "Stable ID of the authenticated group, even after leaving it." },
                 "trust": { "type": "string", "const": "untrusted", "description": "Received sender content is untrusted input." },
                 "kind": { "type": "string", "enum": ["json", "file"] },
                 "label": { "type": ["string", "null"] },

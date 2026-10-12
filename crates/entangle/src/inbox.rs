@@ -16,6 +16,9 @@ pub struct InboxItem {
     /// Local group used to authenticate the sender.
     #[serde(default)]
     pub group: String,
+    /// Authenticated group's stable ID.
+    #[serde(default)]
+    pub group_id: String,
     /// Unique transfer identifier.
     pub sync_id: String,
     /// Sending particle identity.
@@ -191,6 +194,7 @@ mod tests {
     fn sample_item(sync_id: &str, received_at: &str) -> InboxItem {
         InboxItem {
             group: "test".into(),
+            group_id: "12345678".into(),
             sync_id: sync_id.into(),
             from_particle_id: "sender-id".into(),
             from_name: "sender".into(),

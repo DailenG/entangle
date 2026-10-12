@@ -1083,20 +1083,34 @@ impl Particle {
             .get("collapse")
             .and_then(Value::as_bool)
             .unwrap_or(false);
-        let group_names: HashMap<String, String> = self
-            .groups
-            .read()
-            .expect("group store lock")
-            .iter()
-            .map(|group| (group.id.clone(), group.meta.name.clone()))
-            .collect();
-        let render_group = |stored: &str| {
-            group_names
-                .get(stored)
-                .cloned()
-                .unwrap_or_else(|| stored.to_owned())
+        let (group_names, group_ids_by_name): (HashMap<String, String>, HashMap<String, String>) = {
+            let groups = self.groups.read().expect("group store lock");
+            (
+                groups
+                    .iter()
+                    .map(|group| (group.id.clone(), group.meta.name.clone()))
+                    .collect(),
+                groups
+                    .iter()
+                    .map(|group| (group.meta.name.clone(), group.id.clone()))
+                    .collect(),
+            )
         };
-        let group_filter = args.get("group").and_then(Value::as_str).map(render_group);
+        let group_filter = args.get("group").and_then(Value::as_str).map(str::to_owned);
+        let group_filter_id = group_filter
+            .as_ref()
+            .and_then(|filter| group_ids_by_name.get(filter));
+        let render_group = |item: &InboxItem| {
+            let stored_id = if item.group_id.is_empty() {
+                &item.group
+            } else {
+                &item.group_id
+            };
+            group_names
+                .get(stored_id)
+                .cloned()
+                .unwrap_or_else(|| item.group.clone())
+        };
         let mut inbox = self.inbox.lock().await;
         let start = match since {
             Some(id) => inbox
@@ -1109,9 +1123,11 @@ impl Particle {
             .iter()
             .skip(start)
             .filter(|item| {
-                group_filter
-                    .as_ref()
-                    .is_none_or(|group| render_group(&item.group) == group.as_str())
+                group_filter.as_ref().is_none_or(|filter| {
+                    item.group == *filter
+                        || (!item.group_id.is_empty() && item.group_id == *filter)
+                        || group_filter_id.is_some_and(|id| item.group_id == *id)
+                })
             })
             .take(limit)
             .cloned()
@@ -1128,11 +1144,13 @@ impl Particle {
         let states = selected
             .into_iter()
             .map(|item| {
+                let group = render_group(&item);
                 json!({
                     "sync_id": item.sync_id,
                     "from_particle_id": item.from_particle_id,
                     "from_name": item.from_name,
-                    "group": render_group(&item.group),
+                    "group": group,
+                    "group_id": item.group_id,
                     "trust": "untrusted",
                     "kind": item.kind,
                     "label": item.label,
@@ -1334,6 +1352,10 @@ impl Particle {
             members
         };
         let fan_out = single.is_none();
+        let candidate_groups = match pinned.as_ref() {
+            Some(group) => std::slice::from_ref(group),
+            None => local_groups.as_slice(),
+        };
         let mut seen = HashSet::new();
         let mut seen_inputs = HashSet::new();
         let mut plans = Vec::new();
@@ -1343,7 +1365,7 @@ impl Particle {
                 continue;
             }
             let (particle_id, member_name) =
-                match Self::resolve_group_member(&local_groups, &identifier) {
+                match Self::resolve_group_member(candidate_groups, &identifier) {
                     Ok(Some(member)) => member,
                     Ok(None) => {
                         failures.push((
@@ -2070,16 +2092,18 @@ impl Particle {
                 }
                 StateKind::File => (None, None),
             };
+            let group_id = hex::encode(peer_info.group);
             let group = self
                 .groups
                 .read()
                 .expect("group store lock")
                 .iter()
-                .find(|group| groups::group_id_bytes(&group.key) == peer_info.group)
+                .find(|group| group.id == group_id)
                 .map(|group| group.meta.name.clone())
                 .ok_or_else(|| "authenticated group is no longer available".to_owned())?;
             let item = InboxItem {
                 group,
+                group_id,
                 sync_id: offer.sync_id.clone(),
                 from_particle_id: manifest.particle_id.to_string(),
                 from_name: manifest.name.clone(),
@@ -2539,31 +2563,35 @@ mod tests {
 
     #[test]
     fn group_member_prefix_resolution_rejects_ambiguous_prefixes() {
-        let group = Group {
-            id: groups::group_id(&[0x73; 32]),
-            key: [0x73; 32],
+        let member = |particle_id: &str| Member {
+            particle_id: particle_id.into(),
+            name: particle_id.into(),
+            static_key: String::new(),
+            added_by: String::new(),
+            added_at: String::new(),
+        };
+        let group = |name: &str, key: [u8; 32], particle_id: &str| Group {
+            id: groups::group_id(&key),
+            key,
             meta: groups::GroupMeta {
                 version: 1,
-                name: "work".into(),
+                name: name.into(),
                 role: groups::Role::Admin,
                 created_at: chrono::Utc::now().to_rfc3339(),
             },
-            members: [
-                "deadbeef000000000000000000000001",
-                "deadbeef000000000000000000000002",
-            ]
-            .into_iter()
-            .map(|particle_id| Member {
-                particle_id: particle_id.into(),
-                name: particle_id.into(),
-                static_key: String::new(),
-                added_by: String::new(),
-                added_at: String::new(),
-            })
-            .collect(),
+            members: vec![member(particle_id)],
         };
+        let work = group("work", [0x73; 32], "deadbeef000000000000000000000001");
+        let home = group("home", [0x74; 32], "deadbeef000000000000000000000002");
         assert_eq!(
-            Particle::resolve_group_member(&[group], "deadbeef").unwrap_err(),
+            Particle::resolve_group_member(std::slice::from_ref(&work), "deadbeef")
+                .unwrap()
+                .unwrap()
+                .0,
+            "deadbeef000000000000000000000001"
+        );
+        assert_eq!(
+            Particle::resolve_group_member(&[work, home], "deadbeef").unwrap_err(),
             "ambiguous particle ID: deadbeef"
         );
     }
@@ -2930,6 +2958,7 @@ mod tests {
         let results = group_send["results"].as_array().unwrap();
         assert_eq!(results[0]["name"], "particle-b");
         assert_eq!(results[1]["name"], "particle-c");
+        let original_work_sync_id = results[0]["sync_id"].as_str().unwrap().to_owned();
         for observer in [&b, &c] {
             let observed = observer.observe(&json!({ "group": "work" })).await;
             assert_eq!(observed["states"].as_array().unwrap().len(), 1);
@@ -3007,12 +3036,80 @@ mod tests {
             .find(|result| result["particle_id"] == id_c.as_str())
             .unwrap();
         assert_eq!(unreachable_result["ok"], false);
+        let reachable_result = with_unreachable["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|result| result["particle_id"] == id_b.as_str())
+            .unwrap();
+        assert_eq!(reachable_result["ok"], true);
+        let second_work_sync_id = reachable_result["sync_id"].as_str().unwrap().to_owned();
         assert_eq!(
             std::fs::read_dir(a.data_dir.join("outbox"))
                 .unwrap()
                 .count(),
             0
         );
+
+        let work_id = groups::group_id(&[0x71; 32]);
+        groups::leave(&b.data_root, "work").unwrap();
+        tokio::time::timeout(Duration::from_secs(8), async {
+            loop {
+                if b.groups
+                    .read()
+                    .unwrap()
+                    .iter()
+                    .all(|group| group.id != work_id)
+                {
+                    break;
+                }
+                sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the group watcher should reload the group store after leaving");
+
+        let by_id = b.observe(&json!({ "group": work_id })).await;
+        let id_states = by_id["states"].as_array().unwrap();
+        assert!(id_states
+            .iter()
+            .any(|item| item["sync_id"] == original_work_sync_id));
+        assert!(id_states
+            .iter()
+            .any(|item| item["sync_id"] == second_work_sync_id));
+        assert!(id_states
+            .iter()
+            .all(|item| { item["group"] == "work" && item["group_id"] == work_id }));
+
+        let legacy_sync_id = "1234567890abcdef1234567890abcdef";
+        let legacy: InboxItem = serde_json::from_value(json!({
+            "group": "work",
+            "sync_id": legacy_sync_id,
+            "from_particle_id": id_a.as_str(),
+            "from_name": "particle-a",
+            "kind": "json",
+            "label": null,
+            "received_at": "2026-10-12T00:00:00Z",
+            "bytes": 2,
+            "sha256": "00".repeat(32),
+            "state": { "legacy": true },
+            "path": null,
+            "text": null
+        }))
+        .unwrap();
+        assert!(legacy.group_id.is_empty());
+        b.inbox.lock().await.push(legacy);
+
+        let by_name = b.observe(&json!({ "group": "work" })).await;
+        let name_states = by_name["states"].as_array().unwrap();
+        assert!(name_states
+            .iter()
+            .any(|item| item["sync_id"] == legacy_sync_id));
+        assert!(name_states.iter().all(|item| item["group"] == "work"));
+        assert!(b.observe(&json!({ "group": "" })).await["states"]
+            .as_array()
+            .unwrap()
+            .is_empty());
 
         a.shutdown().await;
         b.shutdown().await;
