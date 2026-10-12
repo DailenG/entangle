@@ -4,6 +4,7 @@
 
 use entangle_core::{ParticleId, PROTOCOL_VERSION};
 use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
+use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
@@ -17,6 +18,8 @@ use tracing::{debug, info};
 
 /// mDNS service name used by all Entangle particles.
 pub const SERVICE_TYPE: &str = "_entangle._tcp.local.";
+/// mDNS service name used for short-lived group invites.
+pub const INVITE_SERVICE_TYPE: &str = "_entangle-invite._tcp.local.";
 
 /// Information published by a local particle.
 #[derive(Clone, Debug)]
@@ -54,6 +57,101 @@ pub struct Resonance {
     pub groups: Vec<String>,
     /// Remote control protocol version.
     pub proto: u32,
+}
+
+/// A resolved invite rendezvous endpoint.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InviteCandidate {
+    /// One-time code nameplate.
+    pub nameplate: u8,
+    /// Human-readable name of the inviting particle.
+    pub name: String,
+    /// Advertised DNS host name.
+    pub hostname: String,
+    /// Candidate addresses for the advertised host.
+    pub addrs: Vec<IpAddr>,
+    /// TCP invite port.
+    pub port: u16,
+}
+
+/// Owns a short-lived invite advertisement, separate from particle discovery.
+pub struct InviteAdvert {
+    daemon: ServiceDaemon,
+    fullname: String,
+    addresses: Vec<IpAddr>,
+}
+
+impl InviteAdvert {
+    /// Registers one nameplate on the local network.
+    pub fn register(nameplate: u8, name: &str, port: u16) -> Result<Self, ResonanceError> {
+        let properties = encode_invite_txt(nameplate, name)?;
+        let mut random = [0; 2];
+        rand::rngs::OsRng.fill_bytes(&mut random);
+        let instance = format!(
+            "entangle-invite-{nameplate}-{:02x}{:02x}",
+            random[0], random[1]
+        );
+        let host = local_hostname(&ParticleId::generate());
+        let service = ServiceInfo::new(
+            INVITE_SERVICE_TYPE,
+            &instance,
+            &host,
+            "",
+            port,
+            properties.as_slice(),
+        )?
+        .enable_addr_auto();
+        let fullname = service.get_fullname().to_owned();
+        let mut addresses = service.get_addresses().iter().copied().collect::<Vec<_>>();
+        addresses.sort_by_key(|address| address.to_string());
+        let daemon = ServiceDaemon::new()?;
+        daemon.register(service)?;
+        Ok(Self {
+            daemon,
+            fullname,
+            addresses,
+        })
+    }
+
+    pub fn addresses(&self) -> &[IpAddr] {
+        &self.addresses
+    }
+
+    /// Unregisters this invite advertisement and shuts down its daemon.
+    pub fn shutdown(self) -> Result<(), ResonanceError> {
+        let _ = self.daemon.unregister(&self.fullname);
+        self.daemon.shutdown()?;
+        Ok(())
+    }
+
+    /// Browses for matching nameplates until the timeout expires.
+    pub async fn browse(
+        nameplate: u8,
+        timeout: Duration,
+    ) -> Result<Vec<InviteCandidate>, ResonanceError> {
+        Ok(browse_invites(Some(nameplate), timeout)
+            .await?
+            .into_values()
+            .collect())
+    }
+
+    /// Browses all currently visible invites for nameplate selection.
+    pub async fn visible_nameplates(timeout: Duration) -> Result<Vec<u8>, ResonanceError> {
+        let mut nameplates = browse_invites(None, timeout)
+            .await?
+            .into_values()
+            .map(|candidate| candidate.nameplate)
+            .collect::<Vec<_>>();
+        nameplates.sort_unstable();
+        nameplates.dedup();
+        Ok(nameplates)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct InviteTxt {
+    nameplate: u8,
+    name: String,
 }
 
 /// Change in the local discovery view.
@@ -142,6 +240,119 @@ impl Resonator {
         }
         Ok(())
     }
+}
+
+async fn browse_invites(
+    nameplate: Option<u8>,
+    timeout: Duration,
+) -> Result<HashMap<String, InviteCandidate>, ResonanceError> {
+    let daemon = ServiceDaemon::new()?;
+    let events = daemon.browse(INVITE_SERVICE_TYPE)?;
+    let (tx, mut rx) = tokio_mpsc::channel(64);
+    let worker = thread::spawn(move || bridge_invite_events(events, tx));
+    let deadline = Instant::now() + timeout;
+    let mut found = HashMap::<String, InviteCandidate>::new();
+    while Instant::now() < deadline {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        match tokio::time::timeout(remaining, rx.recv()).await {
+            Ok(Some((fullname, Some(candidate)))) => {
+                if nameplate.is_none_or(|expected| candidate.nameplate == expected) {
+                    found.insert(fullname, candidate);
+                }
+            }
+            Ok(Some((fullname, None))) => {
+                found.remove(&fullname);
+            }
+            Ok(None) | Err(_) => break,
+        }
+    }
+    daemon.shutdown()?;
+    let _ = worker.join();
+    Ok(found)
+}
+
+fn bridge_invite_events(
+    events: mdns_sd::Receiver<ServiceEvent>,
+    tx: tokio_mpsc::Sender<(String, Option<InviteCandidate>)>,
+) {
+    while let Ok(event) = events.recv() {
+        let outgoing = match event {
+            ServiceEvent::ServiceResolved(info) => decode_invite_service(&info)
+                .ok()
+                .map(|candidate| (info.get_fullname().to_owned(), Some(candidate))),
+            ServiceEvent::ServiceRemoved(_, fullname) => Some((fullname, None)),
+            _ => None,
+        };
+        if let Some(outgoing) = outgoing {
+            if tx.blocking_send(outgoing).is_err() {
+                break;
+            }
+        }
+    }
+}
+
+fn decode_invite_service(
+    info: &mdns_sd::ResolvedService,
+) -> Result<InviteCandidate, ResonanceError> {
+    let txt = decode_invite_txt(|key| info.get_property_val_str(key).map(str::to_owned))?;
+    let mut addrs = info
+        .get_addresses()
+        .iter()
+        .map(|address| address.to_ip_addr())
+        .collect::<Vec<_>>();
+    addrs.sort_by_key(|address| match address {
+        IpAddr::V4(ip) if !ip.is_loopback() => (0, ip.to_string()),
+        IpAddr::V6(ip) if !ip.is_loopback() => (1, ip.to_string()),
+        IpAddr::V4(_) | IpAddr::V6(_) => (2, address.to_string()),
+    });
+    Ok(InviteCandidate {
+        nameplate: txt.nameplate,
+        name: txt.name,
+        hostname: info.get_hostname().to_owned(),
+        addrs,
+        port: info.get_port(),
+    })
+}
+
+fn encode_invite_txt(
+    nameplate: u8,
+    name: &str,
+) -> Result<Vec<(&'static str, String)>, ResonanceError> {
+    if !(1..=99).contains(&nameplate) || name.is_empty() || name.len() > 255 {
+        return Err(ResonanceError::InvalidTxt("invalid invite fields".into()));
+    }
+    Ok(vec![
+        ("np", nameplate.to_string()),
+        ("proto", PROTOCOL_VERSION.to_string()),
+        ("name", name.to_owned()),
+    ])
+}
+
+fn decode_invite_txt(
+    property: impl Fn(&str) -> Option<String>,
+) -> Result<InviteTxt, ResonanceError> {
+    let property =
+        |key| property(key).ok_or_else(|| ResonanceError::InvalidTxt(format!("missing {key}")));
+    let nameplate = property("np")?;
+    if !nameplate.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(ResonanceError::InvalidTxt("invalid np".into()));
+    }
+    let nameplate = nameplate
+        .parse::<u8>()
+        .ok()
+        .filter(|number| (1..=99).contains(number))
+        .ok_or_else(|| ResonanceError::InvalidTxt("invalid np".into()))?;
+    let proto = property("proto")?
+        .parse::<u32>()
+        .map_err(|_| ResonanceError::InvalidTxt("invalid proto".into()))?;
+    if proto != PROTOCOL_VERSION {
+        return Err(ResonanceError::InvalidTxt("unsupported proto".into()));
+    }
+    let name = property("name")?;
+    if name.is_empty() || name.len() > 255 {
+        return Err(ResonanceError::InvalidTxt("invalid name".into()));
+    }
+    Ok(InviteTxt { nameplate, name })
 }
 
 /// Performs a one-shot browse for up to `timeout` and returns unique particles.
@@ -351,6 +562,33 @@ mod tests {
         assert_eq!(peer.context.as_deref(), Some("sample"));
         assert_eq!(peer.groups, ["a1b2c3d4"]);
         assert_eq!(peer.proto, PROTOCOL_VERSION);
+    }
+
+    #[test]
+    fn invite_advert_txt_roundtrip() {
+        let properties = encode_invite_txt(7, "particle-a").unwrap();
+        let txt = decode_invite_txt(|key| {
+            properties
+                .iter()
+                .find(|(property, _)| *property == key)
+                .map(|(_, value)| value.clone())
+        })
+        .unwrap();
+        assert_eq!(
+            txt,
+            InviteTxt {
+                nameplate: 7,
+                name: "particle-a".into(),
+            }
+        );
+        assert_eq!(
+            properties
+                .iter()
+                .find(|(key, _)| *key == "proto")
+                .unwrap()
+                .1,
+            "4"
+        );
     }
 
     #[test]

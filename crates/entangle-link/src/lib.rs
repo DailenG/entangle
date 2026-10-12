@@ -1,7 +1,7 @@
 //! Noise-protected control frames and bounded state-sync payload streams.
 
 use async_trait::async_trait;
-use entangle_core::{Manifest, ParticleId, StateKind};
+use entangle_core::{Manifest, Member, ParticleId, StateKind};
 use entangle_transport::{
     self, KeyRing, SecureStream, SharedKeyRing, TransportError, MAX_PLAINTEXT,
 };
@@ -70,6 +70,16 @@ pub enum Frame {
     Hello {
         /// Local particle manifest.
         manifest: Manifest,
+    },
+    /// Introduces members vouched for by the authenticated sender.
+    Introduce {
+        /// Membership records added by the sender, excluding the recipient.
+        members: Vec<Member>,
+    },
+    /// Acknowledges how many introduced members were newly stored.
+    IntroduceAck {
+        /// Number of records newly added.
+        added: u32,
     },
     /// Announces a payload to the receiver.
     SyncOffer {
@@ -255,6 +265,16 @@ pub trait LinkHandler: Send + Sync + 'static {
         offer: SyncOffer,
         payload: &mut PayloadReader<'_>,
     ) -> Result<String, String>;
+
+    /// Validates and stores one-hop member introductions.
+    async fn on_introduce(
+        &self,
+        _peer: &PeerInfo,
+        _sender: &ParticleId,
+        _members: Vec<Member>,
+    ) -> Result<u32, LinkError> {
+        Ok(0)
+    }
 }
 
 /// Bound TCP listener for short-lived encrypted control connections.
@@ -431,6 +451,23 @@ where
     .map_err(|_| LinkError::Timeout)?
 }
 
+/// Sends member introductions on an authenticated outbound Hello stream.
+pub async fn introduce_on(
+    mut stream: SecureStream,
+    members: Vec<Member>,
+    duration: Duration,
+) -> Result<u32, LinkError> {
+    timeout(duration, async {
+        write_frame(&mut stream, &Frame::Introduce { members }).await?;
+        match read_frame(&mut stream).await? {
+            Frame::IntroduceAck { added } => Ok(added),
+            frame => Err(LinkError::Unexpected(format!("{frame:?}"))),
+        }
+    })
+    .await
+    .map_err(|_| LinkError::Timeout)?
+}
+
 async fn connect_route(
     route: &Route,
     keys: &KeyRing,
@@ -488,9 +525,27 @@ async fn serve_connection(
 ) -> Result<(), LinkError> {
     match read_frame(&mut stream).await? {
         Frame::Hello { manifest } => {
+            let sender = manifest.particle_id.clone();
             let own = handler.on_hello(&peer, manifest).await?;
             write_frame(&mut stream, &Frame::Hello { manifest: own }).await?;
-            Ok(())
+            match read_frame(&mut stream).await {
+                Ok(Frame::Introduce { members }) => {
+                    let added = handler.on_introduce(&peer, &sender, members).await?;
+                    write_frame(&mut stream, &Frame::IntroduceAck { added }).await
+                }
+                Ok(frame) => Err(LinkError::Unexpected(format!("{frame:?}"))),
+                Err(LinkError::Transport(TransportError::Io(error)))
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::UnexpectedEof
+                            | io::ErrorKind::ConnectionReset
+                            | io::ErrorKind::BrokenPipe
+                    ) =>
+                {
+                    Ok(())
+                }
+                Err(error) => Err(error),
+            }
         }
         frame => match offer_from_frame(frame) {
             Ok(offer) => serve_offer(&mut stream, &peer, &handler, offer).await,

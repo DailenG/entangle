@@ -112,9 +112,14 @@ proceeding.
 Human-only commands: `group create`, `group invite`, `group join`, `group
 leave`, `group remove`, `group rekey`, and `group admin`. Agents may run
 `entangle group list`, `entangle group members <name>`, and `entangle peer
-list`. Devices join with a one-time code from `entangle group invite` (added
-in the next change). Ask the human to perform human-only commands in their
-terminal.
+list`. One device invites with `entangle group invite <name> [--count N]`;
+the human enters the one-time code on each other device with
+`entangle group join <code>`. `--count N` sets the successful-join limit
+(default 1, maximum 20). `group join --via <host:port>` is the direct
+connection fallback when multicast discovery is blocked. Invites expire after
+ten minutes, and a wrong code or failed confirmation closes the invite. Ask
+the human to perform all invite/join commands in their terminal. Agents never
+request, display, or relay invite codes.
 Trust is based on shared group membership, and group keys must never be
 requested or relayed.
 If `find_entangled_particles.self.warning` is present, report its text verbatim

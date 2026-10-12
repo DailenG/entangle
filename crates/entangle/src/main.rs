@@ -5,6 +5,7 @@ mod field;
 mod groups;
 mod identity;
 mod inbox;
+mod invite;
 mod node;
 mod peer;
 mod private_fs;
@@ -16,12 +17,18 @@ use chrono::{SecondsFormat, Utc};
 use clap::{Parser, Subcommand};
 use config::Options;
 use groups::{Member, Role};
+use invite::{
+    code::InviteCode,
+    protocol::{self, InviteEnd, InviteError, InviteServer, InviteState},
+};
 use sha2::Digest;
 use std::{
     io::{self, IsTerminal, Write},
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     process::ExitCode,
     time::Duration,
 };
+use tokio::{net::TcpListener, task::JoinSet};
 use tracing_subscriber::EnvFilter;
 
 /// Entangle local agent collaboration server.
@@ -73,7 +80,27 @@ enum Command {
 #[derive(Debug, Subcommand)]
 enum GroupCommand {
     /// Create a group for this machine.
-    Create { name: String },
+    Create {
+        name: String,
+        #[arg(long)]
+        invite: Option<u8>,
+    },
+    /// Invite devices to join a group.
+    Invite {
+        name: String,
+        #[arg(long, default_value_t = 1)]
+        count: u8,
+    },
+    /// Join a group with a one-time invite code.
+    Join {
+        code: String,
+        /// Local group name to use instead of the inviter's name.
+        #[arg(long)]
+        name: Option<String>,
+        /// Connect directly instead of using mDNS.
+        #[arg(long)]
+        via: Option<String>,
+    },
     /// List this machine's groups.
     List {
         #[arg(long)]
@@ -151,8 +178,9 @@ async fn run() -> Result<()> {
         }
         Command::Group { command } => {
             let mut output = io::stdout().lock();
-            let code = run_group(command, &cli.options, &mut output)?;
+            let code = run_group(command, &cli.options, &mut output).await?;
             if code != 0 {
+                output.flush()?;
                 std::process::exit(code);
             }
         }
@@ -199,11 +227,18 @@ fn is_broken_pipe(error: &anyhow::Error) -> bool {
     })
 }
 
-fn run_group(command: GroupCommand, options: &Options, output: &mut dyn Write) -> Result<i32> {
+async fn run_group(
+    command: GroupCommand,
+    options: &Options,
+    output: &mut dyn Write,
+) -> Result<i32> {
     let data_root = options.data_root();
     if matches!(
         &command,
-        GroupCommand::Create { .. } | GroupCommand::Leave { .. }
+        GroupCommand::Create { .. }
+            | GroupCommand::Invite { .. }
+            | GroupCommand::Join { .. }
+            | GroupCommand::Leave { .. }
     ) && !(io::stdin().is_terminal() && io::stdout().is_terminal())
     {
         writeln!(
@@ -213,7 +248,10 @@ fn run_group(command: GroupCommand, options: &Options, output: &mut dyn Write) -
         return Ok(2);
     }
     match command {
-        GroupCommand::Create { name } => {
+        GroupCommand::Create { name, invite } => {
+            if let Some(count) = invite {
+                InviteState::new(count, InviteState::default_ttl())?;
+            }
             let Some((id, static_private)) = identity::read_saved(&data_root)? else {
                 return Err(groups::GroupError::MissingIdentity(data_root).into());
             };
@@ -232,11 +270,29 @@ fn run_group(command: GroupCommand, options: &Options, output: &mut dyn Write) -
                 "Created group {} ({}). You are its admin.",
                 group.meta.name, group.id
             )?;
-            writeln!(
+            if let Some(count) = invite {
+                run_invite(&data_root, &group.meta.name, count, options, output).await?;
+            } else {
+                writeln!(
+                    output,
+                    "Next: run `entangle group invite {}` here, then `entangle group join <code>` on each other device.",
+                    group.meta.name
+                )?;
+            }
+        }
+        GroupCommand::Invite { name, count } => {
+            run_invite(&data_root, &name, count, options, output).await?;
+        }
+        GroupCommand::Join { code, name, via } => {
+            run_join(
+                &data_root,
+                &code,
+                name.as_deref(),
+                via.as_deref(),
+                options,
                 output,
-                "Next: run `entangle group invite {}` here, then `entangle group join <code>` on each other device.",
-                group.meta.name
-            )?;
+            )
+            .await?;
         }
         GroupCommand::List { json } => {
             let groups = groups::list(&data_root)?;
@@ -326,6 +382,279 @@ fn run_group(command: GroupCommand, options: &Options, output: &mut dyn Write) -
     Ok(0)
 }
 
+async fn run_invite(
+    data_root: &std::path::Path,
+    name: &str,
+    count: u8,
+    options: &Options,
+    output: &mut dyn Write,
+) -> Result<()> {
+    let group = groups::find(data_root, name)?
+        .ok_or_else(|| groups::GroupError::NotFound(name.to_owned()))?;
+    let Some((id, _)) = identity::read_saved(data_root)? else {
+        return Err(groups::GroupError::MissingIdentity(data_root.to_owned()).into());
+    };
+    let visible = if options.no_mdns {
+        Vec::new()
+    } else {
+        entangle_resonance::InviteAdvert::visible_nameplates(Duration::from_secs(1))
+            .await
+            .unwrap_or_default()
+    };
+    let nameplate = protocol::choose_nameplate(&visible)
+        .ok_or_else(|| anyhow::anyhow!("no invite nameplates are available on this network"))?;
+    let code = InviteCode::generate(nameplate);
+    let listener = TcpListener::bind(SocketAddr::from(([0, 0, 0, 0], 0))).await?;
+    let port = listener.local_addr()?.port();
+    let ttl = InviteState::default_ttl();
+    let server = InviteServer::new(
+        data_root,
+        group.id.clone(),
+        options.particle_name(&id),
+        code,
+        count,
+        ttl,
+    )?;
+    let advert = if options.no_mdns {
+        None
+    } else {
+        match entangle_resonance::InviteAdvert::register(
+            nameplate,
+            &options.particle_name(&id),
+            port,
+        ) {
+            Ok(advert) => Some(advert),
+            Err(error) => {
+                tracing::warn!(%error, "invite mDNS registration failed; use --via");
+                None
+            }
+        }
+    };
+    let ip = advert
+        .as_ref()
+        .and_then(|advert| {
+            advert
+                .addresses()
+                .iter()
+                .find(|address| matches!(address, IpAddr::V4(ip) if !ip.is_loopback()))
+                .copied()
+        })
+        .or_else(local_ipv4)
+        .unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+    writeln!(output, "Invite code for {}: {}", group.meta.name, code)?;
+    writeln!(output, "On each device run: entangle group join {}", code)?;
+    writeln!(
+        output,
+        "Waiting for {count} devices (closes in 10 minutes; press Esc to cancel). If a device can't find it: add --via {ip}:{port}"
+    )?;
+    output.flush()?;
+
+    let (mut cancel, cancel_guard) = peer::start_cancel_key_listener()?;
+    let mut terminal = server.state().subscribe();
+    let mut sessions = JoinSet::new();
+    let mut reported = 0_u8;
+    loop {
+        tokio::select! {
+            result = listener.accept() => {
+                let (stream, _) = result?;
+                let session = server.clone();
+                sessions.spawn(async move { session.handle(stream).await });
+            }
+            result = sessions.join_next(), if !sessions.is_empty() => {
+                if let Some(Ok(Ok(Some(joined_name)))) = result {
+                    reported = reported.saturating_add(1);
+                    writeln!(output, "{joined_name} joined ({reported}/{count}).")?;
+                    output.flush()?;
+                }
+            }
+            _ = tokio::time::sleep_until(server.state().expires_at()) => {
+                server.state().end(InviteEnd::Expired);
+            }
+            _ = cancel.recv() => {
+                server.state().end(InviteEnd::Cancelled);
+            }
+            changed = terminal.changed() => {
+                if changed.is_err() || terminal.borrow().is_some() {
+                    break;
+                }
+            }
+        }
+        if server.state().terminal().await.is_some() {
+            break;
+        }
+    }
+    drop(cancel_guard);
+    drop(listener);
+    if let Some(advert) = advert {
+        let _ = advert.shutdown();
+    }
+    while let Some(result) = sessions.join_next().await {
+        if let Ok(Ok(Some(joined_name))) = result {
+            reported = reported.saturating_add(1);
+            writeln!(output, "{joined_name} joined ({reported}/{count}).")?;
+        }
+    }
+    let (joined, total) = server.state().counts().await;
+    match server.state().terminal().await.unwrap_or(InviteEnd::Expired) {
+        InviteEnd::Complete => writeln!(output, "{total} of {total} joined; invite closed.")?,
+        InviteEnd::Expired => writeln!(output, "Invite expired; {joined} of {total} joined.")?,
+        InviteEnd::Cancelled => writeln!(output, "Cancelled; {joined} of {total} joined.")?,
+        InviteEnd::WrongCode => writeln!(
+            output,
+            "A device entered a wrong code; invite closed ({joined} of {total} joined). Run `entangle group invite {}` again for a new code.",
+            group.meta.name
+        )?,
+        InviteEnd::Failed => writeln!(
+            output,
+            "A device failed to confirm; invite closed ({joined} of {total} joined). Run `entangle group invite {}` again for a new code.",
+            group.meta.name
+        )?,
+    }
+    Ok(())
+}
+
+async fn run_join(
+    data_root: &std::path::Path,
+    value: &str,
+    local_name: Option<&str>,
+    via: Option<&str>,
+    options: &Options,
+    output: &mut dyn Write,
+) -> Result<i32> {
+    let code = match InviteCode::parse(value) {
+        Ok(code) => code,
+        Err(error) => {
+            writeln!(output, "Invalid invite code: {error}")?;
+            return Ok(1);
+        }
+    };
+    let Some((particle_id, _)) = identity::read_saved(data_root)? else {
+        let error = groups::GroupError::MissingIdentity(data_root.to_owned());
+        writeln!(output, "{error}")?;
+        return Ok(1);
+    };
+    let mut particle_options = options.clone();
+    particle_options.name = None;
+    let particle_name = particle_options.particle_name(&particle_id);
+    let mut last_error = None;
+    if let Some(via) = via {
+        let addresses = tokio::net::lookup_host(via).await?;
+        for address in addresses {
+            match tokio::net::TcpStream::connect(address).await {
+                Ok(stream) => {
+                    match protocol::join(stream, data_root, code, local_name, &particle_name).await
+                    {
+                        Ok(joined) => {
+                            write_join_success(output, joined)?;
+                            return Ok(0);
+                        }
+                        Err(error) if is_terminal_join_error(&error) => {
+                            return write_join_failure(output, error);
+                        }
+                        Err(error) => last_error = Some(error),
+                    }
+                }
+                Err(error) => last_error = Some(error.into()),
+            }
+        }
+    } else {
+        let candidates = if options.no_mdns {
+            Vec::new()
+        } else {
+            entangle_resonance::InviteAdvert::browse(code.nameplate, Duration::from_secs(15))
+                .await
+                .unwrap_or_default()
+        };
+        for candidate in candidates {
+            for address in candidate.addrs.iter() {
+                let target = SocketAddr::new(*address, candidate.port);
+                match tokio::net::TcpStream::connect(target).await {
+                    Ok(stream) => {
+                        match protocol::join(stream, data_root, code, local_name, &particle_name)
+                            .await
+                        {
+                            Ok(joined) => {
+                                write_join_success(output, joined)?;
+                                return Ok(0);
+                            }
+                            Err(error) if is_terminal_join_error(&error) => {
+                                return write_join_failure(output, error);
+                            }
+                            Err(error) => last_error = Some(error),
+                        }
+                    }
+                    Err(error) => last_error = Some(error.into()),
+                }
+            }
+        }
+    }
+    let _ = last_error;
+    writeln!(
+        output,
+        "No invite {} found on this network. Check the code and that `entangle group invite` is still running; or add --via <host:port>.",
+        code.nameplate
+    )?;
+    Ok(1)
+}
+
+fn is_terminal_join_error(error: &InviteError) -> bool {
+    matches!(
+        error,
+        InviteError::WrongCode
+            | InviteError::Declined { .. }
+            | InviteError::Group(groups::GroupError::MissingIdentity(_))
+    )
+}
+
+fn write_join_failure(output: &mut dyn Write, error: InviteError) -> Result<i32> {
+    match error {
+        InviteError::WrongCode => {
+            writeln!(
+                output,
+                "That code was wrong; the invite is now closed. Ask for a new one."
+            )?;
+        }
+        InviteError::Declined { reason, group_name } => match reason.as_str() {
+            "already_member" => writeln!(
+                output,
+                "This machine is already in {}.",
+                group_name.unwrap_or_else(|| "that group".into())
+            )?,
+            "name_taken" => writeln!(
+                output,
+                "A group named {} already exists here; rerun with --name <other>.",
+                group_name.unwrap_or_else(|| "that group".into())
+            )?,
+            _ => writeln!(output, "The inviter declined this join: {reason}.")?,
+        },
+        InviteError::Group(groups::GroupError::MissingIdentity(path)) => {
+            let error = groups::GroupError::MissingIdentity(path);
+            writeln!(output, "{error}")?;
+        }
+        other => writeln!(output, "Invite join failed: {other}")?,
+    }
+    Ok(1)
+}
+
+fn write_join_success(output: &mut dyn Write, joined: protocol::Joined) -> Result<()> {
+    writeln!(
+        output,
+        "Joined {} ({}) via {}. {} members.",
+        joined.group.meta.name,
+        joined.group.id,
+        joined.inviter_name,
+        joined.group.members.len()
+    )?;
+    Ok(())
+}
+
+fn local_ipv4() -> Option<IpAddr> {
+    let socket = std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).ok()?;
+    socket.connect((Ipv4Addr::new(192, 0, 2, 1), 9)).ok()?;
+    let address = socket.local_addr().ok()?.ip();
+    (!address.is_loopback()).then_some(address)
+}
+
 fn role_name(role: &Role) -> &'static str {
     match role {
         Role::Admin => "admin",
@@ -364,8 +693,8 @@ mod tests {
         assert!(is_broken_pipe(&error));
     }
 
-    #[test]
-    fn group_list_and_members_render_text_and_json() {
+    #[tokio::test]
+    async fn group_list_and_members_render_text_and_json() {
         let temp = tempfile::tempdir().unwrap();
         let options = options(temp.path());
         let identity = identity::claim(temp.path()).unwrap();
@@ -404,7 +733,9 @@ mod tests {
 
         let mut text = Vec::new();
         assert_eq!(
-            run_group(GroupCommand::List { json: false }, &options, &mut text).unwrap(),
+            run_group(GroupCommand::List { json: false }, &options, &mut text)
+                .await
+                .unwrap(),
             0
         );
         let text = String::from_utf8(text).unwrap();
@@ -413,7 +744,9 @@ mod tests {
         assert!(text.contains("admin"));
 
         let mut json = Vec::new();
-        run_group(GroupCommand::List { json: true }, &options, &mut json).unwrap();
+        run_group(GroupCommand::List { json: true }, &options, &mut json)
+            .await
+            .unwrap();
         let rows: serde_json::Value = serde_json::from_slice(&json).unwrap();
         assert_eq!(rows[0]["name"], "work");
         assert_eq!(rows[0]["members"], 2);
@@ -428,6 +761,7 @@ mod tests {
             &options,
             &mut text,
         )
+        .await
         .unwrap();
         let text = String::from_utf8(text).unwrap();
         assert!(text.contains("PARTICLE(short)"));
@@ -443,6 +777,7 @@ mod tests {
             &options,
             &mut json,
         )
+        .await
         .unwrap();
         let rows: serde_json::Value = serde_json::from_slice(&json).unwrap();
         assert_eq!(rows.as_array().unwrap().len(), 2);
@@ -457,20 +792,30 @@ mod tests {
         assert!(rows.to_string().find("key").is_none());
     }
 
-    #[test]
-    fn group_create_and_leave_refuse_non_interactive_use() {
+    #[tokio::test]
+    async fn human_only_group_commands_refuse_non_interactive_use() {
         let temp = tempfile::tempdir().unwrap();
         let options = options(temp.path());
         for command in [
             GroupCommand::Create {
                 name: "work".into(),
+                invite: None,
+            },
+            GroupCommand::Invite {
+                name: "work".into(),
+                count: 1,
+            },
+            GroupCommand::Join {
+                code: "7-amber-photon-quasar".into(),
+                name: None,
+                via: None,
             },
             GroupCommand::Leave {
                 name: "work".into(),
             },
         ] {
             let mut output = Vec::new();
-            assert_eq!(run_group(command, &options, &mut output).unwrap(), 2);
+            assert_eq!(run_group(command, &options, &mut output).await.unwrap(), 2);
             assert!(String::from_utf8(output)
                 .unwrap()
                 .contains("human-only command"));

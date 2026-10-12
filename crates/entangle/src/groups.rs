@@ -2,6 +2,7 @@
 
 use crate::{identity, private_fs};
 use chrono::{SecondsFormat, Utc};
+pub use entangle_core::Member;
 use entangle_core::ParticleId;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
@@ -31,15 +32,6 @@ pub struct GroupMeta {
     pub name: String,
     pub role: Role,
     pub created_at: String,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct Member {
-    pub particle_id: String,
-    pub name: String,
-    pub static_key: String,
-    pub added_by: String,
-    pub added_at: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
