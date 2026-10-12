@@ -1096,7 +1096,7 @@ impl Particle {
                 .cloned()
                 .unwrap_or_else(|| stored.to_owned())
         };
-        let group_filter = args.get("group").and_then(Value::as_str).map(&render_group);
+        let group_filter = args.get("group").and_then(Value::as_str).map(render_group);
         let mut inbox = self.inbox.lock().await;
         let start = match since {
             Some(id) => inbox
