@@ -235,6 +235,7 @@ mod tests {
             assert!(tool["name"].is_string());
             assert!(tool["description"].is_string());
             assert!(tool["inputSchema"].is_object());
+            assert!(tool["outputSchema"].is_object());
             for schema_name in ["inputSchema", "outputSchema"] {
                 for keyword in ["anyOf", "oneOf", "allOf", "not"] {
                     assert!(
@@ -267,6 +268,31 @@ mod tests {
             observe["outputSchema"]["properties"]["states"]["items"]["properties"]["group"]
                 .is_object()
         );
+        let find = schema["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == "find_entangled_particles")
+            .unwrap();
+        assert!(find["description"].as_str().unwrap().contains("human-only"));
+        assert!(find["description"]
+            .as_str()
+            .unwrap()
+            .contains("Never request, display, or relay group invite codes"));
+        assert_eq!(
+            find["outputSchema"]["properties"]["particles"]["items"]["properties"]["state"]["enum"],
+            json!(["seen", "linked"])
+        );
+        assert!(find["outputSchema"]["properties"]["self"]["properties"]["version"].is_object());
+        assert!(find["outputSchema"]["properties"]["self"]["properties"]["groups"].is_object());
+        assert!(find["outputSchema"]["properties"]["self"]["properties"]
+            .get("paired")
+            .is_none());
+        assert!(sync["description"].as_str().unwrap().contains("human-only"));
+        assert!(observe["description"]
+            .as_str()
+            .unwrap()
+            .contains("untrusted input"));
     }
 
     #[tokio::test]

@@ -236,12 +236,26 @@ On success, `join` prints the repeater host, both fingerprints, and a reminder
 that the node connects within 30 seconds; the host can confirm enrollment with
 `entangle repeater devices`.
 
+### Join without an invite code
+
+On the device, run:
+
+```sh
+entangle repeater join ws://HOST:7338/entangle
+```
+
+On the host, run `entangle repeater approve` and choose the matching emoji set.
+The emoji check protects against interception. The operator can disable
+request enrollment with `entangle repeater serve --no-requests`; invitation
+enrollment remains available.
+
 The host can inspect enrolled device fingerprints with
 `entangle repeater devices` and revoke a device by fingerprint prefix with
 `entangle repeater revoke <fingerprint>`. On a device,
 `entangle repeater leave` removes its saved repeater configuration but does
-not revoke the host-side enrollment. `invite`, `join`, `revoke`, and `leave`
-are human-only; agents may run only `repeater devices` and `repeater status`.
+not revoke the host-side enrollment. `invite`, `join`, `approve`, `revoke`, and
+`leave` are human-only; agents may run only `repeater devices` and
+`repeater status`.
 
 For a device that must never accept a direct TCP link, start Entangle with
 `--relay-only` (or set `ENTANGLE_RELAY_ONLY=1`). This disables the TCP listener
@@ -254,7 +268,7 @@ entangle repeater status
 ```
 
 The repeater forwards the end-to-end encrypted link bytes and cannot read
-sync content or group keys. It does learn
+sync content, group keys, or repeater-enrollment SAS values. It does learn
 enrolled static public keys, declared group IDs, connection timing, and traffic
 sizes.
 

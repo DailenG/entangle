@@ -2866,6 +2866,87 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
+    fn tool_output_schema<'a>(schema: &'a Value, tool_name: &str) -> &'a Value {
+        schema["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == tool_name)
+            .unwrap()
+            .get("outputSchema")
+            .unwrap()
+    }
+
+    fn assert_matches_schema(schema: &Value, value: &Value) {
+        let matches_type = |type_name: &str| match type_name {
+            "object" => value.is_object(),
+            "array" => value.is_array(),
+            "string" => value.is_string(),
+            "integer" => value.as_i64().is_some() || value.as_u64().is_some(),
+            "number" => value.is_number(),
+            "boolean" => value.is_boolean(),
+            "null" => value.is_null(),
+            _ => false,
+        };
+        if let Some(schema_type) = schema.get("type") {
+            let matches = match schema_type {
+                Value::String(type_name) => matches_type(type_name),
+                Value::Array(type_names) => type_names
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .any(matches_type),
+                _ => false,
+            };
+            assert!(matches, "value {value} does not match type {schema_type}");
+        }
+        if let Some(enum_values) = schema.get("enum").and_then(Value::as_array) {
+            assert!(
+                enum_values.contains(value),
+                "value {value} is not in schema enum {enum_values:?}"
+            );
+        }
+        if let Some(constant) = schema.get("const") {
+            assert_eq!(value, constant, "value does not match schema const");
+        }
+        if let Some(required) = schema.get("required").and_then(Value::as_array) {
+            let object = value.as_object().expect("required fields need an object");
+            for key in required {
+                let key = key.as_str().expect("required field name");
+                assert!(
+                    object.contains_key(key),
+                    "schema-required field {key} is missing from {value}"
+                );
+            }
+        }
+        if schema["additionalProperties"] == false {
+            let object = value.as_object().expect("object schema needs an object");
+            let properties = schema["properties"]
+                .as_object()
+                .expect("closed object schema needs properties");
+            for key in object.keys() {
+                assert!(
+                    properties.contains_key(key),
+                    "output field {key} is not described by schema"
+                );
+            }
+        }
+        if let (Some(properties), Some(object)) = (
+            schema.get("properties").and_then(Value::as_object),
+            value.as_object(),
+        ) {
+            for (key, child_schema) in properties {
+                if let Some(child_value) = object.get(key) {
+                    assert_matches_schema(child_schema, child_value);
+                }
+            }
+        }
+        if let (Some(items_schema), Some(items)) = (schema.get("items"), value.as_array()) {
+            for item in items {
+                assert_matches_schema(items_schema, item);
+            }
+        }
+    }
+
     fn options(name: &str, link_port: u16, data_dir: PathBuf, peer: Option<String>) -> Options {
         Options {
             name: Some(name.into()),
@@ -3715,17 +3796,6 @@ mod tests {
     async fn group_and_subset_sends_filter_by_authenticated_group() {
         let schema: Value =
             serde_json::from_str(include_str!("../../../schemas/mcp-tools.json")).unwrap();
-        let observe_required = schema["tools"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|tool| tool["name"] == "observe_entangled_states")
-            .unwrap()["outputSchema"]["properties"]["states"]["items"]["required"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|value| value.as_str().unwrap().to_owned())
-            .collect::<Vec<_>>();
         let temp = tempfile::tempdir().unwrap();
         let root_a = temp.path().join("a");
         let root_b = temp.path().join("b");
@@ -3796,6 +3866,20 @@ mod tests {
         wait_for_group_pair(&a, &b).await;
         wait_for_group_pair(&a, &c).await;
 
+        let find_output = a.find_particles(&json!({}));
+        assert_matches_schema(
+            tool_output_schema(&schema, "find_entangled_particles"),
+            &find_output,
+        );
+        assert!(find_output["particles"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|peer| peer["state"] == "linked"));
+        if let Some(path) = std::env::var_os("ENTANGLE_FIND_PARTICLES_SAMPLE_PATH") {
+            std::fs::write(path, serde_json::to_vec_pretty(&find_output).unwrap()).unwrap();
+        }
+
         let group_send = a
             .sync_state(json!({
                 "group": "work",
@@ -3803,6 +3887,10 @@ mod tests {
             }))
             .await
             .unwrap();
+        assert_matches_schema(
+            tool_output_schema(&schema, "sync_entangled_state"),
+            &group_send,
+        );
         assert_eq!(group_send["group"], "work");
         assert_eq!(group_send["delivered"], 2);
         assert_eq!(group_send["failed"], 0);
@@ -3812,16 +3900,27 @@ mod tests {
         let original_work_sync_id = results[0]["sync_id"].as_str().unwrap().to_owned();
         for observer in [&b, &c] {
             let observed = observer.observe(&json!({ "group": "work" })).await;
+            assert_matches_schema(
+                tool_output_schema(&schema, "observe_entangled_states"),
+                &observed,
+            );
             assert_eq!(observed["states"].as_array().unwrap().len(), 1);
             assert_eq!(observed["states"][0]["group"], "work");
             assert_eq!(observed["states"][0]["trust"], "untrusted");
-            for key in &observe_required {
-                assert!(
-                    observed["states"][0].get(key).is_some(),
-                    "observe item is missing schema-required key {key}"
-                );
-            }
         }
+
+        let single_send = a
+            .sync_state(json!({
+                "particle_id": id_b.as_str(),
+                "state": { "message": "single target" }
+            }))
+            .await
+            .unwrap();
+        assert_matches_schema(
+            tool_output_schema(&schema, "sync_entangled_state"),
+            &single_send,
+        );
+        assert_eq!(single_send["delivered"], true);
 
         let c_before = c.observe(&json!({})).await["states"]
             .as_array()
@@ -3834,6 +3933,7 @@ mod tests {
             }))
             .await
             .unwrap();
+        assert_matches_schema(tool_output_schema(&schema, "sync_entangled_state"), &subset);
         assert_eq!(subset["delivered"], 1);
         assert_eq!(subset["results"].as_array().unwrap().len(), 1);
         assert_eq!(subset["results"][0]["particle_id"], id_b.as_str());
@@ -3853,6 +3953,7 @@ mod tests {
             }))
             .await
             .unwrap();
+        assert_matches_schema(tool_output_schema(&schema, "sync_entangled_state"), &pinned);
         assert_eq!(pinned["group"], "home");
         assert_eq!(pinned["delivered"], 1);
         assert_eq!(pinned["failed"], 1);
@@ -3878,6 +3979,10 @@ mod tests {
             }))
             .await
             .unwrap();
+        assert_matches_schema(
+            tool_output_schema(&schema, "sync_entangled_state"),
+            &with_unreachable,
+        );
         assert_eq!(with_unreachable["delivered"], 1);
         assert_eq!(with_unreachable["failed"], 1);
         let unreachable_result = with_unreachable["results"]
