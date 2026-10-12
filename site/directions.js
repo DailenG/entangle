@@ -212,6 +212,7 @@
           out = "pair " + pad(k + 1, 4) + " \u00b7 A " + (s > 0 ? "\u2191" : "\u2193") + "  B " + (s > 0 ? "\u2193" : "\u2191") + " \u00b7 light from A is " + pct + "% of the way to B";
         }
       }
+      var plate = copyRect(); if (plate && !narrow) { ctx.fillStyle = c.bg; ctx.fillRect(plate.x - 28, plate.y - 20, plate.w + 56, plate.h + 40); }
       return out;
     };
   }
@@ -328,6 +329,12 @@
       var viol = 0; [8, 9, 26, 27].forEach(function (b) { if (tot[b] > 25) { var E = (2 * same[b] - tot[b]) / tot[b], lim = -1 + 2 * (b + 0.5) / BINS; if (Math.abs(E - lim) > 1 / Math.sqrt(tot[b]) && Math.abs(E) > Math.abs(lim)) viol++; } });
       return "n = " + n.toLocaleString("en-US") + " pairs \u00b7 " + BINS + " settings \u00b7 bound exceeded at " + viol + " of 4 checked angles";
     };
+  }
+
+  function copyRect() {
+    var copy = document.querySelector(".hero-copy"); if (!copy) return null;
+    var a = copy.getBoundingClientRect(), b = canvas.getBoundingClientRect();
+    return { x: a.left - b.left, y: a.top - b.top, w: a.width, h: a.height };
   }
 
   // ---------- engine ----------

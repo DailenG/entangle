@@ -73,23 +73,23 @@
       </div>
       <ol class="steps">
         <li>
-          <h3>Resonance</h3>
-          <p>Particles advertise over mDNS on the local network and publish only a public pairing-group ID, never the key. Where multicast is blocked, static <code>--peer</code> entries do the same job.</p>
-          <pre>entangle scan</pre>
+          <div><h3>Resonance</h3></div>
+          <div><p>Particles advertise over mDNS on the local network and publish only a public pairing-group ID, never the key. Where multicast is blocked, static <code>--peer</code> entries do the same job.</p>
+          <pre>entangle scan</pre></div>
         </li>
         <li>
-          <h3>Pairing, by a human</h3>
-          <p>One person creates a pairing code, another enters it. On first contact both machines derive three emoji from a commit-then-reveal exchange; the humans compare and approve. Agents never see the code and cannot approve.</p>
+          <div><h3>Pairing, by a human</h3></div>
+          <div><p>One person creates a pairing code, another enters it. On first contact both machines derive three emoji from a commit-then-reveal exchange; the humans compare and approve. Agents never see the code and cannot approve.</p>
           <pre>entangle pair init
 entangle pair join &lt;code&gt;
-entangle peer approve</pre>
+entangle peer approve</pre></div>
         </li>
         <li>
-          <h3>State sync</h3>
-          <p>An agent sends JSON or one file over a Noise <code>XXpsk3</code> link on TCP 7337. The receiver checks the byte count and SHA-256 before anything reaches its inbox; the other agent observes it, then collapses it.</p>
+          <div><h3>State sync</h3></div>
+          <div><p>An agent sends JSON or one file over a Noise <code>XXpsk3</code> link on TCP 7337. The receiver checks the byte count and SHA-256 before anything reaches its inbox; the other agent observes it, then collapses it.</p>
           <pre>find_entangled_particles
 sync_entangled_state
-observe_entangled_states</pre>
+observe_entangled_states</pre></div>
         </li>
       </ol>
     </div>
