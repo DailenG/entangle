@@ -10,6 +10,7 @@ license.workspace = true
 entangle-core = { path = "../entangle-core" }
 gethostname.workspace = true
 mdns-sd.workspace = true
+rand.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 tokio.workspace = true

@@ -48,7 +48,12 @@ streams exactly the declared payload size in encrypted messages; each receive
 chunk has a five-second idle timeout. The receiver verifies the byte count and
 SHA-256 before adding the item to its inbox.
 
-SPAKE2 one-time group invites arrive in the next change.
+Group onboarding uses a one-time, three-word SPAKE2 code. The inviter
+advertises a short-lived nameplate with mDNS; `--via <host:port>` bypasses
+discovery, and failed confirmation closes the invite. Invites expire after ten
+minutes and can be limited with `--count`. The inviter should stay online
+briefly after onboarding: members are propagated by one-hop introductions,
+vouched for by the member who added them.
 
 ## Membership trust
 
@@ -57,6 +62,13 @@ only when its particle ID is present in that group's `members.json` and the
 stored member static key matches the remote Noise-authenticated static key.
 Offers and incoming payloads use the same membership and key-binding check.
 There is no separate peer-approval or verification state.
+
+After a successful Hello, peers exchange introductions for group members
+vouched for by the sender. A receiver accepts an introduction only over an
+authenticated link for that group, from a group member, and when every
+introduced record names that sender as `added_by`. This is one hop, not a
+transitive trust assertion; an inviter should remain online briefly so
+existing members can learn about new joiners.
 
 ## Execution flow
 

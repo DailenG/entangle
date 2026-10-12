@@ -87,16 +87,27 @@ Trust is based on membership in a shared group. Each device can belong to up
 to eight groups, and group keys are never advertised; mDNS publishes only
 public group IDs. Group-bound Noise links encrypt control frames and payloads.
 
-Create a group in an interactive terminal:
+Create a group in an interactive terminal, then invite one device and join
+each other device with the displayed one-time code:
 
 ```sh
 entangle group create work
+entangle group invite work --count 3
+entangle group join 7-amber-photon-quasar
 ```
 
+Use `--as <local-name>` on `group join` to choose a different local group label;
+it does not change the particle name advertised by this device.
+
 Inspect groups and members with `entangle group list` and
-`entangle group members work`. Devices join with a one-time code from
-`entangle group invite` (added in the next change). Leave a group with
-`entangle group leave work`.
+`entangle group members work`; leave a group with `entangle group leave work`.
+`--count N` requests that many successful joins (default 1, maximum 20).
+Invites close after ten minutes. Use `--via <host:port>` on `group join` if
+multicast discovery is blocked; the inviter prints a direct address. A wrong
+code or failed key confirmation closes the invite, so ask for a fresh one.
+The inviter should stay online briefly after onboarding: existing group
+members learn about newcomers when the inviter next links to them, using
+one-hop member introductions.
 
 ## Register as an MCP server
 

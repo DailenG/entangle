@@ -52,8 +52,15 @@ Register the binary as an MCP stdio server in your agent client. The default
 name is `<hostname>-<first 4 hex of the particle ID>`; the ID is saved in the
 data directory and stays stable across restarts. `--name` is optional. Use the
 same `--context` on devices working on the same project. Create a group with
-`entangle group create <name>`; devices join with a one-time code from
-`entangle group invite` (added in the next change). Use `entangle group list`,
+`entangle group create <name>`, then run `entangle group invite <name>` on one
+device and `entangle group join <code>` on each other device. Invitations
+expire after ten minutes; `--count N` sets the number of successful joins, and
+`--via <host:port>` provides a direct-connect fallback when multicast is
+blocked. Use `--as <local-name>` on `group join` to choose a different local
+group label without changing the particle name. A wrong code or failed
+confirmation closes that invite. The inviter
+should stay online briefly so existing members can learn about newly joined
+devices through one-hop introductions. Use `entangle group list`,
 `entangle group members <name>`, and `entangle group leave <name>` to inspect
 or leave groups. A second Entangle server using the same data directory gets
 a temporary ID while the first server is running. See

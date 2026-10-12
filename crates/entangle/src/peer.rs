@@ -3,12 +3,14 @@
 use crate::{groups, identity};
 use anyhow::Result;
 use crossterm::{
-    event::{read, Event, KeyCode, KeyEventKind},
+    event::{poll, read, Event, KeyCode, KeyEventKind, KeyModifiers},
     terminal::{disable_raw_mode, enable_raw_mode},
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use std::{collections::BTreeMap, io::Write, path::Path};
+use std::{
+    collections::BTreeMap, io::Write, path::Path, sync::mpsc as std_mpsc, thread, time::Duration,
+};
 
 #[derive(Debug, clap::Subcommand)]
 pub enum PeerCommand {
@@ -33,6 +35,66 @@ impl Drop for RawModeGuard {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
     }
+}
+
+pub(crate) struct CancelKeyListener {
+    stop: std_mpsc::Sender<()>,
+    thread: Option<thread::JoinHandle<()>>,
+    _raw_mode: RawModeGuard,
+}
+
+impl Drop for CancelKeyListener {
+    fn drop(&mut self) {
+        let _ = self.stop.send(());
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+pub(crate) fn start_cancel_key_listener(
+) -> Result<(tokio::sync::mpsc::UnboundedReceiver<()>, CancelKeyListener)> {
+    let raw_mode = RawModeGuard::enter()?;
+    let (cancel_tx, cancel_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (stop_tx, stop_rx) = std_mpsc::channel();
+    let thread = thread::Builder::new()
+        .name("entangle-invite-key-poll".into())
+        .spawn(move || loop {
+            if stop_rx.try_recv().is_ok() {
+                break;
+            }
+            match poll(Duration::from_millis(100)) {
+                Ok(true) => match read() {
+                    Ok(Event::Key(key))
+                        if key.kind == KeyEventKind::Press
+                            && (key.code == KeyCode::Esc
+                                || (key.code == KeyCode::Char('c')
+                                    && key.modifiers.contains(KeyModifiers::CONTROL))) =>
+                    {
+                        let _ = cancel_tx.send(());
+                        break;
+                    }
+                    Ok(_) => {}
+                    Err(_) => {
+                        let _ = cancel_tx.send(());
+                        break;
+                    }
+                },
+                Ok(false) => {}
+                Err(_) => {
+                    let _ = cancel_tx.send(());
+                    break;
+                }
+            }
+        })?;
+    Ok((
+        cancel_rx,
+        CancelKeyListener {
+            stop: stop_tx,
+            thread: Some(thread),
+            _raw_mode: raw_mode,
+        },
+    ))
 }
 
 pub(crate) fn read_confirmation_key() -> Result<bool> {

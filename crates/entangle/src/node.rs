@@ -3,13 +3,13 @@
 use crate::{
     config::Options,
     field::{Field, LinkPath, PeerRecord, PeerState},
-    groups::{self, Group},
+    groups::{self, Group, Member},
     identity::{self, Identity},
     inbox::{self, InboxItem},
 };
 use anyhow::{anyhow, Context, Result};
 use chrono::Utc;
-use entangle_core::{is_valid_sync_id, Manifest, StateKind, PROTOCOL_VERSION};
+use entangle_core::{is_valid_sync_id, Manifest, ParticleId, StateKind, PROTOCOL_VERSION};
 use entangle_link::{
     LinkError, LinkHandler, LinkListener, PayloadReader, PeerInfo, Route, SyncDecision, SyncOffer,
     TunnelOpener,
@@ -28,7 +28,7 @@ use std::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex as StdMutex, RwLock,
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tokio::task::JoinHandle;
 use tokio::{
@@ -46,6 +46,7 @@ const REPEATER_CONFIG_POLL: Duration = Duration::from_secs(30);
 const REPEATER_DIRECTORY_POLL: Duration = Duration::from_secs(15);
 const REPEATER_RECONNECT_BASE: Duration = Duration::from_secs(1);
 const REPEATER_RECONNECT_CAP: Duration = Duration::from_secs(60);
+const DISCOVERY_FAILURE_LOG_INTERVAL: Duration = Duration::from_secs(60);
 
 fn build_key_ring(static_private: [u8; 32], groups: &[Group]) -> KeyRing {
     KeyRing {
@@ -59,6 +60,17 @@ fn build_key_ring(static_private: [u8; 32], groups: &[Group]) -> KeyRing {
                 )
             })
             .collect(),
+    }
+}
+
+fn should_retry_resonator(no_mdns: bool, relay_only: bool, is_running: bool) -> bool {
+    !no_mdns && !relay_only && !is_running
+}
+
+fn should_log_discovery_failure(last_log: Option<Instant>, now: Instant) -> bool {
+    match last_log {
+        None => true,
+        Some(last) => now.duration_since(last) >= DISCOVERY_FAILURE_LOG_INTERVAL,
     }
 }
 
@@ -149,7 +161,7 @@ pub struct Particle {
     resonator: Mutex<Option<Resonator>>,
     resonance_task: Mutex<Option<JoinHandle<()>>>,
     discovery_generation: AtomicU64,
-    discovery_failure_logged: AtomicBool,
+    discovery_failure_last_log: StdMutex<Option<Instant>>,
     inbox: Mutex<Vec<InboxItem>>,
     in_flight: StdMutex<HashSet<String>>,
     groups_reload_warned: AtomicBool,
@@ -257,7 +269,7 @@ impl Particle {
             resonator: Mutex::new(None),
             resonance_task: Mutex::new(None),
             discovery_generation: AtomicU64::new(0),
-            discovery_failure_logged: AtomicBool::new(false),
+            discovery_failure_last_log: StdMutex::new(None),
             inbox: Mutex::new(persisted_inbox),
             in_flight: StdMutex::new(HashSet::new()),
             groups_reload_warned: AtomicBool::new(false),
@@ -407,8 +419,10 @@ impl Particle {
         *resonator = Some(next);
         drop(resonator);
         *resonance_task = Some(self.spawn_resonance_events(events, generation));
-        self.discovery_failure_logged
-            .store(false, Ordering::Relaxed);
+        *self
+            .discovery_failure_last_log
+            .lock()
+            .expect("discovery failure log lock") = None;
         Ok(())
     }
 
@@ -435,10 +449,14 @@ impl Particle {
     }
 
     fn log_discovery_failure(&self, error: &anyhow::Error) {
-        if !self.discovery_failure_logged.swap(true, Ordering::Relaxed) {
+        let now = Instant::now();
+        let mut last_log = self
+            .discovery_failure_last_log
+            .lock()
+            .expect("discovery failure log lock");
+        if should_log_discovery_failure(*last_log, now) {
+            *last_log = Some(now);
             warn!(%error, "unable to start mDNS discovery; it will be retried");
-        } else {
-            debug!(%error, "mDNS discovery restart failed; it will be retried");
         }
     }
 
@@ -456,8 +474,10 @@ impl Particle {
                 }
                 _ = interval.tick() => {}
             }
+            let mut restart_attempted = false;
             match groups::list(&self.data_root) {
                 Ok(current) if current != previous => {
+                    restart_attempted = true;
                     let discovered = self
                         .field
                         .read()
@@ -488,6 +508,17 @@ impl Particle {
                         warn!(%error, "could not reload group store");
                         unavailable_logged = true;
                     }
+                }
+            }
+            if !restart_attempted
+                && should_retry_resonator(
+                    self.options.no_mdns,
+                    self.options.relay_only,
+                    self.resonator.lock().await.is_some(),
+                )
+            {
+                if let Err(error) = self.restart_resonator().await {
+                    self.log_discovery_failure(&error);
                 }
             }
         }
@@ -1413,7 +1444,7 @@ impl Particle {
             )
             .await
             {
-                Ok((manifest, remote_static, _stream)) if manifest.protocol == PROTOCOL_VERSION => {
+                Ok((manifest, remote_static, stream)) if manifest.protocol == PROTOCOL_VERSION => {
                     if manifest.particle_id == self.manifest.particle_id {
                         return false;
                     }
@@ -1441,6 +1472,30 @@ impl Particle {
                             "refusing a peer whose Noise static key changed"
                         );
                         return false;
+                    }
+                    let peer_info = PeerInfo {
+                        addr: match &route {
+                            Route::Direct(address) => *address,
+                            Route::Tunnel(_) => RELAY_PLACEHOLDER,
+                        },
+                        remote_static,
+                        group: group_id,
+                        relayed: matches!(&route, Route::Tunnel(_)),
+                    };
+                    if let Err(error) = entangle_link::introduce_on(
+                        stream,
+                        peer_info,
+                        manifest.particle_id.clone(),
+                        self,
+                        Duration::from_secs(5),
+                    )
+                    .await
+                    {
+                        debug!(
+                            particle_id = %manifest.particle_id,
+                            %error,
+                            "could not send group member introductions"
+                        );
                     }
                     let route_path = match &route {
                         Route::Direct(_) => LinkPath::Direct,
@@ -1694,6 +1749,33 @@ impl Particle {
 
 #[async_trait::async_trait]
 impl LinkHandler for Particle {
+    fn members_to_introduce(
+        &self,
+        peer: &PeerInfo,
+        recipient: &ParticleId,
+    ) -> std::result::Result<Vec<Member>, LinkError> {
+        let group_id = hex::encode(peer.group);
+        let groups = self
+            .groups
+            .read()
+            .map_err(|_| LinkError::Handler("group store lock poisoned".into()))?;
+        Ok(groups
+            .iter()
+            .find(|group| group.id == group_id)
+            .map(|group| {
+                group
+                    .members
+                    .iter()
+                    .filter(|member| {
+                        member.added_by == self.manifest.particle_id.as_str()
+                            && member.particle_id != recipient.as_str()
+                    })
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
+
     async fn on_hello(
         &self,
         peer: &PeerInfo,
@@ -1822,6 +1904,46 @@ impl LinkHandler for Particle {
     ) -> std::result::Result<String, String> {
         self.receive_payload(peer, offer, payload).await
     }
+
+    async fn on_introduce(
+        &self,
+        peer: &PeerInfo,
+        sender: &ParticleId,
+        members: Vec<Member>,
+    ) -> Result<u32, LinkError> {
+        if !self.group_member(peer.group, sender.as_str(), &peer.remote_static) {
+            warn!(
+                sender = %sender,
+                group = %hex::encode(peer.group),
+                "rejecting member introductions from a non-member"
+            );
+            return Err(LinkError::Handler(
+                "introduction sender is not a member of the authenticated group".into(),
+            ));
+        }
+        let group_id = hex::encode(peer.group);
+        let mut added = 0_u32;
+        for member in members {
+            if member.added_by != sender.as_str() {
+                warn!(
+                    particle_id = %member.particle_id,
+                    added_by = %member.added_by,
+                    sender = %sender,
+                    "rejecting a member introduction with an invalid voucher"
+                );
+                continue;
+            }
+            match groups::add_member(&self.data_root, &group_id, member.clone()) {
+                Ok(true) => added += 1,
+                Ok(false) => {}
+                Err(groups::GroupError::KeyConflict(particle_id)) => {
+                    warn!(%particle_id, "skipping introduced member with a conflicting key")
+                }
+                Err(error) => warn!(%error, "could not store introduced group member"),
+            }
+        }
+        Ok(added)
+    }
 }
 
 impl Particle {
@@ -1931,8 +2053,6 @@ fn kind_name(kind: &StateKind) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::groups::Member;
-    use entangle_core::ParticleId;
     use std::collections::HashMap;
 
     fn options(name: &str, link_port: u16, data_dir: PathBuf, peer: Option<String>) -> Options {
@@ -1950,6 +2070,28 @@ mod tests {
             relay_only: false,
             log_level: "warn".into(),
         }
+    }
+
+    #[test]
+    fn missing_resonator_is_retried_only_when_mdns_is_enabled() {
+        assert!(should_retry_resonator(false, false, false));
+        assert!(!should_retry_resonator(true, false, false));
+        assert!(!should_retry_resonator(false, true, false));
+        assert!(!should_retry_resonator(false, false, true));
+    }
+
+    #[test]
+    fn discovery_failure_logs_are_limited_to_once_per_minute() {
+        let now = Instant::now();
+        assert!(should_log_discovery_failure(None, now));
+        assert!(!should_log_discovery_failure(
+            Some(now),
+            now + Duration::from_secs(59)
+        ));
+        assert!(should_log_discovery_failure(
+            Some(now),
+            now + DISCOVERY_FAILURE_LOG_INTERVAL
+        ));
     }
 
     fn free_port() -> u16 {
@@ -2462,6 +2604,259 @@ mod tests {
             .contains("isn't a member of any shared group"));
         a.shutdown().await;
         b.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn invited_member_is_introduced_across_the_mesh_and_syncs_both_ways() {
+        let temp = tempfile::tempdir().unwrap();
+        let root_a = temp.path().join("a");
+        let root_b = temp.path().join("b");
+        let root_c = temp.path().join("c");
+        let key = [0x63; 32];
+        let (id_a, private_a) = saved_identity(&root_a);
+        let (id_b, _private_b) = saved_identity(&root_b);
+        let (id_c, private_c) = saved_identity(&root_c);
+        let member_a = test_member(&id_a, "particle-a", &private_a, id_a.as_str());
+        let member_c = test_member(&id_c, "particle-c", &private_c, id_a.as_str());
+        insert_test_group(
+            &root_a,
+            "work",
+            key,
+            vec![member_a.clone(), member_c.clone()],
+            groups::Role::Admin,
+        );
+        insert_test_group(
+            &root_c,
+            "work",
+            key,
+            vec![member_a, member_c],
+            groups::Role::Member,
+        );
+
+        let a_port = free_port();
+        let c_port = port_other_than(a_port);
+        let b_port = loop {
+            let port = free_port();
+            if port != a_port && port != c_port {
+                break port;
+            }
+        };
+        let (c, _) = Particle::start(
+            options(
+                "particle-c",
+                c_port,
+                root_c.clone(),
+                Some(format!("127.0.0.1:{b_port}")),
+            ),
+            None,
+        )
+        .await
+        .unwrap();
+        let (a, _) = Particle::start(
+            options(
+                "particle-a",
+                a_port,
+                root_a.clone(),
+                Some(format!("127.0.0.1:{c_port}")),
+            ),
+            None,
+        )
+        .await
+        .unwrap();
+        wait_for_group_pair(&a, &c).await;
+
+        let invite = crate::invite::protocol::InviteServer::new(
+            &root_a,
+            groups::group_id(&key),
+            "particle-a".into(),
+            crate::invite::code::InviteCode::parse("7-amber-photon-quasar").unwrap(),
+            1,
+            Duration::from_secs(30),
+        )
+        .unwrap();
+        let (joiner, inviter) = tokio::io::duplex(1024 * 1024);
+        let invite_task = tokio::spawn(async move { invite.handle(inviter).await });
+        crate::invite::protocol::join(
+            joiner,
+            &root_b,
+            crate::invite::code::InviteCode::parse("7-amber-photon-quasar").unwrap(),
+            None,
+            "particle-b",
+        )
+        .await
+        .unwrap();
+        let _ = invite_task.await.unwrap().unwrap();
+
+        let (b, _) = Particle::start(
+            options(
+                "particle-b",
+                b_port,
+                root_b.clone(),
+                Some(format!("127.0.0.1:{a_port}")),
+            ),
+            None,
+        )
+        .await
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(12), async {
+            loop {
+                let c_knows_b = groups::find(&root_c, "work")
+                    .unwrap()
+                    .unwrap()
+                    .members
+                    .iter()
+                    .any(|member| member.particle_id == id_b.as_str());
+                let c_linked_b = c
+                    .field
+                    .read()
+                    .unwrap()
+                    .by_id(&b.manifest.particle_id)
+                    .is_some_and(|peer| peer.state == PeerState::Entangled);
+                if c_knows_b && c_linked_b {
+                    break;
+                }
+                sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("the group watcher should introduce B to C and establish their link");
+        for (sender, receiver) in [(&b, &c), (&c, &b)] {
+            let result = sender
+                .sync_state(json!({
+                    "particle_id": receiver.manifest.particle_id.as_str(),
+                    "state": { "mesh": true },
+                    "timeout_secs": 60
+                }))
+                .await
+                .unwrap();
+            assert_eq!(result["delivered"], true);
+        }
+
+        let sender_info = PeerInfo {
+            addr: SocketAddr::from(([127, 0, 0, 1], a_port)),
+            remote_static: entangle_transport::public_key(&private_a),
+            group: groups::group_id_bytes(&key),
+            relayed: false,
+        };
+        let untrusted_id = ParticleId::generate();
+        let untrusted_private = [0x74; 32];
+        let misvouched = test_member(
+            &untrusted_id,
+            "untrusted",
+            &untrusted_private,
+            id_c.as_str(),
+        );
+        assert_eq!(
+            c.on_introduce(&sender_info, &id_a, vec![misvouched])
+                .await
+                .unwrap(),
+            0
+        );
+        assert!(groups::find(&root_c, "work")
+            .unwrap()
+            .unwrap()
+            .members
+            .iter()
+            .all(|member| member.particle_id != untrusted_id.as_str()));
+
+        let stranger_id = ParticleId::generate();
+        let stranger_key = [0x75; 32];
+        let stranger_info = PeerInfo {
+            remote_static: entangle_transport::public_key(&stranger_key),
+            ..sender_info
+        };
+        assert!(c
+            .on_introduce(&stranger_info, &stranger_id, vec![])
+            .await
+            .is_err());
+        a.shutdown().await;
+        b.shutdown().await;
+        c.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn inbound_link_introduces_new_member_when_inviter_cannot_dial_peer() {
+        let temp = tempfile::tempdir().unwrap();
+        let root_a = temp.path().join("a");
+        let root_b = temp.path().join("b");
+        let root_c = temp.path().join("c");
+        let key = [0x65; 32];
+        let (id_a, private_a) = saved_identity(&root_a);
+        let (id_b, _private_b) = saved_identity(&root_b);
+        let (id_c, private_c) = saved_identity(&root_c);
+        let member_a = test_member(&id_a, "particle-a", &private_a, id_a.as_str());
+        let member_c = test_member(&id_c, "particle-c", &private_c, id_a.as_str());
+        insert_test_group(
+            &root_a,
+            "work",
+            key,
+            vec![member_a.clone(), member_c.clone()],
+            groups::Role::Admin,
+        );
+        insert_test_group(
+            &root_c,
+            "work",
+            key,
+            vec![member_a, member_c],
+            groups::Role::Member,
+        );
+        let group = groups::find(&root_a, "work").unwrap().unwrap();
+        let invite = crate::invite::protocol::InviteServer::new(
+            &root_a,
+            group.id,
+            "particle-a".into(),
+            crate::invite::code::InviteCode::parse("7-amber-photon-quasar").unwrap(),
+            1,
+            Duration::from_secs(30),
+        )
+        .unwrap();
+        let (joiner, inviter) = tokio::io::duplex(1024 * 1024);
+        let invite_task = tokio::spawn(async move { invite.handle(inviter).await });
+        crate::invite::protocol::join(
+            joiner,
+            &root_b,
+            crate::invite::code::InviteCode::parse("7-amber-photon-quasar").unwrap(),
+            None,
+            "particle-b",
+        )
+        .await
+        .unwrap();
+        invite_task.await.unwrap().unwrap();
+
+        let a_port = free_port();
+        let c_port = port_other_than(a_port);
+        let (a, _) = Particle::start(options("particle-a", a_port, root_a, None), None)
+            .await
+            .unwrap();
+        let (c, _) = Particle::start(
+            options(
+                "particle-c",
+                c_port,
+                root_c.clone(),
+                Some(format!("127.0.0.1:{a_port}")),
+            ),
+            None,
+        )
+        .await
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(8), async {
+            loop {
+                if groups::find(&root_c, "work")
+                    .unwrap()
+                    .unwrap()
+                    .members
+                    .iter()
+                    .any(|member| member.particle_id == id_b.as_str())
+                {
+                    break;
+                }
+                sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("C should learn B from A's response to C's inbound-only link");
+        a.shutdown().await;
+        c.shutdown().await;
     }
 
     #[tokio::test]

@@ -14,6 +14,16 @@ pub const PROTOCOL_VERSION: u32 = 4;
 #[serde(transparent)]
 pub struct ParticleId(String);
 
+/// A particle's vouching record within a trusted group.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct Member {
+    pub particle_id: String,
+    pub name: String,
+    pub static_key: String,
+    pub added_by: String,
+    pub added_at: String,
+}
+
 impl ParticleId {
     /// Creates a fresh identity using the OS random number generator; callers may persist it.
     pub fn generate() -> Self {
