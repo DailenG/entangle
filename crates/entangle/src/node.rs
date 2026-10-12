@@ -2635,6 +2635,9 @@ impl LinkHandler for Particle {
                 groups: vec![hex::encode(peer.group)],
                 proto: manifest.protocol,
             });
+        if !peer.relayed && !resonance.addrs.contains(&peer.addr.ip()) {
+            resonance.addrs.push(peer.addr.ip());
+        }
         resonance.particle_id = manifest.particle_id.clone();
         resonance.name = manifest.name.clone();
         resonance.port = manifest.link_port;
@@ -4684,6 +4687,62 @@ mod tests {
             "unexpected sync handshake error: {error}"
         );
         accept_task.await.unwrap();
+        particle.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn direct_hello_adds_tcp_address_after_repeater_discovery() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("node");
+        let (local_id, local_private) = saved_identity(&root);
+        let id = ParticleId::generate();
+        let remote_private = [0x33; 32];
+        insert_test_group(
+            &root,
+            "test",
+            [0x41; 32],
+            vec![
+                test_member(&local_id, "receiver", &local_private, local_id.as_str()),
+                test_member(&id, "peer", &remote_private, local_id.as_str()),
+            ],
+            groups::Role::Admin,
+        );
+        let (particle, _) = Particle::start(options("receiver", free_port(), root, None), None)
+            .await
+            .unwrap();
+        let mut manifest = peer_manifest(id.clone());
+        manifest.link_port = 7338;
+        particle.field.write().unwrap().resonate(Resonance {
+            particle_id: id.clone(),
+            name: manifest.name.clone(),
+            hostname: "via-repeater".into(),
+            addrs: vec![],
+            port: 7338,
+            context: None,
+            groups: vec![groups::group_id(&[0x41; 32])],
+            proto: manifest.protocol,
+        });
+
+        particle
+            .on_hello(
+                &PeerInfo {
+                    addr: SocketAddr::from(([127, 0, 0, 1], 7338)),
+                    remote_static: entangle_transport::public_key(&remote_private),
+                    group: groups::group_id_bytes(&[0x41; 32]),
+                    epoch: 0,
+                    relayed: false,
+                },
+                manifest,
+            )
+            .await
+            .unwrap();
+
+        let record = particle.field.read().unwrap().by_id(&id).unwrap();
+        assert_eq!(
+            record.resonance.addrs,
+            vec![std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)]
+        );
+        assert_eq!(record.path, Some(LinkPath::Direct));
         particle.shutdown().await;
     }
 
