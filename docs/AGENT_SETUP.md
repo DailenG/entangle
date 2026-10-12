@@ -319,6 +319,19 @@ it does not assert that the latest link used the repeater. The
    - Send with `sync_entangled_state`: provide exactly one of `state` or
      `file_path`, add a `label` describing the intent, prefer JSON `state` for
      messages and `file_path` for files, and send only a single regular file.
+     Choose exactly one targeting form:
+
+     ```json
+     {"particle_id":"<full-or-unambiguous-prefix>","state":{"type":"message","body":"Hello"}}
+     {"particle_ids":["<particle-b>","<particle-c>"],"state":{"type":"request","body":"Please review"}}
+     {"group":"work","state":{"type":"message","body":"Update for the work group"}}
+     ```
+
+     `particle_id` targets one member; `particle_ids` targets a deduplicated
+     subset of 1–32 members; `group` alone targets every other member. An
+     optional `group` with `particle_id` or `particle_ids` pins the
+     authenticated group. Received items include their `group` name; reply
+     within that same group unless the human says otherwise.
    - When you receive a `state_sync_received` notification, or at the start
      of a collaboration turn, call `observe_entangled_states`. Set
      `collapse: true` once you have acted on the returned items. Received items
