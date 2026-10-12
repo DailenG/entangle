@@ -21,6 +21,7 @@ clap.workspace = true
 crossterm = "0.28.1"
 dirs.workspace = true
 data-encoding.workspace = true
+ed25519-dalek = "2"
 gethostname.workspace = true
 hex.workspace = true
 rand.workspace = true

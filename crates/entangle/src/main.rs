@@ -16,7 +16,7 @@ use anyhow::Result;
 use chrono::{SecondsFormat, Utc};
 use clap::{Parser, Subcommand};
 use config::Options;
-use groups::{Member, Role};
+use groups::Member;
 use invite::{
     code::InviteCode,
     protocol::{self, InviteEnd, InviteError, InviteServer, InviteState},
@@ -120,6 +120,23 @@ enum GroupCommand {
     Leave {
         #[arg(id = "group_name", value_name = "NAME")]
         name: String,
+    },
+    /// Remove a member and rotate the group's key.
+    Remove {
+        #[arg(id = "group_name", value_name = "NAME")]
+        name: String,
+        member: String,
+    },
+    /// Rotate the group's key.
+    Rekey {
+        #[arg(id = "group_name", value_name = "NAME")]
+        name: String,
+    },
+    /// Transfer group administration to a member.
+    Admin {
+        #[arg(id = "group_name", value_name = "NAME")]
+        name: String,
+        member: String,
     },
 }
 
@@ -246,6 +263,9 @@ async fn run_group(
             | GroupCommand::Invite { .. }
             | GroupCommand::Join { .. }
             | GroupCommand::Leave { .. }
+            | GroupCommand::Remove { .. }
+            | GroupCommand::Rekey { .. }
+            | GroupCommand::Admin { .. }
     ) && !(io::stdin().is_terminal() && io::stdout().is_terminal())
     {
         writeln!(
@@ -268,6 +288,7 @@ async fn run_group(
                 particle_id: particle_id.clone(),
                 name: particle_name,
                 static_key: hex::encode(entangle_transport::public_key(&static_private)),
+                sign_key: groups::signing_public_key(&static_private),
                 added_by: particle_id,
                 added_at: Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
             };
@@ -308,14 +329,29 @@ async fn run_group(
         GroupCommand::List { json } => {
             let groups = groups::list(&data_root)?;
             if json {
+                let self_id = identity::read_saved(&data_root)?.map(|(id, _)| id.to_string());
                 let rows = groups
                     .iter()
                     .map(|group| {
                         serde_json::json!({
                             "name": &group.meta.name,
                             "group": &group.id,
-                            "role": role_name(&group.meta.role),
+                            "role": role_name(
+                                !group.outdated
+                                    && self_id
+                                        .as_deref()
+                                        .is_some_and(|id| group.meta.is_admin(id))
+                            ),
                             "members": group.members.len(),
+                            "admin": group.members.iter()
+                                .find(|member| member.particle_id == group.meta.admin)
+                                .map(|member| member.name.clone()),
+                            "epoch": group.meta.epoch,
+                            "outdated": group.outdated,
+                            "hint": group.outdated.then(|| format!(
+                                "group {} was created by Entangle 0.6; run `entangle group leave {}` and create it again",
+                                group.meta.name, group.meta.name
+                            )),
                         })
                     })
                     .collect::<Vec<_>>();
@@ -324,15 +360,25 @@ async fn run_group(
                 writeln!(output, "This machine isn't in any group yet. Run `entangle group create <name>` or `entangle group join <code>`.")?;
             } else {
                 writeln!(output, "NAME  GROUP  ROLE  MEMBERS")?;
+                let self_id = identity::read_saved(&data_root)?.map(|(id, _)| id.to_string());
                 for group in groups {
-                    writeln!(
-                        output,
-                        "{}  {}  {}  {}",
-                        group.meta.name,
-                        group.id,
-                        role_name(&group.meta.role),
-                        group.members.len()
-                    )?;
+                    if group.outdated {
+                        writeln!(
+                            output,
+                            "{}  {}  outdated  --  group {} was created by Entangle 0.6; run `entangle group leave {}` and create it again",
+                            group.meta.name, group.id, group.meta.name, group.meta.name
+                        )?;
+                    } else {
+                        let is_admin = self_id.as_deref().is_some_and(|id| group.meta.is_admin(id));
+                        writeln!(
+                            output,
+                            "{}  {}  {}  {}",
+                            group.meta.name,
+                            group.id,
+                            role_name(is_admin),
+                            group.members.len()
+                        )?;
+                    }
                 }
             }
         }
@@ -353,44 +399,369 @@ async fn run_group(
                     "particle_id": &member.particle_id,
                     "fingerprint": fingerprint,
                     "added_by": &member.added_by,
+                    "role": role_name(group.meta.is_admin(&member.particle_id)),
                     "this_machine": is_self,
                 })
             }).collect::<Vec<_>>();
             if json {
                 writeln!(output, "{}", serde_json::to_string_pretty(&rows)?)?;
             } else {
-                writeln!(output, "NAME  PARTICLE(short)  FINGERPRINT  ADDED BY")?;
+                writeln!(output, "NAME  PARTICLE(short)  FINGERPRINT  ADDED BY  ROLE")?;
                 for (row, member) in rows.iter().zip(&group.members) {
                     let name = row["name"].as_str().unwrap_or_default();
                     writeln!(
                         output,
-                        "{}  {}  {}  {}",
+                        "{}  {}  {}  {}  {}",
                         name,
                         short_particle_id(&member.particle_id),
                         row["fingerprint"].as_str().unwrap_or_default(),
-                        short_particle_id(row["added_by"].as_str().unwrap_or_default())
+                        short_particle_id(row["added_by"].as_str().unwrap_or_default()),
+                        row["role"].as_str().unwrap_or_default()
                     )?;
                 }
             }
         }
+        GroupCommand::Remove { name, member } => {
+            let group = groups::find(&data_root, &name)?
+                .ok_or_else(|| groups::GroupError::NotFound(name.clone()))?;
+            let static_private = require_admin(&data_root, &group)?;
+            let target = resolve_group_member(&group, &member)?;
+            let self_id = identity::read_saved(&data_root)?
+                .map(|(id, _)| id.to_string())
+                .unwrap_or_default();
+            if target.particle_id == self_id {
+                anyhow::bail!("you cannot remove yourself from {}", group.meta.name);
+            }
+            write!(
+                output,
+                "Remove {} from {} and rotate the group key? [y/N] ",
+                target.name, group.meta.name
+            )?;
+            output.flush()?;
+            if !peer::read_confirmation_key()? {
+                writeln!(output, "Cancelled; still in {}.", group.meta.name)?;
+                return Ok(0);
+            }
+            let next_epoch = group
+                .meta
+                .epoch
+                .checked_add(1)
+                .ok_or_else(|| anyhow::anyhow!("group epoch exhausted"))?;
+            write_update_status(&data_root, &group.id, next_epoch)?;
+            let updated = groups::issue_update(
+                &data_root,
+                &group.id,
+                entangle_core::UpdateKind::Remove {
+                    particle_id: target.particle_id.clone(),
+                },
+                &static_private,
+            )?;
+            let line = update_outcome(
+                &data_root,
+                &updated,
+                &format!("Removed {} from {}", target.name, group.meta.name),
+                "New key",
+                identity::is_running(&data_root),
+                updated.members.len().saturating_sub(1),
+                Duration::from_secs(20),
+            )
+            .await?;
+            writeln!(output, "{line}")?;
+        }
+        GroupCommand::Rekey { name } => {
+            let group = groups::find(&data_root, &name)?
+                .ok_or_else(|| groups::GroupError::NotFound(name.clone()))?;
+            let static_private = require_admin(&data_root, &group)?;
+            write!(output, "Rotate the key for {}? [y/N] ", group.meta.name)?;
+            output.flush()?;
+            if !peer::read_confirmation_key()? {
+                writeln!(output, "Cancelled; still in {}.", group.meta.name)?;
+                return Ok(0);
+            }
+            let next_epoch = group
+                .meta
+                .epoch
+                .checked_add(1)
+                .ok_or_else(|| anyhow::anyhow!("group epoch exhausted"))?;
+            write_update_status(&data_root, &group.id, next_epoch)?;
+            let updated = groups::issue_update(
+                &data_root,
+                &group.id,
+                entangle_core::UpdateKind::Rekey,
+                &static_private,
+            )?;
+            let line = update_outcome(
+                &data_root,
+                &updated,
+                &format!("Rekeyed {}", group.meta.name),
+                "New key",
+                identity::is_running(&data_root),
+                group.members.len().saturating_sub(1),
+                Duration::from_secs(20),
+            )
+            .await?;
+            writeln!(output, "{line}")?;
+        }
+        GroupCommand::Admin { name, member } => {
+            let group = groups::find(&data_root, &name)?
+                .ok_or_else(|| groups::GroupError::NotFound(name.clone()))?;
+            let static_private = require_admin(&data_root, &group)?;
+            let target = resolve_group_member(&group, &member)?;
+            if target.particle_id == group.meta.admin {
+                anyhow::bail!(
+                    "{} is already the admin of {}",
+                    target.name,
+                    group.meta.name
+                );
+            }
+            write!(
+                output,
+                "Make {} the admin of {}? [y/N] ",
+                target.name, group.meta.name
+            )?;
+            output.flush()?;
+            if !peer::read_confirmation_key()? {
+                writeln!(output, "Cancelled; still in {}.", group.meta.name)?;
+                return Ok(0);
+            }
+            let next_epoch = group
+                .meta
+                .epoch
+                .checked_add(1)
+                .ok_or_else(|| anyhow::anyhow!("group epoch exhausted"))?;
+            write_update_status(&data_root, &group.id, next_epoch)?;
+            let updated = groups::issue_update(
+                &data_root,
+                &group.id,
+                entangle_core::UpdateKind::AdminHandoff {
+                    to: target.particle_id,
+                },
+                &static_private,
+            )?;
+            let line = update_outcome(
+                &data_root,
+                &updated,
+                &format!("{} is now the admin of {}", target.name, group.meta.name),
+                "Notified",
+                identity::is_running(&data_root),
+                group.members.len().saturating_sub(1),
+                Duration::from_secs(20),
+            )
+            .await?;
+            writeln!(output, "{line}")?;
+        }
         GroupCommand::Leave { name } => {
             let group = groups::find(&data_root, &name)?
                 .ok_or_else(|| groups::GroupError::NotFound(name.clone()))?;
+            let self_id = identity::read_saved(&data_root)?
+                .map(|(id, _)| id.to_string())
+                .unwrap_or_default();
+            if group.meta.is_admin(&self_id) && group.members.len() > 1 {
+                let member = group
+                    .members
+                    .iter()
+                    .find(|member| member.particle_id != self_id)
+                    .map(|member| member.name.as_str())
+                    .unwrap_or("<member>");
+                anyhow::bail!(
+                    "You're the admin of {}. Hand it off first: entangle group admin {} {}",
+                    group.meta.name,
+                    group.meta.name,
+                    member
+                );
+            }
             write!(
                 output,
-                "Leave group {} ({})? This deletes its key from this machine. [y/N] ",
+                "Leave group {} ({})? [y/N] ",
                 group.meta.name, group.id
             )?;
             output.flush()?;
             if peer::read_confirmation_key()? {
-                groups::leave(&data_root, &name)?;
-                writeln!(output, "Left group {}.", group.meta.name)?;
+                if group.outdated {
+                    groups::leave(&data_root, &name)?;
+                    writeln!(output, "Left {}.", group.meta.name)?;
+                } else if identity::is_running(&data_root) {
+                    groups::write_status(
+                        &data_root,
+                        &group.id,
+                        &groups::GroupStatus {
+                            epoch: group.meta.epoch,
+                            op: "leave".into(),
+                            confirmed: Vec::new(),
+                        },
+                    )?;
+                    groups::set_leaving(&data_root, &group.id, true)?;
+                    let status = wait_for_status(
+                        &data_root,
+                        &group.id,
+                        group.meta.epoch,
+                        "leave",
+                        group.members.len().saturating_sub(1),
+                        Duration::from_secs(60),
+                    )
+                    .await;
+                    writeln!(
+                        output,
+                        "Left {}. Told {} of {} members.",
+                        group.meta.name,
+                        status.confirmed.len(),
+                        group.members.len().saturating_sub(1)
+                    )?;
+                } else {
+                    groups::leave(&data_root, &name)?;
+                    writeln!(output, "Left {}.", group.meta.name)?;
+                }
             } else {
                 writeln!(output, "Cancelled; still in {}.", group.meta.name)?;
             }
         }
     }
     Ok(0)
+}
+
+struct GroupMemberTarget {
+    particle_id: String,
+    name: String,
+}
+
+fn require_admin(root: &std::path::Path, group: &groups::Group) -> Result<[u8; 32]> {
+    let saved = identity::read_saved(root)?;
+    let Some((self_id, private)) = saved else {
+        return Err(groups::GroupError::MissingIdentity(root.to_owned()).into());
+    };
+    if !group.meta.is_admin(self_id.as_str()) {
+        let admin_name = group
+            .members
+            .iter()
+            .find(|member| member.particle_id == group.meta.admin)
+            .map_or(group.meta.admin.as_str(), |member| member.name.as_str());
+        anyhow::bail!(
+            "Only the admin of {} ({}) can do this.",
+            group.meta.name,
+            admin_name
+        );
+    }
+    Ok(private)
+}
+
+fn resolve_group_member(group: &groups::Group, selector: &str) -> Result<GroupMemberTarget> {
+    let matches = group
+        .members
+        .iter()
+        .filter(|member| member.name == selector || member.particle_id.starts_with(selector))
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [] => anyhow::bail!("no member matches {selector} in {}", group.meta.name),
+        [member] => Ok(GroupMemberTarget {
+            particle_id: member.particle_id.clone(),
+            name: member.name.clone(),
+        }),
+        _ => anyhow::bail!("ambiguous member: {selector}"),
+    }
+}
+
+fn write_update_status(root: &std::path::Path, group_id: &str, epoch: u32) -> Result<()> {
+    groups::write_status(
+        root,
+        group_id,
+        &groups::GroupStatus {
+            epoch,
+            op: "update".into(),
+            confirmed: Vec::new(),
+        },
+    )?;
+    Ok(())
+}
+
+async fn wait_for_status(
+    root: &std::path::Path,
+    group_id: &str,
+    epoch: u32,
+    op: &str,
+    expected: usize,
+    duration: Duration,
+) -> groups::GroupStatus {
+    let deadline = std::time::Instant::now() + duration;
+    let mut latest = None;
+    loop {
+        if let Ok(Some(status)) = groups::read_status(root, group_id) {
+            if status.epoch >= epoch && status.op == op {
+                if status.confirmed.len() >= expected {
+                    return status;
+                }
+                latest = Some(status);
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    latest.unwrap_or_else(|| groups::GroupStatus {
+        epoch,
+        op: op.into(),
+        confirmed: Vec::new(),
+    })
+}
+
+async fn update_outcome(
+    root: &std::path::Path,
+    group: &groups::Group,
+    action: &str,
+    delivery_label: &str,
+    running: bool,
+    total: usize,
+    timeout: Duration,
+) -> Result<String> {
+    if !running {
+        return Ok(format!(
+            "{action}. Entangle isn't running here, so the change goes out the next time it starts."
+        ));
+    }
+    let status = wait_for_status(root, &group.id, group.meta.epoch, "update", total, timeout).await;
+    let self_id = identity::read_saved(root)
+        .ok()
+        .flatten()
+        .map(|(id, _)| id.to_string());
+    let delivered_members = group
+        .members
+        .iter()
+        .filter(|member| {
+            self_id.as_deref() != Some(member.particle_id.as_str())
+                && status.confirmed.contains(&member.particle_id)
+        })
+        .collect::<Vec<_>>();
+    let delivered = delivered_members.len().min(total);
+    if delivered >= total {
+        if delivery_label == "Notified" {
+            Ok(format!(
+                "{action}. Notified {delivered} of {total} other members."
+            ))
+        } else {
+            Ok(format!(
+                "{action}. {delivery_label} delivered to {delivered} of {total} other members."
+            ))
+        }
+    } else {
+        let confirmed = delivered_members
+            .iter()
+            .map(|member| member.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let missing = group
+            .members
+            .iter()
+            .filter(|member| {
+                self_id.as_deref() != Some(member.particle_id.as_str())
+                    && !status.confirmed.contains(&member.particle_id)
+            })
+            .map(|member| member.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        Ok(format!(
+            "{action}. Delivered to {delivered} of {total} members so far ({confirmed}); {missing} gets it the next time it connects to any member."
+        ))
+    }
 }
 
 async fn run_invite(
@@ -696,6 +1067,11 @@ fn write_join_failure(output: &mut dyn Write, error: InviteError) -> Result<i32>
                 "A group named {} already exists here; rerun with --as <other>.",
                 group_name.unwrap_or_else(|| "that group".into())
             )?,
+            "removed" => writeln!(
+                output,
+                "This device was removed from {}; ask its admin to invite it.",
+                group_name.unwrap_or_else(|| "that group".into())
+            )?,
             _ => writeln!(output, "The inviter declined this join: {reason}.")?,
         },
         InviteError::Group(groups::GroupError::MissingIdentity(path)) => {
@@ -730,10 +1106,11 @@ fn local_ipv4() -> Option<IpAddr> {
     (!address.is_loopback()).then_some(address)
 }
 
-fn role_name(role: &Role) -> &'static str {
-    match role {
-        Role::Admin => "admin",
-        Role::Member => "member",
+fn role_name(is_admin: bool) -> &'static str {
+    if is_admin {
+        "admin"
+    } else {
+        "member"
     }
 }
 
@@ -839,6 +1216,41 @@ mod tests {
     }
 
     #[test]
+    fn group_remove_keeps_particle_name_separate_from_group_name() {
+        let cli = parse_cli_without_name_env(&[
+            "entangle", "--name", "pc-a", "group", "remove", "work", "pc-c",
+        ]);
+        assert_eq!(cli.options.name.as_deref(), Some("pc-a"));
+        assert!(matches!(
+            group_command(cli),
+            GroupCommand::Remove { name, member } if name == "work" && member == "pc-c"
+        ));
+    }
+
+    #[test]
+    fn group_rekey_keeps_particle_name_separate_from_group_name() {
+        let cli =
+            parse_cli_without_name_env(&["entangle", "--name", "pc-a", "group", "rekey", "work"]);
+        assert_eq!(cli.options.name.as_deref(), Some("pc-a"));
+        assert!(matches!(
+            group_command(cli),
+            GroupCommand::Rekey { name } if name == "work"
+        ));
+    }
+
+    #[test]
+    fn group_admin_keeps_particle_name_separate_from_group_name() {
+        let cli = parse_cli_without_name_env(&[
+            "entangle", "--name", "pc-a", "group", "admin", "work", "pc-b",
+        ]);
+        assert_eq!(cli.options.name.as_deref(), Some("pc-a"));
+        assert!(matches!(
+            group_command(cli),
+            GroupCommand::Admin { name, member } if name == "work" && member == "pc-b"
+        ));
+    }
+
+    #[test]
     fn detects_broken_pipe_root_cause() {
         let error = anyhow::Error::new(io::Error::new(io::ErrorKind::BrokenPipe, "closed"));
         assert!(is_broken_pipe(&error));
@@ -895,18 +1307,24 @@ mod tests {
             particle_id: inviter_id.clone(),
             name: "inviter".into(),
             static_key: hex::encode(entangle_transport::public_key(&identity.static_private)),
-            added_by: inviter_id,
+            sign_key: groups::signing_public_key(&identity.static_private),
+            added_by: inviter_id.clone(),
             added_at: "2026-10-12T00:00:00Z".into(),
         };
+        let inviter_sign_key = groups::signing_public_key(&identity.static_private);
         drop(identity);
         let group = groups::insert(
             inviter_root.path(),
             [0x42; 32],
             groups::GroupMeta {
-                version: 1,
+                version: 2,
                 name: "work".into(),
-                role: Role::Admin,
                 created_at: "2026-10-12T00:00:00Z".into(),
+                epoch: 0,
+                admin: inviter_id.clone(),
+                admin_sign_key: inviter_sign_key,
+                revoked: vec![],
+                leaving: false,
             },
             vec![inviter_member],
         )
@@ -969,13 +1387,15 @@ mod tests {
                 particle_id: local_id.clone(),
                 name: "local".into(),
                 static_key: hex::encode(entangle_transport::public_key(&local_key)),
-                added_by: local_id,
+                sign_key: groups::signing_public_key(&local_key),
+                added_by: local_id.clone(),
                 added_at: "2026-10-12T00:00:00Z".into(),
             },
             Member {
                 particle_id: remote_id.clone(),
                 name: "remote".into(),
                 static_key: hex::encode(entangle_transport::public_key(&[0x42; 32])),
+                sign_key: groups::signing_public_key(&[0x42; 32]),
                 added_by: remote_id,
                 added_at: "2026-10-12T00:00:00Z".into(),
             },
@@ -984,10 +1404,14 @@ mod tests {
             temp.path(),
             [0x24; 32],
             groups::GroupMeta {
-                version: 1,
+                version: 2,
                 name: "work".into(),
-                role: Role::Admin,
                 created_at: "2026-10-12T00:00:00Z".into(),
+                epoch: 0,
+                admin: local_id.clone(),
+                admin_sign_key: groups::signing_public_key(&local_key),
+                revoked: vec![],
+                leaving: false,
             },
             members,
         )

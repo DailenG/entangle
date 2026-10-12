@@ -1,5 +1,5 @@
 use crate::{
-    groups::{self, Group, GroupError, GroupMeta, Member, Role},
+    groups::{self, Group, GroupError, GroupMeta, Member},
     identity,
     invite::code::InviteCode,
 };
@@ -203,7 +203,14 @@ impl InviteServer {
         else {
             return Err(GroupError::MissingIdentity(root).into());
         };
-        groups::find(&root, &group_id)?.ok_or_else(|| GroupError::NotFound(group_id.clone()))?;
+        let group = groups::find(&root, &group_id)?
+            .ok_or_else(|| GroupError::NotFound(group_id.clone()))?;
+        if group.outdated {
+            return Err(GroupError::Outdated {
+                name: group.meta.name,
+            }
+            .into());
+        }
         Ok(Self {
             root,
             group_id,
@@ -333,10 +340,12 @@ impl InviteServer {
                 particle_id,
                 name,
                 static_key,
+                sign_key,
             } => Member {
                 particle_id,
                 name,
                 static_key,
+                sign_key,
                 added_by: self.inviter_id.clone(),
                 added_at: Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
             },
@@ -349,6 +358,43 @@ impl InviteServer {
         let joined_name = request.name.clone();
         self.state.reserve().await?;
         *reserved = true;
+        let current = groups::find(&self.root, &self.group_id)?
+            .ok_or_else(|| GroupError::NotFound(self.group_id.clone()))?;
+        if current
+            .meta
+            .revoked
+            .iter()
+            .any(|revocation| revocation.particle_id == request.particle_id)
+        {
+            if current.meta.admin != self.inviter_id {
+                sender
+                    .send(
+                        stream,
+                        &Message::Decline {
+                            reason: DeclineReason::Removed,
+                        },
+                    )
+                    .await?;
+                return Err(InviteError::Declined {
+                    reason: DeclineReason::Removed.as_str().to_owned(),
+                    group_name: Some(current.meta.name),
+                });
+            }
+            let Some((_, static_private)) =
+                identity::read_saved(&self.root).map_err(|error| GroupError::Malformed {
+                    path: self.root.clone(),
+                    reason: error.to_string(),
+                })?
+            else {
+                return Err(GroupError::MissingIdentity(self.root.clone()).into());
+            };
+            groups::issue_unrevoke_update(
+                &self.root,
+                &self.group_id,
+                &request.particle_id,
+                &static_private,
+            )?;
+        }
         let mut proposed = groups::find(&self.root, &self.group_id)?
             .ok_or_else(|| GroupError::NotFound(self.group_id.clone()))?;
         if let Some(existing) = proposed
@@ -369,9 +415,14 @@ impl InviteServer {
             .send(
                 stream,
                 &Message::JoinGrant {
+                    group_id: proposed.id,
                     name: proposed.meta.name,
                     key_hex: hex::encode(proposed.key),
                     created_at: proposed.meta.created_at,
+                    epoch: proposed.meta.epoch,
+                    admin: proposed.meta.admin,
+                    admin_sign_key: proposed.meta.admin_sign_key,
+                    revoked: proposed.meta.revoked,
                     members: proposed.members,
                 },
             )
@@ -413,11 +464,17 @@ enum Message {
         particle_id: String,
         name: String,
         static_key: String,
+        sign_key: String,
     },
     JoinGrant {
+        group_id: String,
         name: String,
         key_hex: String,
         created_at: String,
+        epoch: u32,
+        admin: String,
+        admin_sign_key: String,
+        revoked: Vec<entangle_core::Revocation>,
         members: Vec<Member>,
     },
     Done,
@@ -429,6 +486,7 @@ enum Message {
 enum DeclineReason {
     AlreadyMember,
     NameTaken,
+    Removed,
 }
 
 impl DeclineReason {
@@ -436,6 +494,7 @@ impl DeclineReason {
         match self {
             Self::AlreadyMember => "already_member",
             Self::NameTaken => "name_taken",
+            Self::Removed => "removed",
         }
     }
 }
@@ -584,12 +643,14 @@ where
         let group_name = match reason {
             DeclineReason::AlreadyMember => &name,
             DeclineReason::NameTaken => local_group_name,
+            DeclineReason::Removed => &name,
         };
         sender.send(stream, &Message::Decline { reason }).await?;
         return Err(InviteError::Declined {
             reason: match reason {
                 DeclineReason::AlreadyMember => "already_member",
                 DeclineReason::NameTaken => "name_taken",
+                DeclineReason::Removed => "removed",
             }
             .to_owned(),
             group_name: Some(group_name.to_owned()),
@@ -602,50 +663,73 @@ where
                 particle_id: id.to_string(),
                 name: particle_name.to_owned(),
                 static_key: hex::encode(entangle_transport::public_key(&static_private)),
+                sign_key: groups::signing_public_key(&static_private),
             },
         )
         .await?;
     let grant = match receiver.receive::<_, Message>(stream).await? {
+        Message::Decline { reason } => {
+            return Err(InviteError::Declined {
+                reason: reason.as_str().to_owned(),
+                group_name: (reason == DeclineReason::Removed).then(|| name.clone()),
+            });
+        }
         Message::JoinGrant {
+            group_id: granted_group_id,
             name,
             key_hex,
             created_at,
+            epoch,
+            admin,
+            admin_sign_key,
+            revoked,
             members,
-        } => (name, key_hex, created_at, members),
+        } => (
+            granted_group_id,
+            name,
+            key_hex,
+            created_at,
+            epoch,
+            admin,
+            admin_sign_key,
+            revoked,
+            members,
+        ),
         message => {
             return Err(InviteError::Message(format!(
                 "expected join grant, got {message:?}"
             )))
         }
     };
-    if grant.0 != name
-        || grant.1.len() != 64
+    if grant.0 != group_id
+        || grant.1 != name
+        || grant.2.len() != 64
         || !grant
-            .1
+            .2
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
     {
         return Err(InviteError::Message("invalid join grant".into()));
     }
-    let key: [u8; 32] = hex::decode(&grant.1)
+    let key: [u8; 32] = hex::decode(&grant.2)
         .map_err(|_| InviteError::Message("invalid group key".into()))?
         .try_into()
         .map_err(|_| InviteError::Message("invalid group key".into()))?;
-    if groups::group_id(&key) != group_id {
-        return Err(InviteError::Message(
-            "group ID does not match the granted key".into(),
-        ));
-    }
-    let group = groups::insert(
+    let group = groups::insert_with_id(
         root,
+        grant.0,
         key,
         GroupMeta {
-            version: 1,
+            version: 2,
             name: local_group_name.to_owned(),
-            role: Role::Member,
-            created_at: grant.2,
+            created_at: grant.3,
+            epoch: grant.4,
+            admin: grant.5,
+            admin_sign_key: grant.6,
+            revoked: grant.7,
+            leaving: false,
         },
-        grant.3,
+        grant.8,
     )?;
     *inserted_group = Some(group.id.clone());
     sender.send(stream, &Message::Done).await?;
@@ -840,6 +924,7 @@ mod tests {
             particle_id: id.clone(),
             name: name.into(),
             static_key: hex::encode(entangle_transport::public_key(&identity.static_private)),
+            sign_key: groups::signing_public_key(&identity.static_private),
             added_by: id,
             added_at: Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
         };
@@ -853,10 +938,14 @@ mod tests {
             root,
             [0x42; 32],
             GroupMeta {
-                version: 1,
+                version: 2,
                 name: "work".into(),
-                role: Role::Admin,
                 created_at: Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
+                epoch: 0,
+                admin: member.particle_id.clone(),
+                admin_sign_key: member.sign_key.clone(),
+                revoked: vec![],
+                leaving: false,
             },
             vec![member],
         )
@@ -899,6 +988,101 @@ mod tests {
         )
     }
 
+    #[tokio::test]
+    async fn admin_reinvitation_unrevokes_a_removed_particle_before_granting() {
+        let inviter_root = tempfile::tempdir().unwrap();
+        let group = setup_group(inviter_root.path());
+        let joiner_root = tempfile::tempdir().unwrap();
+        let removed = saved_member(joiner_root.path(), "removed");
+        groups::add_member(inviter_root.path(), &group.id, removed.clone()).unwrap();
+        let admin_private = identity::read_saved(inviter_root.path())
+            .unwrap()
+            .unwrap()
+            .1;
+        let revoked = groups::issue_update(
+            inviter_root.path(),
+            &group.id,
+            entangle_core::UpdateKind::Remove {
+                particle_id: removed.particle_id.clone(),
+            },
+            &admin_private,
+        )
+        .unwrap();
+        let server = server(inviter_root.path(), &revoked, 1, DEFAULT_TTL);
+
+        let joined = successful_join(&server, joiner_root.path(), "removed")
+            .await
+            .unwrap();
+        let inviter_group = groups::find(inviter_root.path(), &group.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(joined.group.meta.epoch, 2);
+        assert_eq!(inviter_group.meta.epoch, 2);
+        assert_eq!(joined.group.key, revoked.key);
+        assert!(joined.group.meta.revoked.is_empty());
+        assert!(inviter_group.meta.revoked.is_empty());
+        assert!(joined
+            .group
+            .members
+            .iter()
+            .any(|member| member.particle_id == removed.particle_id));
+    }
+
+    #[tokio::test]
+    async fn non_admin_inviter_declines_a_revoked_particle() {
+        let admin_root = tempfile::tempdir().unwrap();
+        let group = setup_group(admin_root.path());
+        let inviter_root = tempfile::tempdir().unwrap();
+        let inviter = saved_member(inviter_root.path(), "member");
+        let joiner_root = tempfile::tempdir().unwrap();
+        let removed = saved_member(joiner_root.path(), "removed");
+        groups::add_member(admin_root.path(), &group.id, inviter.clone()).unwrap();
+        groups::add_member(admin_root.path(), &group.id, removed.clone()).unwrap();
+        let admin_private = identity::read_saved(admin_root.path()).unwrap().unwrap().1;
+        let revoked = groups::issue_update(
+            admin_root.path(),
+            &group.id,
+            entangle_core::UpdateKind::Remove {
+                particle_id: removed.particle_id.clone(),
+            },
+            &admin_private,
+        )
+        .unwrap();
+        groups::insert_with_id(
+            inviter_root.path(),
+            revoked.id.clone(),
+            revoked.key,
+            revoked.meta.clone(),
+            revoked.members.clone(),
+        )
+        .unwrap();
+        let server = InviteServer::new(
+            inviter_root.path(),
+            revoked.id.clone(),
+            inviter.particle_id,
+            code(),
+            1,
+            DEFAULT_TTL,
+        )
+        .unwrap();
+
+        let result = successful_join(&server, joiner_root.path(), "removed").await;
+        assert!(
+            matches!(
+                &result,
+                Err(InviteError::Declined { reason, group_name })
+                    if reason == "removed" && group_name.as_deref() == Some("work")
+            ),
+            "unexpected invitation result: {result:?}"
+        );
+        let unchanged = groups::find(inviter_root.path(), &revoked.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(unchanged.meta.epoch, revoked.meta.epoch);
+        assert_eq!(unchanged.meta.revoked, revoked.meta.revoked);
+        assert_eq!(server.state().counts().await, (0, 1));
+    }
+
     async fn successful_join(
         server: &InviteServer,
         root: &Path,
@@ -926,7 +1110,12 @@ mod tests {
         let joined = successful_join(&server, joiner_root.path(), "joiner")
             .await
             .unwrap();
-        assert_eq!(joined.group.meta.role, Role::Member);
+        let joiner_id = identity::read_saved(joiner_root.path())
+            .unwrap()
+            .unwrap()
+            .0
+            .to_string();
+        assert!(!joined.group.meta.is_admin(&joiner_id));
         assert_eq!(joined.group.members.len(), 2);
         assert!(joined
             .group
@@ -1043,6 +1232,7 @@ mod tests {
                     particle_id: joiner_id.to_string(),
                     name: "joiner".into(),
                     static_key: hex::encode(entangle_transport::public_key(&joiner_private)),
+                    sign_key: groups::signing_public_key(&joiner_private),
                 },
             )
             .await
@@ -1205,6 +1395,7 @@ mod tests {
                     particle_id: good_id.to_string(),
                     name: "good-joiner".into(),
                     static_key: hex::encode(entangle_transport::public_key(&good_private)),
+                    sign_key: groups::signing_public_key(&good_private),
                 },
             )
             .await
@@ -1275,12 +1466,16 @@ mod tests {
             already_root.path(),
             group.key,
             GroupMeta {
-                version: 1,
+                version: 2,
                 name: "work".into(),
-                role: Role::Member,
                 created_at: group.meta.created_at.clone(),
+                epoch: 0,
+                admin: group.meta.admin.clone(),
+                admin_sign_key: group.meta.admin_sign_key.clone(),
+                revoked: vec![],
+                leaving: false,
             },
-            vec![already_member],
+            vec![group.members[0].clone(), already_member],
         )
         .unwrap();
         assert!(matches!(
@@ -1296,10 +1491,14 @@ mod tests {
             taken_root.path(),
             [0x11; 32],
             GroupMeta {
-                version: 1,
+                version: 2,
                 name: "work".into(),
-                role: Role::Admin,
                 created_at: Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
+                epoch: 0,
+                admin: _taken.particle_id.clone(),
+                admin_sign_key: _taken.sign_key.clone(),
+                revoked: vec![],
+                leaving: false,
             },
             vec![_taken],
         )

@@ -7,7 +7,7 @@ use std::{fmt, path::Path};
 pub mod sas;
 
 /// Current version of the Entangle control protocol.
-pub const PROTOCOL_VERSION: u32 = 4;
+pub const PROTOCOL_VERSION: u32 = 5;
 
 /// A process-unique particle identity rendered as 32 lowercase hexadecimal digits.
 #[derive(Clone, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
@@ -20,8 +20,40 @@ pub struct Member {
     pub particle_id: String,
     pub name: String,
     pub static_key: String,
+    pub sign_key: String,
     pub added_by: String,
     pub added_at: String,
+}
+
+/// A signed group membership and key update.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct GroupUpdate {
+    pub group_id: String,
+    pub epoch: u32,
+    pub key_hex: String,
+    pub admin: String,
+    pub admin_sign_key: String,
+    pub revoked: Vec<Revocation>,
+    pub kind: UpdateKind,
+    pub issued_by: String,
+    pub issued_at: String,
+    pub signature: String,
+}
+
+/// A member removed from a group, bound to the static key that was revoked.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct Revocation {
+    pub particle_id: String,
+    pub static_key: String,
+}
+
+/// The operation represented by a signed group update.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum UpdateKind {
+    Remove { particle_id: String },
+    Rekey,
+    AdminHandoff { to: String },
 }
 
 impl ParticleId {

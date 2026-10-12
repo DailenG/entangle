@@ -55,11 +55,22 @@ fn build_key_ring(static_private: [u8; 32], groups: &[Group]) -> KeyRing {
         static_private,
         groups: groups
             .iter()
-            .map(|group| {
-                (
-                    groups::group_id_bytes(&group.key),
-                    groups::derive_psk(&group.key),
-                )
+            .filter(|group| !group.outdated)
+            .filter_map(|group| {
+                let id = groups::id_bytes(&group.id)?;
+                let mut keys = group
+                    .retained_keys
+                    .iter()
+                    .map(|(epoch, key)| (*epoch, groups::derive_psk(key)))
+                    .collect::<std::collections::BTreeMap<_, _>>();
+                keys.insert(group.meta.epoch, groups::derive_psk(&group.key));
+                Some((
+                    id,
+                    entangle_transport::GroupKeys {
+                        current: group.meta.epoch,
+                        keys,
+                    },
+                ))
             })
             .collect(),
     }
@@ -168,6 +179,10 @@ pub struct Particle {
     inbox: Mutex<Vec<InboxItem>>,
     in_flight: StdMutex<HashSet<String>>,
     groups_reload_warned: AtomicBool,
+    too_far_warned: StdMutex<HashSet<[u8; 4]>>,
+    peer_too_far_logged: StdMutex<HashSet<String>>,
+    peer_backoff: StdMutex<HashMap<String, Instant>>,
+    leave_started: StdMutex<HashMap<String, Instant>>,
     notifications: Option<mpsc::Sender<Value>>,
     inbound_limit: Arc<Semaphore>,
     shutdown: tokio::sync::watch::Sender<bool>,
@@ -210,6 +225,14 @@ impl Particle {
             info!("ignoring pre-0.6 pairing/approval state; use entangle group create/join");
         }
         let initial_groups = groups::list(&root)?;
+        for group in initial_groups.iter().filter(|group| group.outdated) {
+            warn!(
+                group = %group.meta.name,
+                "group {} was created by Entangle 0.6; run `entangle group leave {}` and create it again",
+                group.meta.name,
+                group.meta.name
+            );
+        }
         let groups = Arc::new(RwLock::new(initial_groups.clone()));
         let keys: SharedKeyRing = Arc::new(RwLock::new(Arc::new(build_key_ring(
             identity.static_private,
@@ -291,6 +314,10 @@ impl Particle {
             inbox: Mutex::new(persisted_inbox),
             in_flight: StdMutex::new(HashSet::new()),
             groups_reload_warned: AtomicBool::new(false),
+            too_far_warned: StdMutex::new(HashSet::new()),
+            peer_too_far_logged: StdMutex::new(HashSet::new()),
+            peer_backoff: StdMutex::new(HashMap::new()),
+            leave_started: StdMutex::new(HashMap::new()),
             notifications,
             inbound_limit: Arc::new(Semaphore::new(4)),
             shutdown,
@@ -380,17 +407,71 @@ impl Particle {
         Some(warning)
     }
 
+    fn peer_in_backoff(&self, peer_key: &str) -> bool {
+        let now = Instant::now();
+        let mut backoff = self.peer_backoff.lock().expect("peer backoff lock");
+        backoff.retain(|_, until| *until > now);
+        backoff.contains_key(peer_key)
+    }
+
+    fn backoff_peer(&self, peer_key: &str) {
+        self.peer_backoff.lock().expect("peer backoff lock").insert(
+            peer_key.to_owned(),
+            Instant::now() + Duration::from_secs(60),
+        );
+    }
+
+    fn log_epoch_error(&self, error: &LinkError, group: &Group, peer_name: &str, peer_key: &str) {
+        match error {
+            LinkError::Transport(entangle_transport::TransportError::TooFarBehind {
+                local,
+                current,
+            }) => {
+                self.backoff_peer(peer_key);
+                if self
+                    .too_far_warned
+                    .lock()
+                    .expect("epoch warning lock")
+                    .insert(groups::id_bytes(&group.id).unwrap_or([0; 4]))
+                {
+                    warn!(
+                        "group {} is too far out of date (this device is at epoch {}, a member is at {}); re-invite this device",
+                        group.meta.name, local, current
+                    );
+                }
+            }
+            LinkError::Transport(entangle_transport::TransportError::PeerTooFarBehind {
+                peer_epoch: _,
+            }) => {
+                self.backoff_peer(peer_key);
+                if self
+                    .peer_too_far_logged
+                    .lock()
+                    .expect("peer epoch log lock")
+                    .insert(peer_key.to_owned())
+                {
+                    info!(
+                        "{} is too far behind on group {}; re-invite it",
+                        peer_name, group.meta.name
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn group_member(&self, group_id: [u8; 4], particle_id: &str, static_key: &[u8; 32]) -> bool {
         self.groups
             .read()
             .expect("group store lock")
             .iter()
-            .find(|group| groups::group_id_bytes(&group.key) == group_id)
+            .find(|group| !group.outdated && groups::id_bytes(&group.id) == Some(group_id))
             .is_some_and(|group| {
-                group.members.iter().any(|member| {
-                    member.particle_id == particle_id
-                        && member.static_key == hex::encode(static_key)
-                })
+                !group.meta.leaving
+                    && group.members.iter().any(|member| {
+                        member.particle_id == particle_id
+                            && member.static_key == hex::encode(static_key)
+                    })
             })
     }
 
@@ -400,10 +481,12 @@ impl Particle {
             .expect("group store lock")
             .iter()
             .filter(|group| {
-                group.members.iter().any(|member| {
-                    member.particle_id == particle_id
-                        && member.static_key == hex::encode(static_key)
-                })
+                !group.outdated
+                    && !group.meta.leaving
+                    && group.members.iter().any(|member| {
+                        member.particle_id == particle_id
+                            && member.static_key == hex::encode(static_key)
+                    })
             })
             .map(|group| group.meta.name.clone())
             .collect()
@@ -420,6 +503,7 @@ impl Particle {
                 .read()
                 .expect("group store lock")
                 .iter()
+                .filter(|group| !group.outdated && !group.meta.leaving)
                 .map(|group| group.id.clone())
                 .collect(),
             version: self.manifest.version.clone(),
@@ -514,7 +598,9 @@ impl Particle {
                     *self.groups.write().expect("group store lock") = current.clone();
                     *self.keys.write().expect("key ring lock") =
                         Arc::new(build_key_ring(self._identity.static_private, &current));
-                    self.field.write().expect("field lock").clear();
+                    if !current.iter().any(|group| group.meta.leaving) {
+                        self.field.write().expect("field lock").clear();
+                    }
                     self.groups_reload_warned.store(false, Ordering::Relaxed);
                     if let Err(error) = self.restart_resonator().await {
                         self.log_discovery_failure(&error);
@@ -544,6 +630,125 @@ impl Particle {
                 if let Err(error) = self.restart_resonator().await {
                     self.log_discovery_failure(&error);
                 }
+            }
+            self.drive_leaving_groups().await;
+        }
+    }
+
+    async fn drive_leaving_groups(&self) {
+        let groups = self.groups.read().expect("group store lock").clone();
+        let self_id = self.manifest.particle_id.to_string();
+        for group in groups
+            .into_iter()
+            .filter(|group| group.meta.leaving && !group.outdated)
+        {
+            let started = {
+                let mut started = self.leave_started.lock().expect("leave timer lock");
+                *started.entry(group.id.clone()).or_insert_with(Instant::now)
+            };
+            let group_id = group.id.clone();
+            let mut status = groups::read_status(&self.data_root, &group_id)
+                .ok()
+                .flatten()
+                .filter(|status| status.op == "leave")
+                .unwrap_or(groups::GroupStatus {
+                    epoch: group.meta.epoch,
+                    op: "leave".into(),
+                    confirmed: Vec::new(),
+                });
+            let total = group
+                .members
+                .iter()
+                .filter(|member| member.particle_id != self_id)
+                .count();
+            let pending = group
+                .members
+                .iter()
+                .filter(|member| member.particle_id != self_id)
+                .filter(|member| !status.confirmed.contains(&member.particle_id))
+                .cloned()
+                .collect::<Vec<_>>();
+            for member in pending {
+                if self.peer_in_backoff(&member.static_key) {
+                    continue;
+                }
+                let Ok(static_key_bytes) = hex::decode(&member.static_key) else {
+                    continue;
+                };
+                let Ok(static_key) = <[u8; 32]>::try_from(static_key_bytes) else {
+                    continue;
+                };
+                let Some(id) = ParticleId::parse(member.particle_id.clone()).ok() else {
+                    continue;
+                };
+                let peer = self
+                    .field
+                    .read()
+                    .expect("field lock")
+                    .by_id(&id)
+                    .filter(|peer| peer.static_key.is_none_or(|key| key == static_key));
+                let Some(peer) = peer else {
+                    continue;
+                };
+                let Some(group_bytes) = groups::id_bytes(&group.id) else {
+                    continue;
+                };
+                let mut delivered = false;
+                for address in &peer.resonance.addrs {
+                    if peer.resonance.port == 0 {
+                        continue;
+                    }
+                    let route = Route::Direct(SocketAddr::new(*address, peer.resonance.port));
+                    if let Ok(stream) = self.sync_handshake(&route, static_key, group_bytes).await {
+                        if entangle_link::leave_on(stream, Duration::from_secs(5))
+                            .await
+                            .is_ok()
+                        {
+                            delivered = true;
+                            break;
+                        }
+                    }
+                }
+                if !delivered
+                    && self
+                        .relay_directory
+                        .lock()
+                        .expect("relay directory lock")
+                        .contains(&static_key)
+                {
+                    let dialer = self
+                        .repeater
+                        .read()
+                        .expect("repeater dialer lock")
+                        .as_ref()
+                        .filter(|dialer| !dialer.is_closed())
+                        .cloned();
+                    if let Some(dialer) = dialer {
+                        let route = Route::Tunnel(Arc::new(RepeaterOpener {
+                            dialer,
+                            target: static_key,
+                        }));
+                        if let Ok(stream) =
+                            self.sync_handshake(&route, static_key, group_bytes).await
+                        {
+                            delivered = entangle_link::leave_on(stream, Duration::from_secs(5))
+                                .await
+                                .is_ok();
+                        }
+                    }
+                }
+                if delivered {
+                    status.confirmed.push(member.particle_id);
+                    status.confirmed.sort();
+                    let _ = groups::write_status(&self.data_root, &group_id, &status);
+                }
+            }
+            if status.confirmed.len() >= total || started.elapsed() >= Duration::from_secs(60) {
+                let _ = groups::leave(&self.data_root, &group_id);
+                self.leave_started
+                    .lock()
+                    .expect("leave timer lock")
+                    .remove(&group_id);
             }
         }
     }
@@ -1260,7 +1465,10 @@ impl Particle {
                 if !member {
                     return Err(format!("not a member of {}", group.meta.name));
                 }
-                (groups::group_id_bytes(&group.key), group.meta.name.clone())
+                (
+                    groups::id_bytes(&group.id).ok_or_else(unreachable)?,
+                    group.meta.name.clone(),
+                )
             }
             None => {
                 let group_id = self
@@ -1748,14 +1956,36 @@ impl Particle {
         expected_static: [u8; 32],
         group_id: [u8; 4],
     ) -> Result<SecureStream, String> {
-        let stream = entangle_link::connect_secure(
+        let result = entangle_link::connect_secure_with_handler(
             route,
             self.keys.clone(),
             group_id,
+            self,
             Duration::from_secs(5),
         )
-        .await
-        .map_err(|error| error.to_string())?;
+        .await;
+        let stream = match result {
+            Ok(stream) => stream,
+            Err(error) => {
+                let group = self
+                    .groups
+                    .read()
+                    .expect("group store lock")
+                    .iter()
+                    .find(|group| groups::id_bytes(&group.id) == Some(group_id))
+                    .cloned();
+                if let Some(group) = group {
+                    let peer_name = group
+                        .members
+                        .iter()
+                        .find(|member| member.static_key == hex::encode(expected_static))
+                        .map_or("peer", |member| member.name.as_str())
+                        .to_owned();
+                    self.log_epoch_error(&error, &group, &peer_name, &hex::encode(expected_static));
+                }
+                return Err(error.to_string());
+            }
+        };
         if stream.remote_static() != expected_static {
             return Err("remote Noise static key did not match the bound peer key".into());
         }
@@ -1765,10 +1995,12 @@ impl Particle {
     fn select_peer_group(&self, peer: &PeerRecord, static_key: &[u8; 32]) -> Option<[u8; 4]> {
         let groups = self.groups.read().expect("group store lock");
         let member_matches = |group: &&Group| {
-            group.members.iter().any(|member| {
-                member.particle_id == peer.resonance.particle_id.as_str()
-                    && member.static_key == hex::encode(static_key)
-            })
+            !group.outdated
+                && !group.meta.leaving
+                && group.members.iter().any(|member| {
+                    member.particle_id == peer.resonance.particle_id.as_str()
+                        && member.static_key == hex::encode(static_key)
+                })
         };
         let advertised = !peer.resonance.groups.is_empty();
         groups
@@ -1778,11 +2010,10 @@ impl Particle {
                 if advertised {
                     peer.resonance.groups.contains(&group.id)
                 } else {
-                    peer.group_id == Some(groups::group_id_bytes(&group.key))
-                        || peer.group_id.is_none()
+                    peer.group_id == groups::id_bytes(&group.id) || peer.group_id.is_none()
                 }
             })
-            .map(|group| groups::group_id_bytes(&group.key))
+            .and_then(|group| groups::id_bytes(&group.id))
     }
 
     async fn on_detected(&self, peer: Resonance) {
@@ -1817,8 +2048,24 @@ impl Particle {
     }
 
     async fn dial(&self, route: Route, discovery: Option<Resonance>) -> bool {
+        let peer_key = discovery
+            .as_ref()
+            .map(|peer| peer.particle_id.to_string())
+            .unwrap_or_else(|| match &route {
+                Route::Direct(address) => address.to_string(),
+                Route::Tunnel(opener) => opener.describe(),
+            });
+        if self.peer_in_backoff(&peer_key) {
+            return true;
+        }
+        let peer_name = discovery
+            .as_ref()
+            .map_or_else(|| peer_key.clone(), |peer| peer.name.clone());
         let groups = self.groups.read().expect("group store lock").clone();
         let candidates = groups.into_iter().filter(|group| {
+            if group.outdated || group.meta.leaving {
+                return false;
+            }
             if discovery
                 .as_ref()
                 .is_some_and(|peer| !peer.groups.contains(&group.id))
@@ -1833,12 +2080,15 @@ impl Particle {
             })
         });
         for group in candidates {
-            let group_id = groups::group_id_bytes(&group.key);
-            match entangle_link::handshake_stream(
+            let Some(group_id) = groups::id_bytes(&group.id) else {
+                continue;
+            };
+            match entangle_link::handshake_stream_with_handler(
                 &route,
                 self.keys.clone(),
                 group_id,
                 &self.manifest,
+                self,
                 Duration::from_secs(5),
             )
             .await
@@ -1879,6 +2129,7 @@ impl Particle {
                         },
                         remote_static,
                         group: group_id,
+                        epoch: stream.epoch(),
                         relayed: matches!(&route, Route::Tunnel(_)),
                     };
                     if let Err(error) = entangle_link::introduce_on(
@@ -1952,6 +2203,16 @@ impl Particle {
                     debug!("peer protocol mismatch: {}", manifest.protocol);
                 }
                 Err(error) => {
+                    self.log_epoch_error(&error, &group, &peer_name, &peer_key);
+                    if matches!(
+                        &error,
+                        LinkError::Transport(
+                            entangle_transport::TransportError::TooFarBehind { .. }
+                                | entangle_transport::TransportError::PeerTooFarBehind { .. }
+                        ) | LinkError::Stale
+                    ) {
+                        return true;
+                    }
                     let route_description = match &route {
                         Route::Direct(address) => address.to_string(),
                         Route::Tunnel(opener) => opener.describe(),
@@ -2150,6 +2411,121 @@ impl Particle {
 
 #[async_trait::async_trait]
 impl LinkHandler for Particle {
+    fn supports_group_updates(&self) -> bool {
+        true
+    }
+
+    fn group_epoch(&self, peer: &PeerInfo) -> u32 {
+        self.groups
+            .read()
+            .expect("group store lock")
+            .iter()
+            .find(|group| {
+                groups::id_bytes(&group.id) == Some(peer.group)
+                    && !group.outdated
+                    && group
+                        .members
+                        .iter()
+                        .any(|member| member.static_key == hex::encode(peer.remote_static))
+            })
+            .map_or(peer.epoch, |group| group.meta.epoch)
+    }
+
+    fn peer_particle_id(&self, peer: &PeerInfo) -> Option<ParticleId> {
+        let groups = self.groups.read().ok()?;
+        let group = groups.iter().find(|group| {
+            groups::id_bytes(&group.id) == Some(peer.group)
+                && !group.outdated
+                && group
+                    .members
+                    .iter()
+                    .any(|member| member.static_key == hex::encode(peer.remote_static))
+        })?;
+        group
+            .members
+            .iter()
+            .find(|member| member.static_key == hex::encode(peer.remote_static))
+            .and_then(|member| ParticleId::parse(member.particle_id.clone()).ok())
+    }
+
+    fn updates_since(&self, peer: &PeerInfo, epoch: u32) -> Vec<entangle_core::GroupUpdate> {
+        let groups = self.groups.read().expect("group store lock");
+        let Some(group) = groups.iter().find(|group| {
+            groups::id_bytes(&group.id) == Some(peer.group)
+                && !group.outdated
+                && group
+                    .members
+                    .iter()
+                    .any(|member| member.static_key == hex::encode(peer.remote_static))
+        }) else {
+            return Vec::new();
+        };
+        groups::updates_since(group, epoch).unwrap_or_default()
+    }
+
+    fn on_updates(
+        &self,
+        peer: &PeerInfo,
+        sender: &ParticleId,
+        updates: Vec<entangle_core::GroupUpdate>,
+    ) -> Result<u32, LinkError> {
+        let member = {
+            let groups = self
+                .groups
+                .read()
+                .map_err(|_| LinkError::Handler("group store lock poisoned".into()))?;
+            let group = groups
+                .iter()
+                .find(|group| groups::id_bytes(&group.id) == Some(peer.group) && !group.outdated)
+                .ok_or_else(|| LinkError::Handler("group is not available".into()))?;
+            group
+                .members
+                .iter()
+                .find(|member| {
+                    member.particle_id == sender.as_str()
+                        && member.static_key == hex::encode(peer.remote_static)
+                })
+                .cloned()
+                .ok_or_else(|| LinkError::Handler("update sender is not a current member".into()))?
+        };
+        let group_id = hex::encode(peer.group);
+        let result = groups::apply_updates(&self.data_root, &group_id, &updates, Some(&member))
+            .map_err(|error| LinkError::Handler(error.to_string()))?;
+        Ok(result.epoch)
+    }
+
+    fn on_leave(&self, peer: &PeerInfo, sender: &ParticleId) -> Result<(), LinkError> {
+        if !self.group_member(peer.group, sender.as_str(), &peer.remote_static) {
+            return Err(LinkError::Handler(
+                "leave sender is not a current member".into(),
+            ));
+        }
+        groups::remove_member(&self.data_root, &hex::encode(peer.group), sender.as_str())
+            .map_err(|error| LinkError::Handler(error.to_string()))
+    }
+
+    fn on_updates_ack(&self, peer: &PeerInfo, epoch: u32) {
+        let Some(sender) = self.peer_particle_id(peer) else {
+            return;
+        };
+        let group_id = hex::encode(peer.group);
+        let Ok(Some(mut status)) = groups::read_status(&self.data_root, &group_id) else {
+            return;
+        };
+        if status.op != "update" || epoch < status.epoch {
+            return;
+        }
+        if !status.confirmed.iter().any(|id| id == sender.as_str()) {
+            status.confirmed.push(sender.to_string());
+            status.confirmed.sort();
+            let _ = groups::write_status(&self.data_root, &group_id, &status);
+        }
+    }
+
+    fn on_link_epoch(&self, peer: &PeerInfo, epoch: u32) {
+        self.on_updates_ack(peer, epoch);
+    }
+
     fn members_to_introduce(
         &self,
         peer: &PeerInfo,
@@ -2331,6 +2707,27 @@ impl LinkHandler for Particle {
                     added_by = %member.added_by,
                     sender = %sender,
                     "rejecting a member introduction with an invalid voucher"
+                );
+                continue;
+            }
+            let revoked = self
+                .groups
+                .read()
+                .expect("group store lock")
+                .iter()
+                .find(|group| groups::id_bytes(&group.id) == Some(peer.group))
+                .is_some_and(|group| {
+                    group
+                        .meta
+                        .revoked
+                        .iter()
+                        .any(|revocation| revocation.particle_id == member.particle_id)
+                });
+            if revoked {
+                warn!(
+                    particle_id = %member.particle_id,
+                    group = %hex::encode(peer.group),
+                    "rejecting an introduction for a revoked particle"
                 );
                 continue;
             }
@@ -2535,6 +2932,7 @@ mod tests {
             particle_id: id.to_string(),
             name: name.into(),
             static_key: hex::encode(entangle_transport::public_key(private)),
+            sign_key: groups::signing_public_key(private),
             added_by: added_by.into(),
             added_at: chrono::Utc::now().to_rfc3339(),
         }
@@ -2545,16 +2943,21 @@ mod tests {
         name: &str,
         key: [u8; 32],
         members: Vec<Member>,
-        role: groups::Role,
+        _role: groups::Role,
     ) {
+        let admin = members.first().expect("test group member").clone();
         groups::insert(
             root,
             key,
             groups::GroupMeta {
-                version: 1,
+                version: 2,
                 name: name.into(),
-                role,
                 created_at: chrono::Utc::now().to_rfc3339(),
+                epoch: 0,
+                admin: admin.particle_id,
+                admin_sign_key: admin.sign_key,
+                revoked: vec![],
+                leaving: false,
             },
             members,
         )
@@ -2567,6 +2970,7 @@ mod tests {
             particle_id: particle_id.into(),
             name: particle_id.into(),
             static_key: String::new(),
+            sign_key: String::new(),
             added_by: String::new(),
             added_at: String::new(),
         };
@@ -2574,12 +2978,19 @@ mod tests {
             id: groups::group_id(&key),
             key,
             meta: groups::GroupMeta {
-                version: 1,
+                version: 2,
                 name: name.into(),
-                role: groups::Role::Admin,
                 created_at: chrono::Utc::now().to_rfc3339(),
+                epoch: 0,
+                admin: particle_id.into(),
+                admin_sign_key: String::new(),
+                revoked: vec![],
+                leaving: false,
             },
             members: vec![member(particle_id)],
+            retained_keys: Default::default(),
+            updates: vec![],
+            outdated: false,
         };
         let work = group("work", [0x73; 32], "deadbeef000000000000000000000001");
         let home = group("home", [0x74; 32], "deadbeef000000000000000000000002");
@@ -2858,6 +3269,344 @@ mod tests {
         assert_eq!(observed["states"][0]["group"], "test");
         a.shutdown().await;
         b.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn removal_updates_members_and_rejects_the_revoked_member() {
+        let temp = tempfile::tempdir().unwrap();
+        let root_a = temp.path().join("a");
+        let root_b = temp.path().join("b");
+        let root_c = temp.path().join("c");
+        let (id_a, private_a) = saved_identity(&root_a);
+        let (id_b, private_b) = saved_identity(&root_b);
+        let (id_c, private_c) = saved_identity(&root_c);
+        let members = vec![
+            test_member(&id_a, "pc-a", &private_a, id_a.as_str()),
+            test_member(&id_b, "pc-b", &private_b, id_a.as_str()),
+            test_member(&id_c, "pc-c", &private_c, id_a.as_str()),
+        ];
+        for (root, role) in [
+            (&root_a, groups::Role::Admin),
+            (&root_b, groups::Role::Member),
+            (&root_c, groups::Role::Member),
+        ] {
+            insert_test_group(root, "work", [0x7a; 32], members.clone(), role);
+        }
+        let a_port = free_port();
+        let b_port = port_other_than(a_port);
+        let c_port = loop {
+            let port = free_port();
+            if port != a_port && port != b_port {
+                break port;
+            }
+        };
+        let mut options_b = options(
+            "pc-b",
+            b_port,
+            root_b.clone(),
+            Some(format!("127.0.0.1:{a_port}")),
+        );
+        options_b.no_mdns = true;
+        let mut options_c = options(
+            "pc-c",
+            c_port,
+            root_c.clone(),
+            Some(format!("127.0.0.1:{a_port}")),
+        );
+        options_c.no_mdns = true;
+        let (b, _) = Particle::start(options_b, None).await.unwrap();
+        let (c, _) = Particle::start(options_c, None).await.unwrap();
+        let mut options_a = options("pc-a", a_port, root_a.clone(), None);
+        options_a.peer = vec![format!("127.0.0.1:{b_port}"), format!("127.0.0.1:{c_port}")];
+        let (a, _) = Particle::start(options_a, None).await.unwrap();
+        wait_for_group_pair(&a, &b).await;
+        wait_for_group_pair(&a, &c).await;
+
+        let group = groups::find(&root_a, "work").unwrap().unwrap();
+        groups::issue_update(
+            &root_a,
+            &group.id,
+            entangle_core::UpdateKind::Remove {
+                particle_id: id_c.to_string(),
+            },
+            &private_a,
+        )
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(12), async {
+            loop {
+                let a_reloaded = a
+                    .groups
+                    .read()
+                    .unwrap()
+                    .iter()
+                    .any(|group| group.meta.name == "work" && group.meta.epoch == 1);
+                let b_reloaded = b
+                    .groups
+                    .read()
+                    .unwrap()
+                    .iter()
+                    .any(|group| group.meta.name == "work" && group.meta.epoch == 1);
+                let linked = a
+                    .field
+                    .read()
+                    .unwrap()
+                    .by_id(&b.manifest.particle_id)
+                    .is_some_and(|peer| peer.state == PeerState::Entangled);
+                if a_reloaded && b_reloaded && linked {
+                    break;
+                }
+                sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("members A and B should apply the update and relink");
+        let delivered = a
+            .sync_state(json!({
+                "particle_id": id_b.as_str(),
+                "state": { "message": "still a member" }
+            }))
+            .await
+            .unwrap();
+        assert_eq!(delivered["delivered"], true);
+        assert!(c
+            .sync_state(json!({
+                "particle_id": id_a.as_str(),
+                "state": { "message": "removed" }
+            }))
+            .await
+            .is_err());
+        assert!(c
+            .sync_state(json!({
+                "particle_id": id_b.as_str(),
+                "state": { "message": "removed" }
+            }))
+            .await
+            .is_err());
+
+        a.shutdown().await;
+        b.shutdown().await;
+        c.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn offline_member_catches_up_from_a_relaying_peer() {
+        let temp = tempfile::tempdir().unwrap();
+        let root_a = temp.path().join("a");
+        let root_b = temp.path().join("b");
+        let root_c = temp.path().join("c");
+        let (id_a, private_a) = saved_identity(&root_a);
+        let (id_b, private_b) = saved_identity(&root_b);
+        let (id_c, private_c) = saved_identity(&root_c);
+        let members = vec![
+            test_member(&id_a, "pc-a", &private_a, id_a.as_str()),
+            test_member(&id_b, "pc-b", &private_b, id_a.as_str()),
+            test_member(&id_c, "pc-c", &private_c, id_a.as_str()),
+        ];
+        for root in [&root_a, &root_b, &root_c] {
+            insert_test_group(
+                root,
+                "work",
+                [0x7b; 32],
+                members.clone(),
+                groups::Role::Member,
+            );
+        }
+        let a_port = free_port();
+        let b_port = port_other_than(a_port);
+        let c_port = loop {
+            let port = free_port();
+            if port != a_port && port != b_port {
+                break port;
+            }
+        };
+        let mut options_c = options("pc-c", c_port, root_c.clone(), None);
+        options_c.no_mdns = true;
+        let (c, _) = Particle::start(options_c, None).await.unwrap();
+        let mut options_a = options(
+            "pc-a",
+            a_port,
+            root_a.clone(),
+            Some(format!("127.0.0.1:{c_port}")),
+        );
+        options_a.no_mdns = true;
+        let (a, _) = Particle::start(options_a, None).await.unwrap();
+        wait_for_group_pair(&a, &c).await;
+
+        let group = groups::find(&root_a, "work").unwrap().unwrap();
+        groups::issue_update(
+            &root_a,
+            &group.id,
+            entangle_core::UpdateKind::Rekey,
+            &private_a,
+        )
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(12), async {
+            loop {
+                let caught_up = c
+                    .groups
+                    .read()
+                    .unwrap()
+                    .iter()
+                    .any(|group| group.meta.name == "work" && group.meta.epoch == 1);
+                if caught_up {
+                    break;
+                }
+                sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("online member should apply the admin's rekey");
+        a.shutdown().await;
+
+        let mut options_b = options(
+            "pc-b",
+            b_port,
+            root_b.clone(),
+            Some(format!("127.0.0.1:{c_port}")),
+        );
+        options_b.no_mdns = true;
+        let (b, _) = Particle::start(options_b, None).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                let caught_up = b
+                    .groups
+                    .read()
+                    .unwrap()
+                    .iter()
+                    .any(|group| group.meta.name == "work" && group.meta.epoch == 1);
+                let linked = b
+                    .field
+                    .read()
+                    .unwrap()
+                    .by_id(&c.manifest.particle_id)
+                    .is_some_and(|peer| peer.state == PeerState::Entangled);
+                if caught_up && linked {
+                    break;
+                }
+                sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("offline member should apply relayed updates and relink");
+        let delivered = b
+            .sync_state(json!({
+                "particle_id": id_c.as_str(),
+                "state": { "message": "caught up through a member" }
+            }))
+            .await
+            .unwrap();
+        assert_eq!(delivered["delivered"], true);
+        b.shutdown().await;
+        c.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn running_member_leave_notifies_peers_and_records_acknowledgements() {
+        let temp = tempfile::tempdir().unwrap();
+        let root_a = temp.path().join("a");
+        let root_b = temp.path().join("b");
+        let root_c = temp.path().join("c");
+        let (id_a, private_a) = saved_identity(&root_a);
+        let (id_b, private_b) = saved_identity(&root_b);
+        let (id_c, private_c) = saved_identity(&root_c);
+        let members = vec![
+            test_member(&id_a, "pc-a", &private_a, id_a.as_str()),
+            test_member(&id_b, "pc-b", &private_b, id_a.as_str()),
+            test_member(&id_c, "pc-c", &private_c, id_a.as_str()),
+        ];
+        for root in [&root_a, &root_b, &root_c] {
+            insert_test_group(
+                root,
+                "work",
+                [0x7c; 32],
+                members.clone(),
+                groups::Role::Member,
+            );
+        }
+        let a_port = free_port();
+        let b_port = port_other_than(a_port);
+        let c_port = loop {
+            let port = free_port();
+            if port != a_port && port != b_port {
+                break port;
+            }
+        };
+        let mut options_a = options("pc-a", a_port, root_a.clone(), None);
+        options_a.no_mdns = true;
+        options_a.peer = vec![format!("127.0.0.1:{b_port}"), format!("127.0.0.1:{c_port}")];
+        let mut options_b = options(
+            "pc-b",
+            b_port,
+            root_b.clone(),
+            Some(format!("127.0.0.1:{a_port}")),
+        );
+        options_b.no_mdns = true;
+        options_b.peer.push(format!("127.0.0.1:{c_port}"));
+        let mut options_c = options(
+            "pc-c",
+            c_port,
+            root_c.clone(),
+            Some(format!("127.0.0.1:{a_port}")),
+        );
+        options_c.no_mdns = true;
+        options_c.peer.push(format!("127.0.0.1:{b_port}"));
+        let (a, _) = Particle::start(options_a, None).await.unwrap();
+        let (b, _) = Particle::start(options_b, None).await.unwrap();
+        let (c, _) = Particle::start(options_c, None).await.unwrap();
+        wait_for_group_pair(&a, &b).await;
+        wait_for_group_pair(&a, &c).await;
+        wait_for_group_pair(&b, &c).await;
+
+        let group = groups::find(&root_b, "work").unwrap().unwrap();
+        groups::set_leaving(&root_b, &group.id, true).unwrap();
+        groups::write_status(
+            &root_b,
+            &group.id,
+            &groups::GroupStatus {
+                epoch: group.meta.epoch,
+                op: "leave".into(),
+                confirmed: Vec::new(),
+            },
+        )
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                let a_removed = groups::find(&root_a, &group.id)
+                    .unwrap()
+                    .is_some_and(|group| {
+                        group
+                            .members
+                            .iter()
+                            .all(|member| member.particle_id != id_b.as_str())
+                    });
+                let c_removed = groups::find(&root_c, &group.id)
+                    .unwrap()
+                    .is_some_and(|group| {
+                        group
+                            .members
+                            .iter()
+                            .all(|member| member.particle_id != id_b.as_str())
+                    });
+                let status = groups::read_status(&root_b, &group.id).unwrap();
+                if a_removed
+                    && c_removed
+                    && groups::find(&root_b, &group.id).unwrap().is_none()
+                    && status.as_ref().is_some_and(|status| {
+                        status.confirmed.len() == 2
+                            && status.confirmed.contains(&id_a.to_string())
+                            && status.confirmed.contains(&id_c.to_string())
+                    })
+                {
+                    break;
+                }
+                sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("both members should acknowledge the leave notice");
+        a.shutdown().await;
+        b.shutdown().await;
+        c.shutdown().await;
     }
 
     #[tokio::test]
@@ -3341,7 +4090,7 @@ mod tests {
         let root_c = temp.path().join("c");
         let key = [0x63; 32];
         let (id_a, private_a) = saved_identity(&root_a);
-        let (id_b, _private_b) = saved_identity(&root_b);
+        let (id_b, private_b) = saved_identity(&root_b);
         let (id_c, private_c) = saved_identity(&root_c);
         let member_a = test_member(&id_a, "particle-a", &private_a, id_a.as_str());
         let member_c = test_member(&id_c, "particle-c", &private_c, id_a.as_str());
@@ -3463,6 +4212,7 @@ mod tests {
             addr: SocketAddr::from(([127, 0, 0, 1], a_port)),
             remote_static: entangle_transport::public_key(&private_a),
             group: groups::group_id_bytes(&key),
+            epoch: 0,
             relayed: false,
         };
         let untrusted_id = ParticleId::generate();
@@ -3496,6 +4246,45 @@ mod tests {
             .on_introduce(&stranger_info, &stranger_id, vec![])
             .await
             .is_err());
+        let group = groups::find(&root_a, "work").unwrap().unwrap();
+        groups::issue_update(
+            &root_a,
+            &group.id,
+            entangle_core::UpdateKind::Remove {
+                particle_id: id_b.to_string(),
+            },
+            &private_a,
+        )
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(12), async {
+            loop {
+                let caught_up = c
+                    .groups
+                    .read()
+                    .unwrap()
+                    .iter()
+                    .any(|group| group.meta.name == "work" && group.meta.epoch == 1);
+                if caught_up {
+                    break;
+                }
+                sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("the revoked member update should reach C");
+        let revoked_member = test_member(&id_b, "particle-b", &private_b, id_a.as_str());
+        assert_eq!(
+            c.on_introduce(&sender_info, &id_a, vec![revoked_member])
+                .await
+                .unwrap(),
+            0
+        );
+        assert!(groups::find(&root_c, "work")
+            .unwrap()
+            .unwrap()
+            .members
+            .iter()
+            .all(|member| member.particle_id != id_b.as_str()));
         a.shutdown().await;
         b.shutdown().await;
         c.shutdown().await;
@@ -3648,6 +4437,18 @@ mod tests {
         )
         .await
         .unwrap();
+        stream
+            .send(
+                &serde_json::to_vec(&entangle_link::Frame::GroupUpdates { updates: vec![] })
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let updates_ack = stream.recv(Duration::from_secs(2)).await.unwrap();
+        assert!(matches!(
+            serde_json::from_slice::<entangle_link::Frame>(&updates_ack).unwrap(),
+            entangle_link::Frame::GroupUpdates { updates } if updates.is_empty()
+        ));
         let frame = entangle_link::Frame::SyncOffer {
             from: a.manifest.particle_id.clone(),
             sync_id: sync_id.into(),
@@ -3751,6 +4552,7 @@ mod tests {
             addr: SocketAddr::from(([127, 0, 0, 1], 7337)),
             remote_static: entangle_transport::public_key(&remote_private),
             group: groups::group_id_bytes(&[0x41; 32]),
+            epoch: 0,
             relayed: false,
         };
         let decision = particle
@@ -3772,6 +4574,7 @@ mod tests {
                     addr: SocketAddr::from(([127, 0, 0, 1], 7337)),
                     remote_static: [0x22; 32],
                     group: groups::group_id_bytes(&[0x41; 32]),
+                    epoch: 0,
                     relayed: false,
                 },
                 manifest,
@@ -3797,6 +4600,7 @@ mod tests {
                     addr: SocketAddr::from(([127, 0, 0, 1], 7337)),
                     remote_static: [0x22; 32],
                     group: groups::group_id_bytes(&[0x41; 32]),
+                    epoch: 0,
                     relayed: false,
                 },
                 &offer,
@@ -3834,17 +4638,35 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let responder_keys = KeyRing {
             static_private: unbound_private,
-            groups: HashMap::from([(group_id, groups::derive_psk(&group_key))]),
+            groups: HashMap::from([(
+                group_id,
+                entangle_transport::GroupKeys {
+                    current: 0,
+                    keys: std::collections::BTreeMap::from([(0, groups::derive_psk(&group_key))]),
+                },
+            )]),
         };
         let accept_task = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
-            entangle_transport::accept_io(
+            let mut stream = entangle_transport::accept_io(
                 Box::new(stream),
                 &responder_keys,
                 Duration::from_secs(5),
             )
             .await
             .unwrap();
+            let updates = stream.recv(Duration::from_secs(5)).await.unwrap();
+            assert!(matches!(
+                serde_json::from_slice::<entangle_link::Frame>(&updates).unwrap(),
+                entangle_link::Frame::GroupUpdates { updates } if updates.is_empty()
+            ));
+            stream
+                .send(
+                    &serde_json::to_vec(&entangle_link::Frame::GroupUpdates { updates: vec![] })
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
         });
         let error = match particle
             .sync_handshake(
@@ -3857,7 +4679,10 @@ mod tests {
             Ok(_) => panic!("unbound static key must not complete the sync handshake"),
             Err(error) => error,
         };
-        assert!(error.contains("remote Noise static key did not match"));
+        assert!(
+            error.contains("remote Noise static key did not match"),
+            "unexpected sync handshake error: {error}"
+        );
         accept_task.await.unwrap();
         particle.shutdown().await;
     }
@@ -3902,6 +4727,7 @@ mod tests {
                     addr: RELAY_PLACEHOLDER,
                     remote_static: entangle_transport::public_key(&remote_private),
                     group: groups::group_id_bytes(&[0x41; 32]),
+                    epoch: 0,
                     relayed: true,
                 },
                 manifest,

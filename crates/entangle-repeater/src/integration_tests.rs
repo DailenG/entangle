@@ -479,11 +479,27 @@ async fn forwarding_does_not_expose_end_to_end_noise_plaintext() {
     let group_id = [0xaa; 4];
     let keys_a = KeyRing {
         static_private: entangle_transport::generate_static(),
-        groups: [(group_id, [47; 32])].into_iter().collect(),
+        groups: [(
+            group_id,
+            entangle_transport::GroupKeys {
+                current: 0,
+                keys: std::collections::BTreeMap::from([(0, [47; 32])]),
+            },
+        )]
+        .into_iter()
+        .collect(),
     };
     let keys_b = KeyRing {
         static_private: entangle_transport::generate_static(),
-        groups: [(group_id, [47; 32])].into_iter().collect(),
+        groups: [(
+            group_id,
+            entangle_transport::GroupKeys {
+                current: 0,
+                keys: std::collections::BTreeMap::from([(0, [47; 32])]),
+            },
+        )]
+        .into_iter()
+        .collect(),
     };
     let (secure_a, secure_b) = tokio::join!(
         entangle_transport::connect_io(

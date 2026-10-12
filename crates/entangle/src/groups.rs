@@ -2,13 +2,14 @@
 
 use crate::{identity, private_fs};
 use chrono::{SecondsFormat, Utc};
+use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 pub use entangle_core::Member;
-use entangle_core::ParticleId;
+use entangle_core::{GroupUpdate, ParticleId, Revocation, UpdateKind};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     fs::{self, File, OpenOptions},
     io,
     path::{Path, PathBuf},
@@ -16,12 +17,16 @@ use std::{
 use thiserror::Error;
 
 pub const MAX_GROUPS: usize = 8;
-const GROUP_VERSION: u32 = 1;
+const GROUP_VERSION: u32 = 2;
 const GROUP_DOMAIN: &[u8] = b"entangle-group-id-v1";
 const PSK_DOMAIN: &[u8] = b"entangle-group-psk-v1";
+const SIGN_DOMAIN: &[u8] = b"entangle-sign-v1";
+const UPDATE_DOMAIN: &[u8] = b"entangle-group-update-v1\n";
+const RETAINED_LIMIT: usize = 16;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
+#[cfg(test)]
 pub enum Role {
     Admin,
     Member,
@@ -31,8 +36,19 @@ pub enum Role {
 pub struct GroupMeta {
     pub version: u32,
     pub name: String,
-    pub role: Role,
     pub created_at: String,
+    pub epoch: u32,
+    pub admin: String,
+    pub admin_sign_key: String,
+    pub revoked: Vec<Revocation>,
+    #[serde(default)]
+    pub leaving: bool,
+}
+
+impl GroupMeta {
+    pub fn is_admin(&self, self_id: &str) -> bool {
+        self.admin == self_id
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -41,6 +57,22 @@ pub struct Group {
     pub key: [u8; 32],
     pub meta: GroupMeta,
     pub members: Vec<Member>,
+    pub retained_keys: BTreeMap<u32, [u8; 32]>,
+    pub updates: Vec<GroupUpdate>,
+    pub outdated: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ApplyResult {
+    pub epoch: u32,
+    pub removed: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct GroupStatus {
+    pub epoch: u32,
+    pub op: String,
+    pub confirmed: Vec<String>,
 }
 
 #[derive(Debug, Error)]
@@ -55,6 +87,8 @@ pub enum GroupError {
     TooMany,
     #[error("group not found: {0}")]
     NotFound(String),
+    #[error("group {name} was created by Entangle 0.6; run `entangle group leave {name}` and create it again")]
+    Outdated { name: String },
     #[error("could not generate a unique group ID after 16 key attempts")]
     IdCollision,
     #[error("group member key conflicts for particle {0}")]
@@ -68,6 +102,8 @@ pub enum GroupError {
     Malformed { path: PathBuf, reason: String },
     #[error("unsafe group storage path: {0}")]
     UnsafePath(PathBuf),
+    #[error("invalid signed group update: {0}")]
+    InvalidUpdate(String),
     #[error("group storage I/O failed at {path}: {source}")]
     Io {
         path: PathBuf,
@@ -112,11 +148,30 @@ pub fn group_id_bytes(key: &[u8; 32]) -> [u8; 4] {
         .expect("four-byte group ID")
 }
 
+pub fn id_bytes(id: &str) -> Option<[u8; 4]> {
+    if !is_group_id(id) {
+        return None;
+    }
+    hex::decode(id).ok()?.try_into().ok()
+}
+
 pub fn derive_psk(key: &[u8; 32]) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(PSK_DOMAIN);
     hasher.update(key);
     hasher.finalize().into()
+}
+
+pub fn signing_key(static_private: &[u8; 32]) -> SigningKey {
+    let mut hasher = Sha256::new();
+    hasher.update(SIGN_DOMAIN);
+    hasher.update(static_private);
+    let seed: [u8; 32] = hasher.finalize().into();
+    SigningKey::from_bytes(&seed)
+}
+
+pub fn signing_public_key(static_private: &[u8; 32]) -> String {
+    hex::encode(signing_key(static_private).verifying_key().to_bytes())
 }
 
 pub fn validate_name(name: &str) -> Result<(), GroupError> {
@@ -165,6 +220,7 @@ fn create_with_key_source(
     validate_member(&self_member, root)?;
     if self_member.particle_id != identity_id.as_str()
         || self_member.static_key != hex::encode(entangle_transport::public_key(&identity_key))
+        || self_member.sign_key != signing_public_key(&identity_key)
     {
         return Err(GroupError::malformed(
             root,
@@ -192,10 +248,17 @@ fn create_with_key_source(
         meta: GroupMeta {
             version: GROUP_VERSION,
             name: name.to_owned(),
-            role: Role::Admin,
             created_at: now,
+            epoch: 0,
+            admin: self_member.particle_id.clone(),
+            admin_sign_key: self_member.sign_key.clone(),
+            revoked: Vec::new(),
+            leaving: false,
         },
         members: vec![self_member],
+        retained_keys: BTreeMap::new(),
+        updates: Vec::new(),
+        outdated: false,
     };
     write_group(root, &group)?;
     Ok(group)
@@ -208,15 +271,31 @@ pub fn insert(
     meta: GroupMeta,
     members: Vec<Member>,
 ) -> Result<Group, GroupError> {
+    insert_with_id(root, group_id(&key), key, meta, members)
+}
+
+pub fn insert_with_id(
+    root: &Path,
+    id: String,
+    key: [u8; 32],
+    meta: GroupMeta,
+    members: Vec<Member>,
+) -> Result<Group, GroupError> {
     validate_meta(&meta, root)?;
     validate_members(&members, root)?;
+    validate_admin_member(&meta, &members, root)?;
     let _lock = lock_groups(root)?;
     let existing = read_groups_unlocked(root)?;
     ensure_available(&existing, &meta.name)?;
     if existing.len() >= MAX_GROUPS {
         return Err(GroupError::TooMany);
     }
-    let id = group_id(&key);
+    if !is_group_id(&id) {
+        return Err(GroupError::malformed(
+            Path::new("group ID"),
+            "directory name is not an eight-character group ID",
+        ));
+    }
     if existing.iter().any(|group| group.id == id) {
         return Err(GroupError::AlreadyMember(id));
     }
@@ -225,6 +304,9 @@ pub fn insert(
         key,
         meta,
         members,
+        retained_keys: BTreeMap::new(),
+        updates: Vec::new(),
+        outdated: false,
     };
     write_group(root, &group)?;
     Ok(group)
@@ -240,6 +322,17 @@ pub fn add_member(root: &Path, group_id: &str, member: Member) -> Result<bool, G
     cleanup_transaction_dirs(&groups_dir(root))?;
     let path = group_path(root, group_id);
     let mut group = read_group(&path)?;
+    if group
+        .meta
+        .revoked
+        .iter()
+        .any(|revocation| revocation.particle_id == member.particle_id)
+    {
+        return Err(GroupError::InvalidUpdate(format!(
+            "particle {} is revoked",
+            member.particle_id
+        )));
+    }
     if let Some(existing) = group
         .members
         .iter()
@@ -256,6 +349,369 @@ pub fn add_member(root: &Path, group_id: &str, member: Member) -> Result<bool, G
         .sort_by(|left, right| left.particle_id.cmp(&right.particle_id));
     write_group(root, &group)?;
     Ok(true)
+}
+
+pub fn remove_member(root: &Path, group_id: &str, particle_id: &str) -> Result<(), GroupError> {
+    if !is_group_id(group_id) {
+        return Err(GroupError::NotFound(group_id.to_owned()));
+    }
+    let _lock = lock_groups(root)?;
+    cleanup_transaction_dirs(&groups_dir(root))?;
+    let path = group_path(root, group_id);
+    let mut group = read_group(&path)?;
+    group
+        .members
+        .retain(|member| member.particle_id != particle_id);
+    if group.members.is_empty() {
+        fs::remove_dir_all(&path).map_err(|error| GroupError::io(&path, error))?;
+    } else {
+        write_group(root, &group)?;
+    }
+    Ok(())
+}
+
+pub fn set_leaving(root: &Path, group_id: &str, leaving: bool) -> Result<Group, GroupError> {
+    if !is_group_id(group_id) {
+        return Err(GroupError::NotFound(group_id.to_owned()));
+    }
+    let _lock = lock_groups(root)?;
+    cleanup_transaction_dirs(&groups_dir(root))?;
+    let path = group_path(root, group_id);
+    let mut group = read_group(&path)?;
+    group.meta.leaving = leaving;
+    write_group(root, &group)?;
+    Ok(group)
+}
+
+pub fn issue_update(
+    root: &Path,
+    group_id: &str,
+    kind: UpdateKind,
+    static_private: &[u8; 32],
+) -> Result<Group, GroupError> {
+    issue_update_with(root, group_id, kind, static_private, None)
+}
+
+pub fn issue_unrevoke_update(
+    root: &Path,
+    group_id: &str,
+    particle_id: &str,
+    static_private: &[u8; 32],
+) -> Result<Group, GroupError> {
+    issue_update_with(
+        root,
+        group_id,
+        UpdateKind::Rekey,
+        static_private,
+        Some(particle_id),
+    )
+}
+
+fn issue_update_with(
+    root: &Path,
+    group_id: &str,
+    kind: UpdateKind,
+    static_private: &[u8; 32],
+    unrevoke: Option<&str>,
+) -> Result<Group, GroupError> {
+    let Some((self_id, saved_private)) = identity::read_saved(root)
+        .map_err(|error| GroupError::malformed(root, error.to_string()))?
+    else {
+        return Err(GroupError::MissingIdentity(root.to_owned()));
+    };
+    if &saved_private != static_private {
+        return Err(GroupError::InvalidUpdate(
+            "signing identity does not match the saved identity".into(),
+        ));
+    }
+    let _lock = lock_groups(root)?;
+    cleanup_transaction_dirs(&groups_dir(root))?;
+    let path = group_path(root, group_id);
+    let mut group = read_group(&path)?;
+    if !group.meta.is_admin(self_id.as_str())
+        || group.meta.admin_sign_key != signing_public_key(static_private)
+    {
+        return Err(GroupError::InvalidUpdate(format!(
+            "only group admin {} may issue updates",
+            group.meta.admin
+        )));
+    }
+    let issued_by = self_id.to_string();
+    let mut new_key = group.key;
+    let mut new_admin = group.meta.admin.clone();
+    let mut new_admin_sign_key = group.meta.admin_sign_key.clone();
+    let mut revoked = group.meta.revoked.clone();
+    if let Some(particle_id) = unrevoke {
+        revoked.retain(|revocation| revocation.particle_id != particle_id);
+    }
+    match &kind {
+        UpdateKind::Remove { particle_id } => {
+            if particle_id == &issued_by {
+                return Err(GroupError::InvalidUpdate(
+                    "the admin cannot remove itself".into(),
+                ));
+            }
+            let member = group
+                .members
+                .iter()
+                .find(|member| member.particle_id == *particle_id)
+                .ok_or_else(|| GroupError::InvalidUpdate(format!("no member {particle_id}")))?;
+            let revocation = Revocation {
+                particle_id: member.particle_id.clone(),
+                static_key: member.static_key.clone(),
+            };
+            if !revoked.iter().any(|existing| existing == &revocation) {
+                revoked.push(revocation);
+            }
+            group
+                .members
+                .retain(|member| member.particle_id != *particle_id);
+            rand::rngs::OsRng.fill_bytes(&mut new_key);
+        }
+        UpdateKind::Rekey => {
+            if unrevoke.is_none() {
+                rand::rngs::OsRng.fill_bytes(&mut new_key);
+            }
+        }
+        UpdateKind::AdminHandoff { to } => {
+            if to == &issued_by {
+                return Err(GroupError::InvalidUpdate(
+                    "the group is already administered by this particle".into(),
+                ));
+            }
+            let member = group
+                .members
+                .iter()
+                .find(|member| member.particle_id == *to)
+                .ok_or_else(|| GroupError::InvalidUpdate(format!("no member {to}")))?;
+            new_admin = member.particle_id.clone();
+            new_admin_sign_key = member.sign_key.clone();
+        }
+    }
+    let epoch = group
+        .meta
+        .epoch
+        .checked_add(1)
+        .ok_or_else(|| GroupError::InvalidUpdate("group epoch overflow".into()))?;
+    revoked.sort_by(|left, right| left.particle_id.cmp(&right.particle_id));
+    let mut update = GroupUpdate {
+        group_id: group.id.clone(),
+        epoch,
+        key_hex: hex::encode(new_key),
+        admin: new_admin.clone(),
+        admin_sign_key: new_admin_sign_key.clone(),
+        revoked: revoked.clone(),
+        kind,
+        issued_by,
+        issued_at: timestamp(),
+        signature: String::new(),
+    };
+    let message = update_signing_bytes(&update)?;
+    update.signature = hex::encode(signing_key(static_private).sign(&message).to_bytes());
+    group.retained_keys.insert(group.meta.epoch, group.key);
+    trim_oldest(&mut group.retained_keys);
+    group.key = new_key;
+    group.meta.epoch = epoch;
+    group.meta.admin = new_admin;
+    group.meta.admin_sign_key = new_admin_sign_key;
+    group.meta.revoked = revoked;
+    group.updates.push(update);
+    if group.updates.len() > RETAINED_LIMIT {
+        group.updates.drain(..group.updates.len() - RETAINED_LIMIT);
+    }
+    write_group(root, &group)?;
+    Ok(group)
+}
+
+pub fn apply_updates(
+    root: &Path,
+    group_id: &str,
+    updates: &[GroupUpdate],
+    _via: Option<&Member>,
+) -> Result<ApplyResult, GroupError> {
+    if !is_group_id(group_id) {
+        return Err(GroupError::NotFound(group_id.to_owned()));
+    }
+    let Some((self_id, _)) = identity::read_saved(root)
+        .map_err(|error| GroupError::malformed(root, error.to_string()))?
+    else {
+        return Err(GroupError::MissingIdentity(root.to_owned()));
+    };
+    let _lock = lock_groups(root)?;
+    cleanup_transaction_dirs(&groups_dir(root))?;
+    let path = group_path(root, group_id);
+    let mut group = read_group(&path)?;
+    let mut ordered = updates.to_vec();
+    ordered.sort_by_key(|update| update.epoch);
+    for update in ordered {
+        if update.epoch <= group.meta.epoch {
+            continue;
+        }
+        validate_update(&group, &update)?;
+        let new_key = decode_key(&update.key_hex, &path.join("updates.json"))?;
+        group.retained_keys.insert(group.meta.epoch, group.key);
+        trim_oldest(&mut group.retained_keys);
+        group.key = new_key;
+        group.meta.epoch = update.epoch;
+        group.meta.admin = update.admin.clone();
+        group.meta.admin_sign_key = update.admin_sign_key.clone();
+        group.meta.revoked = update.revoked.clone();
+        if let UpdateKind::Remove { particle_id } = &update.kind {
+            group
+                .members
+                .retain(|member| member.particle_id != *particle_id);
+        }
+        group.members.retain(|member| {
+            !group
+                .meta
+                .revoked
+                .iter()
+                .any(|revocation| revocation.particle_id == member.particle_id)
+        });
+        group.updates.push(update);
+        if group.updates.len() > RETAINED_LIMIT {
+            group.updates.drain(..group.updates.len() - RETAINED_LIMIT);
+        }
+        let self_revoked = group
+            .meta
+            .revoked
+            .iter()
+            .any(|revocation| revocation.particle_id == self_id.as_str());
+        if self_revoked {
+            fs::remove_dir_all(&path).map_err(|error| GroupError::io(&path, error))?;
+            tracing::info!("removed from group {} by its admin", group.meta.name);
+            return Ok(ApplyResult {
+                epoch: group.meta.epoch,
+                removed: true,
+            });
+        }
+        write_group(root, &group)?;
+    }
+    Ok(ApplyResult {
+        epoch: group.meta.epoch,
+        removed: false,
+    })
+}
+
+fn validate_update(group: &Group, update: &GroupUpdate) -> Result<(), GroupError> {
+    if update.group_id != group.id {
+        return Err(GroupError::InvalidUpdate("group ID mismatch".into()));
+    }
+    if update.epoch != group.meta.epoch.saturating_add(1) {
+        return Err(GroupError::InvalidUpdate(format!(
+            "expected epoch {}, received {}",
+            group.meta.epoch.saturating_add(1),
+            update.epoch
+        )));
+    }
+    if update.issued_by != group.meta.admin {
+        return Err(GroupError::InvalidUpdate(
+            "update issuer is not the current admin".into(),
+        ));
+    }
+    if update.admin != group.meta.admin {
+        let member = group
+            .members
+            .iter()
+            .find(|member| member.particle_id == update.admin)
+            .ok_or_else(|| GroupError::InvalidUpdate("new admin is not a current member".into()))?;
+        if update.admin_sign_key != member.sign_key {
+            return Err(GroupError::InvalidUpdate(
+                "new admin signing key does not match its member record".into(),
+            ));
+        }
+    } else if update.admin_sign_key != group.meta.admin_sign_key {
+        return Err(GroupError::InvalidUpdate(
+            "admin signing key changed without a handoff".into(),
+        ));
+    }
+    let verifying_key_bytes = hex::decode(&group.meta.admin_sign_key)
+        .map_err(|error| GroupError::InvalidUpdate(error.to_string()))?;
+    let verifying_key_bytes: [u8; 32] = verifying_key_bytes
+        .try_into()
+        .map_err(|_| GroupError::InvalidUpdate("invalid admin signing key length".into()))?;
+    let verifying_key = VerifyingKey::from_bytes(&verifying_key_bytes)
+        .map_err(|error| GroupError::InvalidUpdate(error.to_string()))?;
+    let signature_bytes = hex::decode(&update.signature)
+        .map_err(|error| GroupError::InvalidUpdate(error.to_string()))?;
+    let signature = Signature::from_slice(&signature_bytes)
+        .map_err(|error| GroupError::InvalidUpdate(error.to_string()))?;
+    verifying_key
+        .verify(&update_signing_bytes(update)?, &signature)
+        .map_err(|error| GroupError::InvalidUpdate(error.to_string()))?;
+    decode_key(&update.key_hex, Path::new("updates.json"))?;
+    Ok(())
+}
+
+fn update_signing_bytes(update: &GroupUpdate) -> Result<Vec<u8>, GroupError> {
+    let mut unsigned = update.clone();
+    unsigned.signature.clear();
+    let bytes = serde_json::to_vec(&unsigned)
+        .map_err(|error| GroupError::InvalidUpdate(error.to_string()))?;
+    let mut message = UPDATE_DOMAIN.to_vec();
+    message.extend_from_slice(&bytes);
+    Ok(message)
+}
+
+fn decode_key(value: &str, path: &Path) -> Result<[u8; 32], GroupError> {
+    let decoded =
+        hex::decode(value).map_err(|error| GroupError::malformed(path, error.to_string()))?;
+    decoded
+        .try_into()
+        .map_err(|_| GroupError::malformed(path, "expected a 32-byte key"))
+}
+
+fn trim_oldest<K: Ord, V>(map: &mut BTreeMap<K, V>) {
+    while map.len() > RETAINED_LIMIT {
+        map.pop_first();
+    }
+}
+
+pub fn updates_since(group: &Group, epoch: u32) -> Option<Vec<GroupUpdate>> {
+    if epoch >= group.meta.epoch {
+        return Some(Vec::new());
+    }
+    let updates = group
+        .updates
+        .iter()
+        .filter(|update| update.epoch > epoch)
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut expected = epoch.checked_add(1)?;
+    for update in &updates {
+        if update.epoch != expected {
+            return None;
+        }
+        expected = expected.checked_add(1)?;
+    }
+    (expected == group.meta.epoch.checked_add(1)?).then_some(updates)
+}
+
+pub fn write_status(root: &Path, group_id: &str, status: &GroupStatus) -> Result<(), GroupError> {
+    if !is_group_id(group_id) {
+        return Err(GroupError::NotFound(group_id.to_owned()));
+    }
+    let directory = groups_dir(root).join(".status");
+    private_fs::create_private_directory(&directory).map_err(GroupError::private_fs)?;
+    let path = directory.join(format!("{group_id}.json"));
+    let bytes = serde_json::to_vec_pretty(status)
+        .map_err(|error| GroupError::malformed(&path, error.to_string()))?;
+    private_fs::atomic_write(&path, &bytes).map_err(GroupError::private_fs)
+}
+
+pub fn read_status(root: &Path, group_id: &str) -> Result<Option<GroupStatus>, GroupError> {
+    if !is_group_id(group_id) {
+        return Ok(None);
+    }
+    let path = groups_dir(root)
+        .join(".status")
+        .join(format!("{group_id}.json"));
+    let Some(bytes) = private_fs::read_regular_file(&path).map_err(GroupError::private_fs)? else {
+        return Ok(None);
+    };
+    serde_json::from_slice(&bytes)
+        .map(Some)
+        .map_err(|error| GroupError::malformed(&path, error.to_string()))
 }
 
 pub fn leave(root: &Path, name_or_id: &str) -> Result<Group, GroupError> {
@@ -346,7 +802,13 @@ fn read_groups_unlocked(root: &Path) -> Result<Vec<Group>, GroupError> {
         if !metadata.file_type().is_dir() {
             return Err(GroupError::malformed(&path, "expected a group directory"));
         }
-        groups.push(read_group(&path)?);
+        match read_group(&path) {
+            Ok(group) => groups.push(group),
+            Err(GroupError::Outdated { name }) => {
+                groups.push(read_outdated_group(&path, name)?);
+            }
+            Err(error) => return Err(error),
+        }
     }
     groups.sort_by(|left, right| {
         left.meta
@@ -355,6 +817,44 @@ fn read_groups_unlocked(root: &Path) -> Result<Vec<Group>, GroupError> {
             .then_with(|| left.id.cmp(&right.id))
     });
     Ok(groups)
+}
+
+fn read_outdated_group(path: &Path, name: String) -> Result<Group, GroupError> {
+    let key_path = path.join("key");
+    let key_bytes = private_fs::read_regular_file(&key_path)
+        .map_err(GroupError::private_fs)?
+        .ok_or_else(|| GroupError::malformed(&key_path, "missing key"))?;
+    let key_text = std::str::from_utf8(&key_bytes)
+        .map_err(|error| GroupError::malformed(&key_path, error.to_string()))?
+        .trim_end_matches(['\r', '\n']);
+    let decoded = hex::decode(key_text)
+        .map_err(|error| GroupError::malformed(&key_path, error.to_string()))?;
+    let key = decoded
+        .try_into()
+        .map_err(|_| GroupError::malformed(&key_path, "expected a 32-byte key"))?;
+    let id = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|id| is_group_id(id))
+        .ok_or_else(|| GroupError::malformed(path, "invalid group directory name"))?;
+    Ok(Group {
+        id: id.to_owned(),
+        key,
+        meta: GroupMeta {
+            version: 1,
+            name,
+            created_at: String::new(),
+            epoch: 0,
+            admin: String::new(),
+            admin_sign_key: String::new(),
+            revoked: Vec::new(),
+            leaving: false,
+        },
+        members: Vec::new(),
+        retained_keys: BTreeMap::new(),
+        updates: Vec::new(),
+        outdated: true,
+    })
 }
 
 fn read_group(path: &Path) -> Result<Group, GroupError> {
@@ -396,7 +896,22 @@ fn read_group(path: &Path) -> Result<Group, GroupError> {
     let meta_bytes = private_fs::read_regular_file(&meta_path)
         .map_err(GroupError::private_fs)?
         .ok_or_else(|| GroupError::malformed(&meta_path, "missing metadata"))?;
-    let meta: GroupMeta = serde_json::from_slice(&meta_bytes)
+    let meta_value: serde_json::Value = serde_json::from_slice(&meta_bytes)
+        .map_err(|error| GroupError::malformed(&meta_path, error.to_string()))?;
+    if meta_value
+        .get("version")
+        .and_then(serde_json::Value::as_u64)
+        == Some(1)
+    {
+        let name = meta_value
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| GroupError::malformed(&meta_path, "missing group name"))?;
+        return Err(GroupError::Outdated {
+            name: name.to_owned(),
+        });
+    }
+    let meta: GroupMeta = serde_json::from_value(meta_value)
         .map_err(|error| GroupError::malformed(&meta_path, error.to_string()))?;
     validate_meta(&meta, &meta_path)?;
 
@@ -407,6 +922,7 @@ fn read_group(path: &Path) -> Result<Group, GroupError> {
     let members: Vec<Member> = serde_json::from_slice(&members_bytes)
         .map_err(|error| GroupError::malformed(&members_path, error.to_string()))?;
     validate_members(&members, &members_path)?;
+    validate_admin_member(&meta, &members, &members_path)?;
     if members.is_empty() {
         return Err(GroupError::malformed(&members_path, "group has no members"));
     }
@@ -415,10 +931,50 @@ fn read_group(path: &Path) -> Result<Group, GroupError> {
         .file_name()
         .and_then(|name| name.to_str())
         .ok_or_else(|| GroupError::malformed(path, "invalid group directory name"))?;
-    if id != group_id(&key) {
+    if !is_group_id(id) {
         return Err(GroupError::malformed(
             path,
-            "directory name does not match the key's group ID",
+            "directory name is not an eight-character group ID",
+        ));
+    }
+    let retained_path = path.join("keys.json");
+    let retained_bytes = private_fs::read_regular_file(&retained_path)
+        .map_err(GroupError::private_fs)?
+        .ok_or_else(|| GroupError::malformed(&retained_path, "missing retained key list"))?;
+    let retained_hex: BTreeMap<u32, String> = serde_json::from_slice(&retained_bytes)
+        .map_err(|error| GroupError::malformed(&retained_path, error.to_string()))?;
+    let mut retained_keys = BTreeMap::new();
+    for (epoch, key_hex) in retained_hex {
+        let bytes = hex::decode(&key_hex)
+            .map_err(|error| GroupError::malformed(&retained_path, error.to_string()))?;
+        let retained_key: [u8; 32] = bytes
+            .try_into()
+            .map_err(|_| GroupError::malformed(&retained_path, "expected 32-byte keys"))?;
+        if epoch >= meta.epoch {
+            return Err(GroupError::malformed(
+                &retained_path,
+                "retained key epoch must be older than the current epoch",
+            ));
+        }
+        retained_keys.insert(epoch, retained_key);
+    }
+    if retained_keys.len() > RETAINED_LIMIT {
+        return Err(GroupError::malformed(
+            &retained_path,
+            "too many retained group keys",
+        ));
+    }
+
+    let updates_path = path.join("updates.json");
+    let updates_bytes = private_fs::read_regular_file(&updates_path)
+        .map_err(GroupError::private_fs)?
+        .ok_or_else(|| GroupError::malformed(&updates_path, "missing update log"))?;
+    let updates: Vec<GroupUpdate> = serde_json::from_slice(&updates_bytes)
+        .map_err(|error| GroupError::malformed(&updates_path, error.to_string()))?;
+    if updates.len() > RETAINED_LIMIT {
+        return Err(GroupError::malformed(
+            &updates_path,
+            "too many retained group updates",
         ));
     }
     Ok(Group {
@@ -426,23 +982,32 @@ fn read_group(path: &Path) -> Result<Group, GroupError> {
         key,
         meta,
         members,
+        retained_keys,
+        updates,
+        outdated: false,
     })
 }
 
 fn write_group(root: &Path, group: &Group) -> Result<(), GroupError> {
     let path = group_path(root, &group.id);
+    if group.outdated {
+        return Err(GroupError::Outdated {
+            name: group.meta.name.clone(),
+        });
+    }
+    if !is_group_id(&group.id) {
+        return Err(GroupError::malformed(
+            &path,
+            "directory name is not an eight-character group ID",
+        ));
+    }
     validate_meta(&group.meta, &path.join("meta.json"))?;
     validate_members(&group.members, &path.join("members.json"))?;
+    validate_admin_member(&group.meta, &group.members, &path.join("members.json"))?;
     if group.members.is_empty() {
         return Err(GroupError::malformed(
             &path.join("members.json"),
             "group has no members",
-        ));
-    }
-    if group.id != group_id(&group.key) {
-        return Err(GroupError::malformed(
-            &path.join("key"),
-            "group ID does not match the key",
         ));
     }
     let key = format!("{}\n", hex::encode(group.key));
@@ -450,16 +1015,19 @@ fn write_group(root: &Path, group: &Group) -> Result<(), GroupError> {
         .map_err(|error| GroupError::malformed(&path.join("meta.json"), error.to_string()))?;
     let members = serde_json::to_vec_pretty(&group.members)
         .map_err(|error| GroupError::malformed(&path.join("members.json"), error.to_string()))?;
+    let retained = group
+        .retained_keys
+        .iter()
+        .map(|(epoch, key)| (*epoch, hex::encode(key)))
+        .collect::<BTreeMap<_, _>>();
+    let retained = serde_json::to_vec_pretty(&retained)
+        .map_err(|error| GroupError::malformed(&path.join("keys.json"), error.to_string()))?;
+    let updates = serde_json::to_vec_pretty(&group.updates)
+        .map_err(|error| GroupError::malformed(&path.join("updates.json"), error.to_string()))?;
 
     let replace_existing = match fs::symlink_metadata(&path) {
         Ok(metadata) if metadata.file_type().is_dir() => {
-            let existing = read_group(&path)?;
-            if existing.key != group.key {
-                return Err(GroupError::malformed(
-                    &path.join("key"),
-                    "refusing to replace a group directory with a different key",
-                ));
-            }
+            read_group(&path)?;
             true
         }
         Ok(_) => return Err(GroupError::UnsafePath(path)),
@@ -473,6 +1041,10 @@ fn write_group(root: &Path, group: &Group) -> Result<(), GroupError> {
         private_fs::atomic_write(&staging.join("meta.json"), &meta)
             .map_err(GroupError::private_fs)?;
         private_fs::atomic_write(&staging.join("members.json"), &members)
+            .map_err(GroupError::private_fs)?;
+        private_fs::atomic_write(&staging.join("keys.json"), &retained)
+            .map_err(GroupError::private_fs)?;
+        private_fs::atomic_write(&staging.join("updates.json"), &updates)
             .map_err(GroupError::private_fs)?;
         Ok(())
     })();
@@ -632,6 +1204,14 @@ fn validate_meta(meta: &GroupMeta, path: &Path) -> Result<(), GroupError> {
     validate_name(&meta.name).map_err(|error| GroupError::malformed(path, error.to_string()))?;
     chrono::DateTime::parse_from_rfc3339(&meta.created_at)
         .map_err(|error| GroupError::malformed(path, error.to_string()))?;
+    ParticleId::parse(meta.admin.clone())
+        .map_err(|error| GroupError::malformed(path, error.to_string()))?;
+    validate_hex_key(&meta.admin_sign_key, path, "admin signing key")?;
+    for revocation in &meta.revoked {
+        ParticleId::parse(revocation.particle_id.clone())
+            .map_err(|error| GroupError::malformed(path, error.to_string()))?;
+        validate_hex_key(&revocation.static_key, path, "revoked static key")?;
+    }
     Ok(())
 }
 
@@ -649,24 +1229,47 @@ fn validate_members(members: &[Member], path: &Path) -> Result<(), GroupError> {
     Ok(())
 }
 
+fn validate_admin_member(
+    meta: &GroupMeta,
+    members: &[Member],
+    path: &Path,
+) -> Result<(), GroupError> {
+    let admin = members
+        .iter()
+        .find(|member| member.particle_id == meta.admin)
+        .ok_or_else(|| GroupError::malformed(path, "admin is not a current group member"))?;
+    if admin.sign_key != meta.admin_sign_key {
+        return Err(GroupError::malformed(
+            path,
+            "admin signing key does not match its member record",
+        ));
+    }
+    Ok(())
+}
+
 fn validate_member(member: &Member, path: &Path) -> Result<(), GroupError> {
     for id in [&member.particle_id, &member.added_by] {
         ParticleId::parse(id.clone())
             .map_err(|error| GroupError::malformed(path, error.to_string()))?;
     }
-    if member.static_key.len() != 64
-        || !member
-            .static_key
+    validate_hex_key(&member.static_key, path, "member static key")?;
+    validate_hex_key(&member.sign_key, path, "member signing key")?;
+    chrono::DateTime::parse_from_rfc3339(&member.added_at)
+        .map_err(|error| GroupError::malformed(path, error.to_string()))?;
+    Ok(())
+}
+
+fn validate_hex_key(value: &str, path: &Path, label: &str) -> Result<(), GroupError> {
+    if value.len() != 64
+        || !value
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
     {
         return Err(GroupError::malformed(
             path,
-            "member static key must be 64 lowercase hexadecimal characters",
+            format!("{label} must be 64 lowercase hexadecimal characters"),
         ));
     }
-    chrono::DateTime::parse_from_rfc3339(&member.added_at)
-        .map_err(|error| GroupError::malformed(path, error.to_string()))?;
     Ok(())
 }
 
@@ -690,6 +1293,7 @@ mod tests {
             particle_id: identity.id.to_string(),
             name: "workstation".into(),
             static_key: hex::encode(entangle_transport::public_key(&identity.static_private)),
+            sign_key: signing_public_key(&identity.static_private),
             added_by: identity.id.to_string(),
             added_at: timestamp(),
         }
@@ -701,8 +1305,22 @@ mod tests {
             particle_id: id.clone(),
             name: format!("peer-{index}"),
             static_key: hex::encode([index; 32]),
+            sign_key: signing_public_key(&[index; 32]),
             added_by: id,
             added_at: timestamp(),
+        }
+    }
+
+    fn group_meta(name: &str, admin: &Member) -> GroupMeta {
+        GroupMeta {
+            version: GROUP_VERSION,
+            name: name.into(),
+            created_at: timestamp(),
+            epoch: 0,
+            admin: admin.particle_id.clone(),
+            admin_sign_key: admin.sign_key.clone(),
+            revoked: Vec::new(),
+            leaving: false,
         }
     }
 
@@ -728,10 +1346,281 @@ mod tests {
     fn create_list_and_find_by_name_or_id() {
         let root = tempdir().unwrap();
         let group = create_named(root.path(), "work");
+        let self_member = &group.members[0];
+        assert_eq!(group.meta.epoch, 0);
+        assert_eq!(group.meta.admin, self_member.particle_id);
+        assert_eq!(group.meta.admin_sign_key, self_member.sign_key);
+        assert_eq!(
+            group.meta.admin_sign_key,
+            signing_public_key(&identity::read_saved(root.path()).unwrap().unwrap().1)
+        );
         assert_eq!(list(root.path()).unwrap(), vec![group.clone()]);
         assert_eq!(find(root.path(), "work").unwrap(), Some(group.clone()));
         assert_eq!(find(root.path(), &group.id).unwrap(), Some(group));
         assert_eq!(find(root.path(), "missing").unwrap(), None);
+    }
+
+    #[test]
+    fn version_one_group_is_reported_as_outdated() {
+        let root = tempdir().unwrap();
+        let path = root.path().join("groups").join("deadbeef");
+        fs::create_dir_all(&path).unwrap();
+        fs::write(path.join("key"), format!("{}\n", hex::encode([0x44; 32]))).unwrap();
+        fs::write(
+            path.join("meta.json"),
+            br#"{"version":1,"name":"legacy","created_at":"2026-01-01T00:00:00Z","role":"admin"}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            read_group(&path),
+            Err(GroupError::Outdated { name }) if name == "legacy"
+        ));
+        let listed = list(root.path()).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert!(listed[0].outdated);
+        assert_eq!(listed[0].meta.name, "legacy");
+    }
+
+    #[test]
+    fn remove_rotates_key_records_revocation_and_retains_the_update() {
+        let admin_root = tempdir().unwrap();
+        let admin = saved_identity(admin_root.path());
+        let group = insert(
+            admin_root.path(),
+            [0x41; 32],
+            group_meta("work", &admin),
+            vec![admin.clone(), member(1)],
+        )
+        .unwrap();
+        let updated = issue_update(
+            admin_root.path(),
+            &group.id,
+            UpdateKind::Remove {
+                particle_id: member(1).particle_id,
+            },
+            &identity::read_saved(admin_root.path()).unwrap().unwrap().1,
+        )
+        .unwrap();
+        assert_eq!(updated.meta.epoch, 1);
+        assert_ne!(updated.key, group.key);
+        assert_eq!(updated.members.len(), 1);
+        assert_eq!(updated.meta.revoked.len(), 1);
+        assert_eq!(updated.retained_keys.get(&0), Some(&group.key));
+        assert_eq!(updated.updates.len(), 1);
+        let stored = find(admin_root.path(), &group.id).unwrap().unwrap();
+        assert_eq!(stored, updated);
+    }
+
+    #[test]
+    fn re_invitation_unrevokes_without_rotating_the_key() {
+        let root = tempdir().unwrap();
+        let admin = saved_identity(root.path());
+        let target = member(3);
+        let group = insert(
+            root.path(),
+            [0x47; 32],
+            group_meta("work", &admin),
+            vec![admin.clone(), target.clone()],
+        )
+        .unwrap();
+        let private = identity::read_saved(root.path()).unwrap().unwrap().1;
+        let removed = issue_update(
+            root.path(),
+            &group.id,
+            UpdateKind::Remove {
+                particle_id: target.particle_id.clone(),
+            },
+            &private,
+        )
+        .unwrap();
+        let restored =
+            issue_unrevoke_update(root.path(), &group.id, &target.particle_id, &private).unwrap();
+        assert_eq!(restored.meta.epoch, removed.meta.epoch + 1);
+        assert_eq!(restored.key, removed.key);
+        assert!(restored.meta.revoked.is_empty());
+    }
+
+    #[test]
+    fn valid_update_chain_applies_and_replays_are_ignored() {
+        let admin_root = tempdir().unwrap();
+        let peer_root = tempdir().unwrap();
+        let admin = saved_identity(admin_root.path());
+        let peer = saved_identity(peer_root.path());
+        let group = insert(
+            admin_root.path(),
+            [0x42; 32],
+            group_meta("work", &admin),
+            vec![admin.clone(), peer.clone()],
+        )
+        .unwrap();
+        insert_with_id(
+            peer_root.path(),
+            group.id.clone(),
+            group.key,
+            group.meta.clone(),
+            group.members.clone(),
+        )
+        .unwrap();
+        let private = identity::read_saved(admin_root.path()).unwrap().unwrap().1;
+        let first =
+            issue_update(admin_root.path(), &group.id, UpdateKind::Rekey, &private).unwrap();
+        let second =
+            issue_update(admin_root.path(), &group.id, UpdateKind::Rekey, &private).unwrap();
+        let updates = vec![first.updates[0].clone(), second.updates[1].clone()];
+        let applied = apply_updates(peer_root.path(), &group.id, &updates, Some(&admin)).unwrap();
+        assert_eq!(applied.epoch, 2);
+        assert!(!applied.removed);
+        let stored = find(peer_root.path(), &group.id).unwrap().unwrap();
+        assert_eq!(stored.key, second.key);
+        assert_eq!(stored.updates.len(), 2);
+        assert_eq!(
+            apply_updates(peer_root.path(), &group.id, &updates, None)
+                .unwrap()
+                .epoch,
+            2
+        );
+    }
+
+    #[test]
+    fn update_chain_rejects_invalid_signature_issuer_epoch_and_group() {
+        let admin_root = tempdir().unwrap();
+        let peer_root = tempdir().unwrap();
+        let admin = saved_identity(admin_root.path());
+        let peer = saved_identity(peer_root.path());
+        let group = insert(
+            admin_root.path(),
+            [0x43; 32],
+            group_meta("work", &admin),
+            vec![admin.clone(), peer],
+        )
+        .unwrap();
+        let private = identity::read_saved(admin_root.path()).unwrap().unwrap().1;
+        let update = issue_update(admin_root.path(), &group.id, UpdateKind::Rekey, &private)
+            .unwrap()
+            .updates[0]
+            .clone();
+        let reject = |mutated: GroupUpdate| {
+            let root = tempdir().unwrap();
+            let self_member = saved_identity(root.path());
+            insert_with_id(
+                root.path(),
+                group.id.clone(),
+                group.key,
+                group.meta.clone(),
+                vec![admin.clone(), self_member],
+            )
+            .unwrap();
+            assert!(apply_updates(root.path(), &group.id, &[mutated], None).is_err());
+        };
+        let mut bad_signature = update.clone();
+        bad_signature.signature = "00".repeat(64);
+        reject(bad_signature);
+        let mut wrong_issuer = update.clone();
+        wrong_issuer.issued_by = member(7).particle_id;
+        reject(wrong_issuer);
+        let mut gap = update.clone();
+        gap.epoch = 2;
+        reject(gap);
+        let mut wrong_group = update;
+        wrong_group.group_id = "deadbeef".into();
+        reject(wrong_group);
+    }
+
+    #[test]
+    fn self_revocation_deletes_the_group_and_handoff_changes_the_signer() {
+        let admin_root = tempdir().unwrap();
+        let peer_root = tempdir().unwrap();
+        let admin = saved_identity(admin_root.path());
+        let peer = saved_identity(peer_root.path());
+        let group = insert(
+            admin_root.path(),
+            [0x45; 32],
+            group_meta("work", &admin),
+            vec![admin.clone(), peer.clone()],
+        )
+        .unwrap();
+        insert_with_id(
+            peer_root.path(),
+            group.id.clone(),
+            group.key,
+            group.meta.clone(),
+            group.members.clone(),
+        )
+        .unwrap();
+        let admin_private = identity::read_saved(admin_root.path()).unwrap().unwrap().1;
+        let handoff = issue_update(
+            admin_root.path(),
+            &group.id,
+            UpdateKind::AdminHandoff {
+                to: peer.particle_id.clone(),
+            },
+            &admin_private,
+        )
+        .unwrap();
+        apply_updates(peer_root.path(), &group.id, &handoff.updates, Some(&admin)).unwrap();
+        let peer_private = identity::read_saved(peer_root.path()).unwrap().unwrap().1;
+        let peer_update = issue_update(
+            peer_root.path(),
+            &group.id,
+            UpdateKind::Rekey,
+            &peer_private,
+        )
+        .unwrap();
+        assert_eq!(peer_update.meta.admin, peer.particle_id);
+        let mut old_admin_update = peer_update.updates[1].clone();
+        old_admin_update.epoch += 1;
+        old_admin_update.issued_by = admin.particle_id.clone();
+        old_admin_update.signature = hex::encode(
+            signing_key(&admin_private)
+                .sign(&update_signing_bytes(&old_admin_update).unwrap())
+                .to_bytes(),
+        );
+        assert!(apply_updates(
+            peer_root.path(),
+            &group.id,
+            &[old_admin_update],
+            Some(&admin)
+        )
+        .is_err());
+
+        let revoke_admin = issue_update(
+            peer_root.path(),
+            &group.id,
+            UpdateKind::Remove {
+                particle_id: admin.particle_id.clone(),
+            },
+            &peer_private,
+        )
+        .unwrap();
+        let revoked = apply_updates(
+            admin_root.path(),
+            &group.id,
+            &revoke_admin.updates,
+            Some(&peer),
+        )
+        .unwrap();
+        assert!(revoked.removed);
+        assert!(find(admin_root.path(), &group.id).unwrap().is_none());
+    }
+
+    #[test]
+    fn retained_keys_and_updates_are_capped_at_sixteen() {
+        let root = tempdir().unwrap();
+        let admin = saved_identity(root.path());
+        let group = insert(
+            root.path(),
+            [0x46; 32],
+            group_meta("work", &admin),
+            vec![admin],
+        )
+        .unwrap();
+        let private = identity::read_saved(root.path()).unwrap().unwrap().1;
+        for _ in 0..20 {
+            issue_update(root.path(), &group.id, UpdateKind::Rekey, &private).unwrap();
+        }
+        let stored = find(root.path(), &group.id).unwrap().unwrap();
+        assert_eq!(stored.retained_keys.len(), 16);
+        assert_eq!(stored.updates.len(), 16);
     }
 
     #[test]
@@ -760,12 +1649,7 @@ mod tests {
         let existing = insert(
             root.path(),
             existing_key,
-            GroupMeta {
-                version: GROUP_VERSION,
-                name: "existing".into(),
-                role: Role::Admin,
-                created_at: timestamp(),
-            },
+            group_meta("existing", &self_member),
             vec![self_member.clone()],
         )
         .unwrap();
@@ -854,7 +1738,7 @@ mod tests {
     }
 
     #[test]
-    fn group_directory_name_must_match_key_id() {
+    fn stable_group_id_does_not_change_with_the_current_key() {
         let root = tempdir().unwrap();
         let group = create_named(root.path(), "work");
         let original_path = root.path().join("groups").join(&group.id);
@@ -867,10 +1751,10 @@ mod tests {
         assert_eq!(renamed_id.len(), 8);
         fs::rename(&original_path, &renamed_path).unwrap();
 
-        match list(root.path()).unwrap_err() {
-            GroupError::Malformed { path, .. } => assert_eq!(path, renamed_path),
-            error => panic!("expected malformed group data, got {error}"),
-        }
+        let mut groups = list(root.path()).unwrap();
+        let renamed = groups.remove(0);
+        assert_eq!(renamed.id, renamed_id);
+        assert_eq!(renamed.key, group.key);
     }
 
     #[test]

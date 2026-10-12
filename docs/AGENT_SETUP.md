@@ -110,8 +110,8 @@ proceeding.
 
 ## Groups
 
-Human-only commands: `group create`, `group invite`, `group join`, and
-`group leave`. Agents may run
+Human-only commands: `group create`, `group invite`, `group join`, `group
+leave`, `group remove`, `group rekey`, and `group admin`. Agents may run
 `entangle group list`, `entangle group members <name>`, and `entangle peer
 list`. One device invites with `entangle group invite <name> [--count N]`;
 the human enters the one-time code on each other device with
@@ -121,7 +121,9 @@ group label, not the particle name. `--count N` sets the successful-join limit
 connection fallback when multicast discovery is blocked. Invites expire after
 ten minutes, and a wrong code or failed confirmation closes the invite. Ask
 the human to perform all invite/join commands in their terminal. Agents never
-request, display, or relay invite codes.
+request, display, or relay invite codes. Agents never remove members, rotate
+group keys, transfer administration, or leave groups; these commands require
+human judgment and confirmation.
 Trust is based on shared group membership, and group keys must never be
 requested or relayed.
 If `find_entangled_particles.self.warning` is present, report its text verbatim

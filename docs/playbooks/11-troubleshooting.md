@@ -83,6 +83,9 @@ The cross-network paths were not tested on a real LAN.
 | `That code was wrong; the invite is now closed. Ask for a new one.` | The code did not authenticate; the inviter closes that invite on a wrong code. | Ask for a new invite code. |
 | `configured: no` | This device has not saved repeater enrollment in the data directory used by the current process. | Have a person complete repeater enrollment in that same data directory. |
 | Members are not linked even though both devices list the group. | Membership does not make a blocked route reachable. | Check the link TCP port, static `--peer` address, and repeater enrollment. |
+| `group <name> is too far out of date ...; re-invite this device` | The device no longer has a retained key epoch shared with a current member. | Ask the admin to invite this device again. |
+| `This device was removed from <group>; ask its admin to invite it.` | The device is revoked in the group's signed membership state. | Ask the group admin to invite this device again. |
+| `group <name> was created by Entangle 0.6; run ... group leave ... and create it again` | This is a pre-v2 group and is not migrated. | Leave the outdated group and create or join a current group again. |
 
 ## Next
 

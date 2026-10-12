@@ -64,8 +64,11 @@ confirmation closes that invite. The inviter
 should stay online briefly so existing members can learn about newly joined
 devices through one-hop introductions. Use `entangle group list`,
 `entangle group members <name>`, and `entangle group leave <name>` to inspect
-or leave groups. A second Entangle server using the same data directory gets
-a temporary ID while the first server is running. See
+or leave groups. Human admins can run `entangle group remove <group> <member>`
+to remove a member and rotate the key, `entangle group rekey <group>` to
+rotate without changing membership, and `entangle group admin <group> <member>`
+to hand off administration. A second Entangle server using the same data
+directory gets a temporary ID while the first server is running. See
 [docs/SETUP.md](docs/SETUP.md) for group setup, firewall, client configuration,
 and a two-machine smoke test.
 
@@ -82,8 +85,9 @@ The standalone commands are `entangle serve` (default), `entangle node`, and
 ## Design and security
 
 The crate boundaries, message flow, wire format, and security limitations are
-documented in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). Protocol version 4
-uses group-bound Noise links; all devices must share a group to communicate.
+documented in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). Protocol version 5
+uses epoch-bound, group-authenticated Noise links with signed membership
+updates; all devices must share a group to communicate.
 
 ## License
 

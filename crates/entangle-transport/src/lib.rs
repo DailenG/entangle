@@ -6,7 +6,7 @@ use snow::{
     Builder, HandshakeState, TransportState,
 };
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     fmt, io,
     net::SocketAddr,
     sync::{Arc, RwLock},
@@ -24,7 +24,10 @@ pub const NOISE_PATTERN: &str = "Noise_XXpsk3_25519_ChaChaPoly_BLAKE2s";
 const MAX_MESSAGE: usize = u16::MAX as usize;
 const TAG_LENGTH: usize = 16;
 const PREFACE: &[u8; 4] = b"ENTG";
-const PREFACE_VERSION: u8 = 1;
+const PREFACE_VERSION: u8 = 2;
+const ACK_CONTINUE: u8 = 0;
+const ACK_RETRY_EPOCH: u8 = 1;
+const ACK_TOO_FAR_BEHIND: u8 = 2;
 /// Maximum plaintext bytes carried by one Noise transport message.
 pub const MAX_PLAINTEXT: usize = MAX_MESSAGE - TAG_LENGTH;
 
@@ -44,8 +47,14 @@ pub type SharedKeyRing = Arc<RwLock<Arc<KeyRing>>>;
 pub struct KeyRing {
     /// X25519 static private key.
     pub static_private: [u8; 32],
-    /// Group-ID-to-Noise-PSK map.
-    pub groups: HashMap<[u8; 4], [u8; 32]>,
+    /// Group-ID-to-current-and-retained Noise PSKs.
+    pub groups: HashMap<[u8; 4], GroupKeys>,
+}
+
+#[derive(Clone, Debug)]
+pub struct GroupKeys {
+    pub current: u32,
+    pub keys: BTreeMap<u32, [u8; 32]>,
 }
 
 impl fmt::Debug for KeyRing {
@@ -91,12 +100,18 @@ pub enum TransportError {
     /// Noise could not authenticate or complete a handshake.
     #[error("Noise handshake failed: {0}")]
     Handshake(String),
-    /// The nine-byte group preface was malformed.
+    /// The group preface or epoch acknowledgement was malformed.
     #[error("invalid group preface")]
     BadPreface,
     /// The requested group is not present in this key ring.
     #[error("unknown group")]
     UnknownGroup,
+    /// The responder retains the group, but not this older epoch.
+    #[error("local group epoch {local} is too far behind; peer is at epoch {current}")]
+    TooFarBehind { local: u32, current: u32 },
+    /// The responder's epoch is not retained by the initiator.
+    #[error("peer group epoch {peer_epoch} is too far behind")]
+    PeerTooFarBehind { peer_epoch: u32 },
     /// A Noise transport message could not be encrypted or authenticated.
     #[error("Noise transport failed: {0}")]
     Noise(String),
@@ -114,6 +129,7 @@ pub struct SecureStream {
     noise: TransportState,
     remote_static: [u8; 32],
     group_id: [u8; 4],
+    epoch: u32,
 }
 
 impl SecureStream {
@@ -154,6 +170,11 @@ impl SecureStream {
     pub fn group_id(&self) -> [u8; 4] {
         self.group_id
     }
+
+    /// Returns the group key epoch used by this authenticated session.
+    pub fn epoch(&self) -> u32 {
+        self.epoch
+    }
 }
 
 /// Connects as a Noise initiator and completes the XXpsk3 handshake.
@@ -179,16 +200,45 @@ pub async fn connect_io(
     duration: Duration,
 ) -> Result<SecureStream, TransportError> {
     timeout(duration, async {
-        if !ring.groups.contains_key(&group_id) {
-            return Err(TransportError::UnknownGroup);
-        }
-        write_preface(&mut stream, group_id).await?;
-        let (noise, remote_static) = initiator_handshake(&mut stream, ring, group_id).await?;
+        let group_keys = ring
+            .groups
+            .get(&group_id)
+            .ok_or(TransportError::UnknownGroup)?;
+        let requested_epoch = group_keys.current;
+        write_preface(&mut stream, group_id, requested_epoch).await?;
+        let mut ack = [0_u8; 1];
+        stream.read_exact(&mut ack).await?;
+        let epoch = match ack[0] {
+            ACK_CONTINUE => requested_epoch,
+            ACK_RETRY_EPOCH => {
+                let mut epoch_bytes = [0_u8; 4];
+                stream.read_exact(&mut epoch_bytes).await?;
+                let epoch = u32::from_be_bytes(epoch_bytes);
+                if !group_keys.keys.contains_key(&epoch) {
+                    return Err(TransportError::PeerTooFarBehind { peer_epoch: epoch });
+                }
+                stream.write_all(&epoch.to_be_bytes()).await?;
+                stream.flush().await?;
+                epoch
+            }
+            ACK_TOO_FAR_BEHIND => {
+                let mut epoch_bytes = [0_u8; 4];
+                stream.read_exact(&mut epoch_bytes).await?;
+                return Err(TransportError::TooFarBehind {
+                    local: requested_epoch,
+                    current: u32::from_be_bytes(epoch_bytes),
+                });
+            }
+            _ => return Err(TransportError::BadPreface),
+        };
+        let (noise, remote_static) =
+            initiator_handshake(&mut stream, ring, group_id, epoch).await?;
         Ok(SecureStream {
             stream,
             noise,
             remote_static,
             group_id,
+            epoch,
         })
     })
     .await
@@ -211,16 +261,47 @@ pub async fn accept_io(
     duration: Duration,
 ) -> Result<SecureStream, TransportError> {
     timeout(duration, async {
-        let group_id = read_preface(&mut stream).await?;
-        if !ring.groups.contains_key(&group_id) {
+        let (group_id, requested_epoch) = read_preface(&mut stream).await?;
+        let group_keys = ring
+            .groups
+            .get(&group_id)
+            .ok_or(TransportError::UnknownGroup)?;
+        let epoch = if group_keys.keys.contains_key(&requested_epoch) {
+            stream.write_all(&[ACK_CONTINUE]).await?;
+            stream.flush().await?;
+            requested_epoch
+        } else if requested_epoch > group_keys.current {
+            stream.write_all(&[ACK_RETRY_EPOCH]).await?;
+            stream.write_all(&group_keys.current.to_be_bytes()).await?;
+            stream.flush().await?;
+            let mut retry = [0_u8; 4];
+            stream.read_exact(&mut retry).await?;
+            let retry_epoch = u32::from_be_bytes(retry);
+            if retry_epoch != group_keys.current || !group_keys.keys.contains_key(&retry_epoch) {
+                return Err(TransportError::UnknownGroup);
+            }
+            retry_epoch
+        } else if group_keys
+            .keys
+            .keys()
+            .next()
+            .is_some_and(|oldest| requested_epoch < *oldest)
+        {
+            stream.write_all(&[ACK_TOO_FAR_BEHIND]).await?;
+            stream.write_all(&group_keys.current.to_be_bytes()).await?;
+            stream.flush().await?;
             return Err(TransportError::UnknownGroup);
-        }
-        let (noise, remote_static) = responder_handshake(&mut stream, ring, group_id).await?;
+        } else {
+            return Err(TransportError::UnknownGroup);
+        };
+        let (noise, remote_static) =
+            responder_handshake(&mut stream, ring, group_id, epoch).await?;
         Ok(SecureStream {
             stream,
             noise,
             remote_static,
             group_id,
+            epoch,
         })
     })
     .await
@@ -230,30 +311,38 @@ pub async fn accept_io(
 async fn write_preface(
     stream: &mut (impl AsyncWrite + Unpin),
     group_id: [u8; 4],
+    epoch: u32,
 ) -> Result<(), TransportError> {
-    let mut preface = [0_u8; 9];
+    let mut preface = [0_u8; 13];
     preface[..4].copy_from_slice(PREFACE);
     preface[4] = PREFACE_VERSION;
-    preface[5..].copy_from_slice(&group_id);
+    preface[5..9].copy_from_slice(&group_id);
+    preface[9..].copy_from_slice(&epoch.to_be_bytes());
     stream.write_all(&preface).await?;
     stream.flush().await?;
     Ok(())
 }
 
-async fn read_preface(stream: &mut (impl AsyncRead + Unpin)) -> Result<[u8; 4], TransportError> {
-    let mut preface = [0_u8; 9];
+async fn read_preface(
+    stream: &mut (impl AsyncRead + Unpin),
+) -> Result<([u8; 4], u32), TransportError> {
+    let mut preface = [0_u8; 13];
     stream.read_exact(&mut preface).await?;
     if &preface[..4] != PREFACE || preface[4] != PREFACE_VERSION {
         return Err(TransportError::BadPreface);
     }
-    Ok(preface[5..]
-        .try_into()
-        .expect("the preface has four group-ID bytes"))
+    Ok((
+        preface[5..9]
+            .try_into()
+            .expect("the preface has four group-ID bytes"),
+        u32::from_be_bytes(preface[9..].try_into().expect("four epoch bytes")),
+    ))
 }
 
 fn handshake_state(
     ring: &KeyRing,
     group_id: [u8; 4],
+    epoch: u32,
     initiator: bool,
 ) -> Result<HandshakeState, TransportError> {
     let params = NOISE_PATTERN
@@ -262,9 +351,11 @@ fn handshake_state(
     let psk = ring
         .groups
         .get(&group_id)
+        .and_then(|keys| keys.keys.get(&epoch))
         .ok_or(TransportError::UnknownGroup)?;
-    let mut prologue = b"entangle-link-v4".to_vec();
+    let mut prologue = b"entangle-link-v5".to_vec();
     prologue.extend_from_slice(&group_id);
+    prologue.extend_from_slice(&epoch.to_be_bytes());
     let builder = Builder::new(params)
         .local_private_key(&ring.static_private)
         .map_err(|error| TransportError::Handshake(error.to_string()))?
@@ -287,8 +378,9 @@ async fn initiator_handshake(
     stream: &mut (impl AsyncRead + AsyncWrite + Unpin + Send),
     ring: &KeyRing,
     group_id: [u8; 4],
+    epoch: u32,
 ) -> Result<(TransportState, [u8; 32]), TransportError> {
-    let mut state = handshake_state(ring, group_id, true)?;
+    let mut state = handshake_state(ring, group_id, epoch, true)?;
     let mut message = vec![0_u8; MAX_MESSAGE];
     let length = state
         .write_message(&[], &mut message)
@@ -321,8 +413,9 @@ async fn responder_handshake(
     stream: &mut (impl AsyncRead + AsyncWrite + Unpin + Send),
     ring: &KeyRing,
     group_id: [u8; 4],
+    epoch: u32,
 ) -> Result<(TransportState, [u8; 32]), TransportError> {
-    let mut state = handshake_state(ring, group_id, false)?;
+    let mut state = handshake_state(ring, group_id, epoch, false)?;
     let incoming = read_message(stream).await.map_err(handshake_io_error)?;
     let mut payload = vec![0_u8; MAX_MESSAGE];
     state
@@ -395,9 +488,20 @@ mod tests {
     const GROUP_B: [u8; 4] = [0xb2; 4];
 
     fn ring(psk_a: [u8; 32], psk_b: [u8; 32]) -> KeyRing {
+        let keys = |psk| GroupKeys {
+            current: 0,
+            keys: BTreeMap::from([(0, psk)]),
+        };
         KeyRing {
             static_private: generate_static(),
-            groups: HashMap::from([(GROUP_A, psk_a), (GROUP_B, psk_b)]),
+            groups: HashMap::from([(GROUP_A, keys(psk_a)), (GROUP_B, keys(psk_b))]),
+        }
+    }
+
+    fn ring_at(current: u32, keys: BTreeMap<u32, [u8; 32]>) -> KeyRing {
+        KeyRing {
+            static_private: generate_static(),
+            groups: HashMap::from([(GROUP_A, GroupKeys { current, keys })]),
         }
     }
 
@@ -418,6 +522,86 @@ mod tests {
             .await
             .unwrap();
         (client, accept.await.unwrap())
+    }
+
+    async fn connected_pair_result(
+        client_ring: KeyRing,
+        server_ring: KeyRing,
+    ) -> (
+        Result<SecureStream, TransportError>,
+        Result<SecureStream, TransportError>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let accept = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            accept(stream, &server_ring, Duration::from_secs(2)).await
+        });
+        let client = connect(address, &client_ring, GROUP_A, Duration::from_secs(2)).await;
+        (client, accept.await.unwrap())
+    }
+
+    #[tokio::test]
+    async fn retained_epochs_negotiate_both_directions_and_report_epoch() {
+        let psk = [0x31; 32];
+        let (client, server) =
+            connected_pair(ring(psk, [0x32; 32]), ring(psk, [0x32; 32]), GROUP_A).await;
+        assert_eq!(client.epoch(), 0);
+        assert_eq!(server.epoch(), 0);
+
+        let client = ring_at(0, BTreeMap::from([(0, psk)]));
+        let server = ring_at(1, BTreeMap::from([(0, psk), (1, [0x33; 32])]));
+        let (client, server) = connected_pair(client, server, GROUP_A).await;
+        assert_eq!(client.epoch(), 0);
+        assert_eq!(server.epoch(), 0);
+
+        let client = ring_at(1, BTreeMap::from([(0, psk), (1, [0x33; 32])]));
+        let server = ring_at(0, BTreeMap::from([(0, psk)]));
+        let (client, server) = connected_pair(client, server, GROUP_A).await;
+        assert_eq!(client.epoch(), 0);
+        assert_eq!(server.epoch(), 0);
+    }
+
+    #[tokio::test]
+    async fn epochs_older_than_retained_keys_return_too_far_behind_before_noise() {
+        let client = ring_at(0, BTreeMap::from([(0, [0; 32])]));
+        let server = ring_at(
+            17,
+            (1..=17).map(|epoch| (epoch, [epoch as u8; 32])).collect(),
+        );
+        let (client, server) = connected_pair_result(client, server).await;
+        assert!(matches!(
+            client,
+            Err(TransportError::TooFarBehind {
+                local: 0,
+                current: 17
+            })
+        ));
+        assert!(server.is_err());
+    }
+
+    #[tokio::test]
+    async fn initiator_without_responder_epoch_returns_peer_too_far_behind_before_noise() {
+        let client = ring_at(
+            17,
+            (1..=17).map(|epoch| (epoch, [epoch as u8; 32])).collect(),
+        );
+        let server = ring_at(0, BTreeMap::from([(0, [0; 32])]));
+        let (client, server) = connected_pair_result(client, server).await;
+        assert!(matches!(
+            client,
+            Err(TransportError::PeerTooFarBehind { peer_epoch: 0 })
+        ));
+        assert!(server.is_err());
+    }
+
+    #[tokio::test]
+    async fn responder_rejects_an_unknown_epoch() {
+        let client = ring_at(1, BTreeMap::from([(1, [1; 32])]));
+        let server = ring_at(2, BTreeMap::from([(0, [0; 32]), (2, [2; 32])]));
+        let (client, server) = connected_pair_result(client, server).await;
+        assert!(client.is_err());
+        assert!(matches!(server, Err(TransportError::UnknownGroup)));
     }
 
     #[tokio::test]
@@ -463,7 +647,13 @@ mod tests {
         let client_ring = ring([0x5a; 32], [0x6b; 32]);
         let server_ring = ring([0x5a; 32], [0x6b; 32]);
         let mut server_ring = server_ring;
-        server_ring.groups.get_mut(&GROUP_A).unwrap()[0] ^= 1;
+        server_ring
+            .groups
+            .get_mut(&GROUP_A)
+            .unwrap()
+            .keys
+            .get_mut(&0)
+            .unwrap()[0] ^= 1;
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
@@ -485,7 +675,10 @@ mod tests {
             accept_io(Box::new(server), &ring, Duration::from_secs(1)).await
         });
         let mut client = client;
-        client.write_all(b"NOPE\x01\x00\x00\x00\x00").await.unwrap();
+        client
+            .write_all(b"NOPE\x02\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00")
+            .await
+            .unwrap();
         assert!(matches!(
             accept.await.unwrap(),
             Err(TransportError::BadPreface)
@@ -510,7 +703,13 @@ mod tests {
         assert_eq!(key.len(), 32);
         let keys = KeyRing {
             static_private: key,
-            groups: HashMap::from([(GROUP_A, [0xa5; 32])]),
+            groups: HashMap::from([(
+                GROUP_A,
+                GroupKeys {
+                    current: 0,
+                    keys: BTreeMap::from([(0, [0xa5; 32])]),
+                },
+            )]),
         };
         let debug = format!("{keys:?}");
         assert!(debug.contains("static_private: \"[REDACTED]\""));
