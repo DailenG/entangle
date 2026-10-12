@@ -708,6 +708,6 @@
   reduced.addEventListener && reduced.addEventListener("change", start);
 
   buildPicker();
-  var initial = params.get("d") || store.get("entangle.direction") || "singlet";
+  var initial = params.get("d") || store.get("entangle.direction") || "quadrant";
   apply(initial, false);
 })();
