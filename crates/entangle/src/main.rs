@@ -1045,6 +1045,7 @@ fn is_terminal_join_error(error: &InviteError) -> bool {
             | InviteError::Declined { .. }
             | InviteError::Incomplete
             | InviteError::Group(groups::GroupError::MissingIdentity(_))
+            | InviteError::Group(groups::GroupError::Conflict { .. })
     )
 }
 
@@ -1077,6 +1078,9 @@ fn write_join_failure(output: &mut dyn Write, error: InviteError) -> Result<i32>
         InviteError::Group(groups::GroupError::MissingIdentity(path)) => {
             let error = groups::GroupError::MissingIdentity(path);
             writeln!(output, "{error}")?;
+        }
+        InviteError::Group(groups::GroupError::Conflict { name }) => {
+            writeln!(output, "{name} changed while joining; run the invite again")?;
         }
         InviteError::Incomplete => writeln!(
             output,
@@ -1256,6 +1260,25 @@ mod tests {
             group_command(cli),
             GroupCommand::Admin { name, member } if name == "work" && member == "pc-b"
         ));
+    }
+
+    #[test]
+    fn join_conflict_prints_the_retry_message_without_a_generic_prefix() {
+        let mut output = Vec::new();
+        assert_eq!(
+            write_join_failure(
+                &mut output,
+                InviteError::Group(groups::GroupError::Conflict {
+                    name: "work".into(),
+                }),
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            String::from_utf8(output).unwrap(),
+            "work changed while joining; run the invite again\n"
+        );
     }
 
     #[test]

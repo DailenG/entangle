@@ -4441,8 +4441,11 @@ mod tests {
         assert!(joined.refreshed);
         assert_eq!(joined.group.meta.epoch, 18);
         assert_eq!(joined.group.meta.name, "local-work");
-        assert!(joined.group.retained_keys.is_empty());
-        assert!(joined.group.updates.is_empty());
+        assert_eq!(joined.group.retained_keys.len(), 16);
+        assert_eq!(joined.group.retained_keys.keys().next(), Some(&2));
+        assert_eq!(joined.group.updates.len(), 17);
+        assert_eq!(joined.group.updates.first().unwrap().epoch, 2);
+        assert_eq!(joined.group.updates.last().unwrap().epoch, 18);
         let mut output = Vec::new();
         crate::write_join_success(&mut output, joined).unwrap();
         assert_eq!(
@@ -4482,6 +4485,149 @@ mod tests {
 
         a.shutdown().await;
         b.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn refreshed_member_relays_history_to_an_older_member() {
+        let temp = tempfile::tempdir().unwrap();
+        let root_a = temp.path().join("a");
+        let root_b = temp.path().join("b");
+        let root_c = temp.path().join("c");
+        let key = [0x67; 32];
+        let (id_a, private_a) = saved_identity(&root_a);
+        let (id_b, private_b) = saved_identity(&root_b);
+        let (id_c, private_c) = saved_identity(&root_c);
+        let members = vec![
+            test_member(&id_a, "particle-a", &private_a, id_a.as_str()),
+            test_member(&id_b, "particle-b", &private_b, id_a.as_str()),
+            test_member(&id_c, "particle-c", &private_c, id_a.as_str()),
+        ];
+        for (root, role) in [
+            (&root_a, groups::Role::Admin),
+            (&root_b, groups::Role::Member),
+            (&root_c, groups::Role::Member),
+        ] {
+            insert_test_group(root, "work", key, members.clone(), role);
+        }
+        let group_id = groups::group_id(&key);
+        groups::issue_update(
+            &root_a,
+            &group_id,
+            entangle_core::UpdateKind::Rekey,
+            &private_a,
+        )
+        .unwrap();
+        let second = groups::issue_update(
+            &root_a,
+            &group_id,
+            entangle_core::UpdateKind::Rekey,
+            &private_a,
+        )
+        .unwrap();
+        groups::apply_updates(&root_c, &group_id, &second.updates, None).unwrap();
+        for _ in 0..16 {
+            groups::issue_update(
+                &root_a,
+                &group_id,
+                entangle_core::UpdateKind::Rekey,
+                &private_a,
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            groups::find(&root_c, &group_id)
+                .unwrap()
+                .unwrap()
+                .meta
+                .epoch,
+            2
+        );
+
+        let invite = crate::invite::protocol::InviteServer::new(
+            &root_a,
+            group_id.clone(),
+            "particle-a".into(),
+            crate::invite::code::InviteCode::parse("7-amber-photon-quasar").unwrap(),
+            1,
+            Duration::from_secs(30),
+        )
+        .unwrap();
+        let (joiner, inviter) = tokio::io::duplex(1024 * 1024);
+        let invite_task = tokio::spawn(async move { invite.handle(inviter).await });
+        let joined = crate::invite::protocol::join(
+            joiner,
+            &root_b,
+            crate::invite::code::InviteCode::parse("7-amber-photon-quasar").unwrap(),
+            None,
+            "particle-b",
+        )
+        .await
+        .unwrap();
+        invite_task.await.unwrap().unwrap();
+        assert_eq!(joined.group.meta.epoch, 18);
+        assert_eq!(joined.group.retained_keys.get(&2), Some(&second.key));
+        assert_eq!(joined.group.updates.first().unwrap().epoch, 2);
+        assert_eq!(joined.group.updates.last().unwrap().epoch, 18);
+
+        let b_port = free_port();
+        let c_port = port_other_than(b_port);
+        let mut options_b = options("particle-b", b_port, root_b.clone(), None);
+        options_b.no_mdns = true;
+        let mut options_c = options(
+            "particle-c",
+            c_port,
+            root_c.clone(),
+            Some(format!("127.0.0.1:{b_port}")),
+        );
+        options_c.no_mdns = true;
+        let (b, _) = Particle::start(options_b, None).await.unwrap();
+        let (c, _) = Particle::start(options_c, None).await.unwrap();
+        assert!(
+            c.dial(
+                Route::Direct(SocketAddr::from(([127, 0, 0, 1], b.manifest.link_port))),
+                None,
+            )
+            .await
+        );
+        tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                let caught_up = c
+                    .groups
+                    .read()
+                    .unwrap()
+                    .iter()
+                    .any(|group| group.id == group_id && group.meta.epoch == 18);
+                let b_linked = b
+                    .field
+                    .read()
+                    .unwrap()
+                    .by_id(&c.manifest.particle_id)
+                    .is_some_and(|peer| peer.state == PeerState::Entangled);
+                let c_linked = c
+                    .field
+                    .read()
+                    .unwrap()
+                    .by_id(&b.manifest.particle_id)
+                    .is_some_and(|peer| peer.state == PeerState::Entangled);
+                if caught_up && b_linked && c_linked {
+                    break;
+                }
+                sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("the refreshed member should relay its update history to C");
+        let delivered = c
+            .sync_state(json!({
+                "particle_id": id_b.as_str(),
+                "state": { "message": "caught up through refreshed member" }
+            }))
+            .await
+            .unwrap();
+        assert_eq!(delivered["delivered"], true);
+
+        b.shutdown().await;
+        c.shutdown().await;
     }
 
     #[tokio::test]

@@ -425,6 +425,12 @@ impl InviteServer {
                     admin_sign_key: proposed.meta.admin_sign_key,
                     revoked: proposed.meta.revoked,
                     members: proposed.members,
+                    retained_keys: proposed
+                        .retained_keys
+                        .into_iter()
+                        .map(|(epoch, key)| (epoch, hex::encode(key)))
+                        .collect(),
+                    updates: proposed.updates,
                 },
             )
             .await?;
@@ -478,6 +484,8 @@ enum Message {
         admin_sign_key: String,
         revoked: Vec<entangle_core::Revocation>,
         members: Vec<Member>,
+        retained_keys: Vec<(u32, String)>,
+        updates: Vec<entangle_core::GroupUpdate>,
     },
     Done,
     Committed,
@@ -510,7 +518,25 @@ pub struct Joined {
 
 enum JoinMutation {
     Inserted(String),
-    Refreshed(Box<Group>),
+    Refreshed {
+        previous: Box<Group>,
+        installed_epoch: u32,
+        installed_key: [u8; 32],
+    },
+}
+
+struct GroupGrant {
+    group_id: String,
+    name: String,
+    key_hex: String,
+    created_at: String,
+    epoch: u32,
+    admin: String,
+    admin_sign_key: String,
+    revoked: Vec<entangle_core::Revocation>,
+    members: Vec<Member>,
+    retained_keys: Vec<(u32, String)>,
+    updates: Vec<entangle_core::GroupUpdate>,
 }
 
 /// Joins an inviter over an arbitrary byte stream.
@@ -581,8 +607,17 @@ where
                         Ok(_) | Err(GroupError::NotFound(_)) => Err(InviteError::Incomplete),
                         Err(error) => Err(error.into()),
                     },
-                    JoinMutation::Refreshed(previous) => {
-                        match groups::replace_existing(root, *previous) {
+                    JoinMutation::Refreshed {
+                        previous,
+                        installed_epoch,
+                        installed_key,
+                    } => {
+                        match groups::restore_existing_if_unchanged(
+                            root,
+                            *previous,
+                            installed_epoch,
+                            installed_key,
+                        ) {
                             Ok(_) => Err(InviteError::Incomplete),
                             Err(error) => Err(error.into()),
                         }
@@ -608,6 +643,7 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let (id, static_private) = identity;
+    let local_groups = groups::list(root)?;
     let (spake, local_msg) = Spake2::<Ed25519Group>::start_b(
         &Password::new(code.to_string().as_bytes()),
         &Identity::new(ID_INVITER),
@@ -644,7 +680,6 @@ where
                 )))
             }
         };
-    let local_groups = groups::list(root)?;
     let existing_group = local_groups
         .iter()
         .find(|group| group.id == group_id)
@@ -703,7 +738,7 @@ where
             });
         }
         Message::JoinGrant {
-            group_id: granted_group_id,
+            group_id,
             name,
             key_hex,
             created_at,
@@ -712,8 +747,10 @@ where
             admin_sign_key,
             revoked,
             members,
-        } => (
-            granted_group_id,
+            retained_keys,
+            updates,
+        } => GroupGrant {
+            group_id,
             name,
             key_hex,
             created_at,
@@ -722,57 +759,89 @@ where
             admin_sign_key,
             revoked,
             members,
-        ),
+            retained_keys,
+            updates,
+        },
         message => {
             return Err(InviteError::Message(format!(
                 "expected join grant, got {message:?}"
             )))
         }
     };
-    if grant.0 != group_id
-        || grant.1 != name
-        || grant.2.len() != 64
+    if grant.group_id != group_id
+        || grant.name != name
+        || grant.key_hex.len() != 64
         || !grant
-            .2
+            .key_hex
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
     {
         return Err(InviteError::Message("invalid join grant".into()));
     }
-    let key: [u8; 32] = hex::decode(&grant.2)
+    let key: [u8; 32] = hex::decode(&grant.key_hex)
         .map_err(|_| InviteError::Message("invalid group key".into()))?
         .try_into()
         .map_err(|_| InviteError::Message("invalid group key".into()))?;
+    let meta = GroupMeta {
+        version: 2,
+        name: local_group_name.to_owned(),
+        created_at: grant.created_at.clone(),
+        epoch: grant.epoch,
+        admin: grant.admin.clone(),
+        admin_sign_key: grant.admin_sign_key.clone(),
+        revoked: grant.revoked.clone(),
+        leaving: false,
+    };
+    let known_predecessor = existing_group.as_ref().and_then(|previous| {
+        let next_epoch = previous.meta.epoch.checked_add(1)?;
+        grant
+            .updates
+            .first()
+            .filter(|update| update.epoch == next_epoch)
+            .map(|_| {
+                (
+                    previous.meta.admin.as_str(),
+                    previous.meta.admin_sign_key.as_str(),
+                )
+            })
+    });
+    let mut retained_keys = groups::validate_join_history(
+        &grant.group_id,
+        &meta,
+        &key,
+        &grant.retained_keys,
+        &grant.updates,
+        known_predecessor,
+    )?;
     let group = Group {
-        id: grant.0,
+        id: grant.group_id,
         key,
-        meta: GroupMeta {
-            version: 2,
-            name: local_group_name.to_owned(),
-            created_at: grant.3,
-            epoch: grant.4,
-            admin: grant.5,
-            admin_sign_key: grant.6,
-            revoked: grant.7,
-            leaving: false,
+        meta,
+        members: grant.members,
+        retained_keys: {
+            if let Some(previous) = existing_group.as_ref().filter(|_| refresh_existing) {
+                groups::merge_previous_retained_keys(&mut retained_keys, previous);
+            }
+            retained_keys
         },
-        members: grant.8,
-        retained_keys: Default::default(),
-        updates: Vec::new(),
+        updates: grant.updates,
         outdated: false,
     };
     let group = if refresh_existing {
-        let previous = groups::replace_existing(root, group.clone())?;
-        *mutation = Some(JoinMutation::Refreshed(Box::new(previous)));
+        let expected_epoch = existing_group
+            .as_ref()
+            .expect("refresh requires an existing group")
+            .meta
+            .epoch;
+        let previous = groups::replace_existing(root, group.clone(), expected_epoch)?;
+        *mutation = Some(JoinMutation::Refreshed {
+            previous: Box::new(previous),
+            installed_epoch: group.meta.epoch,
+            installed_key: group.key,
+        });
         group
     } else {
-        let inserted = groups::insert_with_id(
-            root,
-            group.id.clone(),
-            group.key,
-            group.meta.clone(),
-            group.members.clone(),
-        )?;
+        let inserted = groups::insert_group(root, group.clone())?;
         *mutation = Some(JoinMutation::Inserted(inserted.id.clone()));
         inserted
     };

@@ -90,6 +90,8 @@ pub enum GroupError {
     NotFound(String),
     #[error("group {name} was created by Entangle 0.6; run `entangle group leave {name}` and create it again")]
     Outdated { name: String },
+    #[error("{name} changed while joining; run the invite again")]
+    Conflict { name: String },
     #[error("could not generate a unique group ID after 16 key attempts")]
     IdCollision,
     #[error("group member key conflicts for particle {0}")]
@@ -282,38 +284,53 @@ pub fn insert_with_id(
     meta: GroupMeta,
     members: Vec<Member>,
 ) -> Result<Group, GroupError> {
-    validate_meta(&meta, root)?;
-    validate_members(&members, root)?;
-    validate_admin_member(&meta, &members, root)?;
-    let _lock = lock_groups(root)?;
-    let existing = read_groups_unlocked(root)?;
-    ensure_available(&existing, &meta.name)?;
-    if existing.len() >= MAX_GROUPS {
-        return Err(GroupError::TooMany);
-    }
-    if !is_group_id(&id) {
+    insert_group(
+        root,
+        Group {
+            id,
+            key,
+            meta,
+            members,
+            retained_keys: BTreeMap::new(),
+            updates: Vec::new(),
+            outdated: false,
+        },
+    )
+}
+
+pub fn insert_group(root: &Path, group: Group) -> Result<Group, GroupError> {
+    validate_meta(&group.meta, root)?;
+    validate_members(&group.members, root)?;
+    validate_admin_member(&group.meta, &group.members, root)?;
+    if !is_group_id(&group.id) {
         return Err(GroupError::malformed(
             Path::new("group ID"),
             "directory name is not an eight-character group ID",
         ));
     }
-    if existing.iter().any(|group| group.id == id) {
-        return Err(GroupError::AlreadyMember(id));
+    if group.retained_keys.len() > RETAINED_LIMIT || group.updates.len() > RETAINED_UPDATE_LIMIT {
+        return Err(GroupError::InvalidUpdate(
+            "too many retained group keys or updates".into(),
+        ));
     }
-    let group = Group {
-        id,
-        key,
-        meta,
-        members,
-        retained_keys: BTreeMap::new(),
-        updates: Vec::new(),
-        outdated: false,
-    };
+    let _lock = lock_groups(root)?;
+    let existing = read_groups_unlocked(root)?;
+    ensure_available(&existing, &group.meta.name)?;
+    if existing.len() >= MAX_GROUPS {
+        return Err(GroupError::TooMany);
+    }
+    if existing.iter().any(|existing| existing.id == group.id) {
+        return Err(GroupError::AlreadyMember(group.id));
+    }
     write_group(root, &group)?;
     Ok(group)
 }
 
-pub fn replace_existing(root: &Path, mut group: Group) -> Result<Group, GroupError> {
+pub fn replace_existing(
+    root: &Path,
+    mut group: Group,
+    expected_epoch: u32,
+) -> Result<Group, GroupError> {
     if !is_group_id(&group.id) {
         return Err(GroupError::NotFound(group.id));
     }
@@ -322,15 +339,44 @@ pub fn replace_existing(root: &Path, mut group: Group) -> Result<Group, GroupErr
     let previous = read_groups_unlocked(root)?
         .into_iter()
         .find(|existing| existing.id == group.id)
-        .ok_or_else(|| GroupError::NotFound(group.id.clone()))?;
+        .ok_or_else(|| GroupError::Conflict {
+            name: group.meta.name.clone(),
+        })?;
     if previous.outdated {
         return Err(GroupError::Outdated {
+            name: previous.meta.name,
+        });
+    }
+    if previous.meta.epoch != expected_epoch {
+        return Err(GroupError::Conflict {
             name: previous.meta.name,
         });
     }
     group.meta.name = previous.meta.name.clone();
     write_group(root, &group)?;
     Ok(previous)
+}
+
+pub fn restore_existing_if_unchanged(
+    root: &Path,
+    previous: Group,
+    installed_epoch: u32,
+    installed_key: [u8; 32],
+) -> Result<(), GroupError> {
+    let _lock = lock_groups(root)?;
+    cleanup_transaction_dirs(&groups_dir(root))?;
+    let current = read_groups_unlocked(root)?
+        .into_iter()
+        .find(|existing| existing.id == previous.id)
+        .ok_or_else(|| GroupError::Conflict {
+            name: previous.meta.name.clone(),
+        })?;
+    if current.outdated || current.meta.epoch != installed_epoch || current.key != installed_key {
+        return Err(GroupError::Conflict {
+            name: current.meta.name,
+        });
+    }
+    write_group(root, &previous)
 }
 
 #[allow(dead_code)]
@@ -650,8 +696,116 @@ fn validate_update(group: &Group, update: &GroupUpdate) -> Result<(), GroupError
             "admin signing key changed without a handoff".into(),
         ));
     }
-    let verifying_key_bytes = hex::decode(&group.meta.admin_sign_key)
+    verify_update_signature(update, &group.meta.admin_sign_key)?;
+    decode_key(&update.key_hex, Path::new("updates.json"))?;
+    Ok(())
+}
+
+pub(crate) fn validate_join_history(
+    group_id: &str,
+    meta: &GroupMeta,
+    current_key: &[u8; 32],
+    retained_keys: &[(u32, String)],
+    updates: &[GroupUpdate],
+    predecessor: Option<(&str, &str)>,
+) -> Result<BTreeMap<u32, [u8; 32]>, GroupError> {
+    if retained_keys.len() > RETAINED_LIMIT {
+        return Err(GroupError::InvalidUpdate(
+            "too many retained group keys".into(),
+        ));
+    }
+    if updates.len() > RETAINED_UPDATE_LIMIT {
+        return Err(GroupError::InvalidUpdate(
+            "too many retained group updates".into(),
+        ));
+    }
+
+    let mut keys = BTreeMap::new();
+    for (epoch, key_hex) in retained_keys {
+        if *epoch >= meta.epoch {
+            return Err(GroupError::InvalidUpdate(
+                "retained key epoch is not below the grant epoch".into(),
+            ));
+        }
+        let key = decode_key(key_hex, Path::new("JoinGrant retained key"))
+            .map_err(|error| GroupError::InvalidUpdate(error.to_string()))?;
+        if keys.insert(*epoch, key).is_some() {
+            return Err(GroupError::InvalidUpdate(
+                "duplicate retained key epoch".into(),
+            ));
+        }
+    }
+
+    if updates.is_empty() {
+        if meta.epoch != 0 || !keys.is_empty() {
+            return Err(GroupError::InvalidUpdate(
+                "join grant has incomplete update history".into(),
+            ));
+        }
+        return Ok(keys);
+    }
+
+    for (index, update) in updates.iter().enumerate() {
+        if update.group_id != group_id {
+            return Err(GroupError::InvalidUpdate("group ID mismatch".into()));
+        }
+        if update.epoch == 0
+            || (index > 0 && updates[index - 1].epoch.checked_add(1) != Some(update.epoch))
+        {
+            return Err(GroupError::InvalidUpdate(
+                "join grant updates are not contiguous".into(),
+            ));
+        }
+        decode_key(&update.key_hex, Path::new("JoinGrant update"))
+            .map_err(|error| GroupError::InvalidUpdate(error.to_string()))?;
+        let known_predecessor = if index == 0 {
+            predecessor
+        } else {
+            let previous = &updates[index - 1];
+            Some((previous.admin.as_str(), previous.admin_sign_key.as_str()))
+        };
+        if let Some((admin, signing_key)) = known_predecessor {
+            if update.issued_by != admin {
+                return Err(GroupError::InvalidUpdate(
+                    "update issuer does not match the previous admin".into(),
+                ));
+            }
+            verify_update_signature(update, signing_key)?;
+        }
+    }
+
+    let latest = updates.last().expect("nonempty update history");
+    let latest_key = decode_key(&latest.key_hex, Path::new("JoinGrant update"))
         .map_err(|error| GroupError::InvalidUpdate(error.to_string()))?;
+    if latest.epoch != meta.epoch
+        || latest_key != *current_key
+        || latest.admin != meta.admin
+        || latest.admin_sign_key != meta.admin_sign_key
+        || latest.revoked != meta.revoked
+    {
+        return Err(GroupError::InvalidUpdate(
+            "latest update does not match the group grant".into(),
+        ));
+    }
+    Ok(keys)
+}
+
+pub(crate) fn merge_previous_retained_keys(
+    retained_keys: &mut BTreeMap<u32, [u8; 32]>,
+    previous: &Group,
+) {
+    for (epoch, key) in &previous.retained_keys {
+        retained_keys.entry(*epoch).or_insert(*key);
+    }
+    retained_keys
+        .entry(previous.meta.epoch)
+        .or_insert(previous.key);
+    trim_oldest(retained_keys);
+}
+
+fn verify_update_signature(update: &GroupUpdate, signing_key: &str) -> Result<(), GroupError> {
+    let verifying_key_bytes =
+        hex::decode(signing_key).map_err(|error| GroupError::InvalidUpdate(error.to_string()))?;
     let verifying_key_bytes: [u8; 32] = verifying_key_bytes
         .try_into()
         .map_err(|_| GroupError::InvalidUpdate("invalid admin signing key length".into()))?;
@@ -663,9 +817,7 @@ fn validate_update(group: &Group, update: &GroupUpdate) -> Result<(), GroupError
         .map_err(|error| GroupError::InvalidUpdate(error.to_string()))?;
     verifying_key
         .verify(&update_signing_bytes(update)?, &signature)
-        .map_err(|error| GroupError::InvalidUpdate(error.to_string()))?;
-    decode_key(&update.key_hex, Path::new("updates.json"))?;
-    Ok(())
+        .map_err(|error| GroupError::InvalidUpdate(error.to_string()))
 }
 
 fn update_signing_bytes(update: &GroupUpdate) -> Result<Vec<u8>, GroupError> {
@@ -1503,6 +1655,254 @@ mod tests {
                 .unwrap()
                 .epoch,
             2
+        );
+    }
+
+    #[test]
+    fn replacement_conflicts_with_an_update_after_the_joiner_read() {
+        let admin_root = tempdir().unwrap();
+        let joiner_root = tempdir().unwrap();
+        let admin = saved_identity(admin_root.path());
+        let joiner = saved_identity(joiner_root.path());
+        let group = insert(
+            admin_root.path(),
+            [0x48; 32],
+            group_meta("work", &admin),
+            vec![admin.clone(), joiner],
+        )
+        .unwrap();
+        let mut local_meta = group.meta.clone();
+        local_meta.name = "local-work".into();
+        insert_with_id(
+            joiner_root.path(),
+            group.id.clone(),
+            group.key,
+            local_meta,
+            group.members.clone(),
+        )
+        .unwrap();
+        let read_at_start = find(joiner_root.path(), &group.id).unwrap().unwrap();
+        let private = identity::read_saved(admin_root.path()).unwrap().unwrap().1;
+        let updated =
+            issue_update(admin_root.path(), &group.id, UpdateKind::Rekey, &private).unwrap();
+        apply_updates(
+            joiner_root.path(),
+            &group.id,
+            &updated.updates,
+            Some(&admin),
+        )
+        .unwrap();
+        let inviter_group = find(admin_root.path(), &group.id).unwrap().unwrap();
+
+        assert!(matches!(
+            replace_existing(
+                joiner_root.path(),
+                inviter_group,
+                read_at_start.meta.epoch
+            ),
+            Err(GroupError::Conflict { name }) if name == "local-work"
+        ));
+        assert_eq!(
+            find(joiner_root.path(), &group.id)
+                .unwrap()
+                .unwrap()
+                .meta
+                .epoch,
+            updated.meta.epoch
+        );
+        assert_eq!(
+            find(joiner_root.path(), &group.id).unwrap().unwrap().key,
+            updated.key
+        );
+    }
+
+    #[test]
+    fn join_history_checks_epochs_signatures_and_retention_limits() {
+        let root = tempdir().unwrap();
+        let admin = saved_identity(root.path());
+        let group = insert(
+            root.path(),
+            [0x4a; 32],
+            group_meta("work", &admin),
+            vec![admin.clone()],
+        )
+        .unwrap();
+        let private = identity::read_saved(root.path()).unwrap().unwrap().1;
+        issue_update(root.path(), &group.id, UpdateKind::Rekey, &private).unwrap();
+        let current = issue_update(root.path(), &group.id, UpdateKind::Rekey, &private).unwrap();
+        let retained = current
+            .retained_keys
+            .iter()
+            .map(|(epoch, key)| (*epoch, hex::encode(key)))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            validate_join_history(
+                &current.id,
+                &current.meta,
+                &current.key,
+                &retained,
+                &current.updates,
+                Some((&group.meta.admin, &group.meta.admin_sign_key)),
+            )
+            .unwrap(),
+            current.retained_keys
+        );
+
+        let mut unknown_first_signature = current.updates.clone();
+        unknown_first_signature[0].signature = "00".repeat(64);
+        assert!(validate_join_history(
+            &current.id,
+            &current.meta,
+            &current.key,
+            &retained,
+            &unknown_first_signature,
+            None,
+        )
+        .is_ok());
+        assert!(validate_join_history(
+            &current.id,
+            &current.meta,
+            &current.key,
+            &retained,
+            &unknown_first_signature,
+            Some((&group.meta.admin, &group.meta.admin_sign_key)),
+        )
+        .is_err());
+
+        let mut bad_signature = current.updates.clone();
+        bad_signature[1].signature = "00".repeat(64);
+        assert!(validate_join_history(
+            &current.id,
+            &current.meta,
+            &current.key,
+            &retained,
+            &bad_signature,
+            None,
+        )
+        .is_err());
+        let mut gap = current.updates.clone();
+        gap[1].epoch += 1;
+        assert!(validate_join_history(
+            &current.id,
+            &current.meta,
+            &current.key,
+            &retained,
+            &gap,
+            None,
+        )
+        .is_err());
+        assert!(validate_join_history(
+            &current.id,
+            &current.meta,
+            &current.key,
+            &retained,
+            &current.updates[..1],
+            None,
+        )
+        .is_err());
+        let mut wrong_group = current.updates.clone();
+        wrong_group[1].group_id = "deadbeef".into();
+        assert!(validate_join_history(
+            &current.id,
+            &current.meta,
+            &current.key,
+            &retained,
+            &wrong_group,
+            None,
+        )
+        .is_err());
+        assert!(validate_join_history(
+            &current.id,
+            &current.meta,
+            &current.key,
+            &[(current.meta.epoch, hex::encode(current.key))],
+            &current.updates,
+            None,
+        )
+        .is_err());
+        assert!(validate_join_history(
+            &current.id,
+            &current.meta,
+            &current.key,
+            &vec![(0, hex::encode([0x50; 32])); RETAINED_LIMIT + 1],
+            &current.updates,
+            None,
+        )
+        .is_err());
+        assert!(validate_join_history(
+            &current.id,
+            &current.meta,
+            &current.key,
+            &retained,
+            &vec![current.updates[0].clone(); RETAINED_UPDATE_LIMIT + 1],
+            None,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn rollback_does_not_overwrite_an_update_after_the_grant_was_installed() {
+        let admin_root = tempdir().unwrap();
+        let joiner_root = tempdir().unwrap();
+        let admin = saved_identity(admin_root.path());
+        let joiner = saved_identity(joiner_root.path());
+        let group = insert(
+            admin_root.path(),
+            [0x49; 32],
+            group_meta("work", &admin),
+            vec![admin.clone(), joiner],
+        )
+        .unwrap();
+        let mut local_meta = group.meta.clone();
+        local_meta.name = "local-work".into();
+        insert_with_id(
+            joiner_root.path(),
+            group.id.clone(),
+            group.key,
+            local_meta,
+            group.members.clone(),
+        )
+        .unwrap();
+        let snapshot = find(joiner_root.path(), &group.id).unwrap().unwrap();
+        let admin_private = identity::read_saved(admin_root.path()).unwrap().unwrap().1;
+        let grant = issue_update(
+            admin_root.path(),
+            &group.id,
+            UpdateKind::Rekey,
+            &admin_private,
+        )
+        .unwrap();
+        let previous =
+            replace_existing(joiner_root.path(), grant.clone(), snapshot.meta.epoch).unwrap();
+        assert_eq!(previous.meta.name, "local-work");
+
+        let concurrent = issue_update(
+            admin_root.path(),
+            &group.id,
+            UpdateKind::Rekey,
+            &admin_private,
+        )
+        .unwrap();
+        apply_updates(
+            joiner_root.path(),
+            &group.id,
+            &[concurrent.updates.last().unwrap().clone()],
+            Some(&admin),
+        )
+        .unwrap();
+        let concurrent_state = find(joiner_root.path(), &group.id).unwrap().unwrap();
+        assert!(matches!(
+            restore_existing_if_unchanged(
+                joiner_root.path(),
+                previous,
+                grant.meta.epoch,
+                grant.key
+            ),
+            Err(GroupError::Conflict { name }) if name == "local-work"
+        ));
+        assert_eq!(
+            find(joiner_root.path(), &group.id).unwrap().unwrap(),
+            concurrent_state
         );
     }
 
