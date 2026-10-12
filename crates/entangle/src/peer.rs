@@ -60,7 +60,7 @@ fn human_only(command: &PeerCommand) -> bool {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-enum KeyOutcome {
+pub(crate) enum KeyOutcome {
     Pick(u8),
     Cancel,
     Invalid,
@@ -71,11 +71,7 @@ fn classify_key(code: KeyCode, modifiers: KeyModifiers) -> KeyOutcome {
     match code {
         KeyCode::Esc => KeyOutcome::Cancel,
         KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => KeyOutcome::Cancel,
-        KeyCode::Char('1') => KeyOutcome::Pick(1),
-        KeyCode::Char('2') => KeyOutcome::Pick(2),
-        KeyCode::Char('3') => KeyOutcome::Pick(3),
-        KeyCode::Char('4') => KeyOutcome::Pick(4),
-        KeyCode::Char('5') => KeyOutcome::Pick(5),
+        KeyCode::Char(value @ '1'..='9') => KeyOutcome::Pick(value as u8 - b'0'),
         _ => KeyOutcome::Invalid,
     }
 }
@@ -102,17 +98,18 @@ impl Drop for RawModeGuard {
     }
 }
 
-fn read_approval_key() -> Result<KeyOutcome> {
+pub(crate) fn read_approval_key(max: u8) -> Result<KeyOutcome> {
     let _raw_mode = RawModeGuard::enter()?;
     loop {
         match classify_event(read()?) {
             KeyOutcome::Ignore => continue,
+            KeyOutcome::Pick(value) if value > max => return Ok(KeyOutcome::Invalid),
             outcome => return Ok(outcome),
         }
     }
 }
 
-fn cancel_approval(output: &mut dyn Write) -> Result<i32> {
+pub(crate) fn cancel_approval(output: &mut dyn Write) -> Result<i32> {
     writeln!(output, "\r\nCancelled; nothing was approved or denied.")?;
     Ok(1)
 }
@@ -379,7 +376,7 @@ fn approve(
     let choice = loop {
         write!(output, "Press 1-5: ")?;
         output.flush()?;
-        match read_approval_key()? {
+        match read_approval_key(5)? {
             KeyOutcome::Pick(value) => {
                 writeln!(output, "{value}")?;
                 break usize::from(value);
@@ -497,17 +494,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn approval_keypresses_select_digits_one_through_five() {
-        for (code, selection) in [
-            (KeyCode::Char('1'), 1),
-            (KeyCode::Char('2'), 2),
-            (KeyCode::Char('3'), 3),
-            (KeyCode::Char('4'), 4),
-            (KeyCode::Char('5'), 5),
-        ] {
+    fn approval_keypresses_classify_digits_one_through_nine() {
+        for digit in 1..=9 {
             assert_eq!(
-                classify_key(code, KeyModifiers::NONE),
-                KeyOutcome::Pick(selection)
+                classify_key(KeyCode::Char(char::from(b'0' + digit)), KeyModifiers::NONE),
+                KeyOutcome::Pick(digit)
             );
         }
     }
@@ -524,7 +515,6 @@ mod tests {
         );
         for code in [
             KeyCode::Char('0'),
-            KeyCode::Char('6'),
             KeyCode::Char('a'),
             KeyCode::Char('c'),
             KeyCode::Char('z'),

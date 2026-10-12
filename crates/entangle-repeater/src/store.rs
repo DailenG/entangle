@@ -37,7 +37,7 @@ pub enum StoreError {
 }
 
 /// An enrolled repeater device.
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct Device {
     /// Optional operator-supplied enrollment label.
     pub label: Option<String>,
@@ -45,6 +45,9 @@ pub struct Device {
     pub enrolled_at: String,
     /// Whether the repeater must refuse this device.
     pub revoked: bool,
+    /// Whether the host explicitly denied an enrollment request.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub denied: bool,
 }
 
 /// Persistent repeater device allowlist.
@@ -72,6 +75,21 @@ pub struct InviteRecord {
 pub struct Invites {
     /// Available and previously consumed invitation records.
     pub invites: Vec<InviteRecord>,
+}
+
+/// A device awaiting host approval to enroll.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct EnrollmentRequest {
+    /// Lowercase hex encoding of the device's authenticated static public key.
+    pub key: String,
+    /// Optional operator-supplied device label.
+    pub label: Option<String>,
+    /// Source IP address of the request.
+    pub source: String,
+    /// RFC 3339 request admission time.
+    pub requested_at: String,
+    /// The three-symbol short authentication string.
+    pub sas: [u8; 3],
 }
 
 /// Metadata used by the server to detect device-file changes.
@@ -143,6 +161,39 @@ impl Store {
         )
     }
 
+    /// Loads pending enrollment requests, or an empty list if absent.
+    pub fn requests(&self) -> Result<Vec<EnrollmentRequest>, StoreError> {
+        load_json(&self.root.join("requests.json"))
+    }
+
+    /// Atomically replaces the server-owned pending enrollment request list.
+    pub fn save_requests(&self, value: &[EnrollmentRequest]) -> Result<(), StoreError> {
+        atomic_write(
+            &self.root.join("requests.json"),
+            &serde_json::to_vec_pretty(value)?,
+        )
+    }
+
+    /// Writes an approval or denial for an authenticated device key.
+    pub fn decide_device(
+        &self,
+        key: [u8; 32],
+        label: Option<String>,
+        approved: bool,
+    ) -> Result<(), StoreError> {
+        let mut devices = self.devices()?;
+        devices.devices.insert(
+            hex::encode(key),
+            Device {
+                label,
+                enrolled_at: Utc::now().to_rfc3339(),
+                revoked: !approved,
+                denied: !approved,
+            },
+        );
+        self.save_devices(&devices)
+    }
+
     /// Loads invitations, or an empty list if the file is absent.
     pub fn invites(&self) -> Result<Invites, StoreError> {
         load_json(&self.root.join("invites.json"))
@@ -208,6 +259,7 @@ impl Store {
                     label: label.or(invite_label),
                     enrolled_at: now.to_rfc3339(),
                     revoked: false,
+                    denied: false,
                 },
             );
             self.save_devices(&devices)
@@ -403,10 +455,52 @@ mod tests {
                 label: Some("device".into()),
                 enrolled_at: "2026-01-01T00:00:00Z".into(),
                 revoked: false,
+                denied: false,
             },
         );
         store.save_devices(&second).unwrap();
         assert_eq!(store.devices().unwrap().devices.len(), 1);
+    }
+
+    #[test]
+    fn denied_device_field_round_trips_and_old_json_defaults_to_false() {
+        let denied = Device {
+            label: Some("device".into()),
+            enrolled_at: "2026-01-01T00:00:00Z".into(),
+            revoked: true,
+            denied: true,
+        };
+        let encoded = serde_json::to_value(&denied).unwrap();
+        assert_eq!(encoded["denied"], true);
+        assert_eq!(serde_json::from_value::<Device>(encoded).unwrap(), denied);
+
+        let old = serde_json::json!({
+            "label": "device",
+            "enrolled_at": "2026-01-01T00:00:00Z",
+            "revoked": true
+        });
+        let old: Device = serde_json::from_value(old).unwrap();
+        assert!(old.revoked);
+        assert!(!old.denied);
+        assert!(serde_json::to_value(old).unwrap().get("denied").is_none());
+    }
+
+    #[test]
+    fn request_list_uses_private_atomic_store_file() {
+        let root = tempfile::tempdir().unwrap();
+        let root_path = test_root_path(root.path());
+        let store = Store::new(&root_path);
+        let request = EnrollmentRequest {
+            key: hex::encode([7; 32]),
+            label: Some("device".into()),
+            source: "127.0.0.1".into(),
+            requested_at: "2026-01-01T00:00:00Z".into(),
+            sas: [1, 2, 3],
+        };
+        store.save_requests(std::slice::from_ref(&request)).unwrap();
+        assert_eq!(store.requests().unwrap(), vec![request]);
+        store.save_requests(&[]).unwrap();
+        assert!(store.requests().unwrap().is_empty());
     }
 
     #[test]

@@ -7,6 +7,7 @@ use crate::{
         PING, PONG, SESSION_STREAM,
     },
 };
+use entangle_core::sas;
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -36,6 +37,9 @@ const MAX_FAILED_HANDSHAKES: usize = 10;
 const HANDSHAKE_FAILURE_WINDOW: Duration = Duration::from_secs(60);
 const HANDSHAKE_COOLDOWN: Duration = Duration::from_secs(5 * 60);
 const SERVER_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_PENDING_REQUESTS: usize = 8;
+const REQUEST_DECISION_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+const REQUEST_SAS_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Default)]
 struct HandshakeLimiter {
@@ -91,6 +95,7 @@ pub struct ServerConfig {
     pub listen: SocketAddr,
     pub path: String,
     pub root: PathBuf,
+    pub requests: bool,
 }
 
 #[derive(Debug, Error)]
@@ -152,6 +157,14 @@ struct Shared {
     incoming_ids: AtomicU32,
     session_ids: AtomicU64,
     session_gate: Arc<Mutex<()>>,
+    requests: bool,
+    pending_requests: Arc<Mutex<PendingRequests>>,
+}
+
+#[derive(Default)]
+struct PendingRequests {
+    requests: Vec<crate::store::EnrollmentRequest>,
+    reserved_ips: std::collections::HashSet<IpAddr>,
 }
 
 struct SessionContext {
@@ -178,6 +191,19 @@ struct Hello {
     group: Option<String>,
     invite: Option<String>,
     label: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct RequestHello {
+    v: u8,
+    mode: String,
+    label: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Endpoint {
+    Session,
+    Request,
 }
 
 #[cfg(test)]
@@ -208,7 +234,14 @@ fn noise_params() -> NoiseParams {
 /// Binds the configured WebSocket endpoint and serves until Ctrl+C.
 pub async fn serve(config: ServerConfig) -> Result<(), ServerError> {
     let listener = TcpListener::bind(config.listen).await?;
-    serve_with_listener(listener, config.path, config.root, SERVER_HANDSHAKE_TIMEOUT).await
+    serve_with_listener(
+        listener,
+        config.path,
+        config.root,
+        config.requests,
+        SERVER_HANDSHAKE_TIMEOUT,
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -217,24 +250,37 @@ pub(crate) async fn serve_on_listener_with_timeout(
     config: ServerConfig,
     handshake_timeout: Duration,
 ) -> Result<(), ServerError> {
-    serve_with_listener(listener, config.path, config.root, handshake_timeout).await
+    serve_with_listener(
+        listener,
+        config.path,
+        config.root,
+        config.requests,
+        handshake_timeout,
+    )
+    .await
 }
 
 async fn serve_with_listener(
     listener: TcpListener,
     path: String,
     root: PathBuf,
+    requests: bool,
     handshake_timeout: Duration,
 ) -> Result<(), ServerError> {
+    let store = Arc::new(Store::new(root));
+    store.save_requests(&[])?;
     let shared = Arc::new(Shared {
-        store: Arc::new(Store::new(root)),
+        store: Arc::clone(&store),
         peers: Arc::new(Mutex::new(HashMap::new())),
         links: Arc::new(Mutex::new(HashMap::new())),
         handshake_limiter: StdMutex::new(HandshakeLimiter::default()),
         incoming_ids: AtomicU32::new(0x8000_0000),
         session_ids: AtomicU64::new(1),
         session_gate: Arc::new(Mutex::new(())),
+        requests,
+        pending_requests: Arc::new(Mutex::new(PendingRequests::default())),
     });
+    let requests = shared.requests;
     let watcher = spawn_device_watcher(Arc::clone(&shared));
     let shutdown = tokio::signal::ctrl_c();
     tokio::pin!(shutdown);
@@ -255,13 +301,24 @@ async fn serve_with_listener(
                     )
                     .await
                     {
-                        Ok(Ok(Some(headers))) if is_websocket_upgrade(&headers, &path) => headers,
+                        Ok(Ok(Some(headers))) => {
+                            let Some(endpoint) = is_websocket_upgrade(&headers, &path) else {
+                                let _ = write_not_found(&mut stream).await;
+                                return;
+                            };
+                            if endpoint == Endpoint::Request && !requests {
+                                let _ = write_not_found(&mut stream).await;
+                                return;
+                            }
+                            (headers, endpoint)
+                        }
                         Err(_) => return,
                         _ => {
                             let _ = write_not_found(&mut stream).await;
                             return;
                         }
                     };
+                    let (headers, endpoint) = headers;
                     if source_is_blocked(&shared, addr.ip()) {
                         return;
                     }
@@ -274,7 +331,7 @@ async fn serve_with_listener(
                     });
                     match tokio::time::timeout_at(deadline, accept_async(websocket_io)).await {
                         Ok(Ok(ws)) => {
-                            if let Err(error) = handle(ws, addr, shared, deadline).await {
+                            if let Err(error) = handle(ws, addr, shared, deadline, endpoint).await {
                                 tracing::debug!(%error, "repeater connection closed");
                             }
                         }
@@ -319,29 +376,32 @@ where
     Ok(None)
 }
 
-fn is_websocket_upgrade(headers: &[u8], expected_path: &str) -> bool {
+fn is_websocket_upgrade(headers: &[u8], expected_path: &str) -> Option<Endpoint> {
     let Ok(headers) = std::str::from_utf8(headers) else {
-        return false;
+        return None;
     };
     let mut lines = headers.split("\r\n");
-    let Some(request_line) = lines.next() else {
-        return false;
-    };
+    let request_line = lines.next()?;
     let mut request_parts = request_line.split_whitespace();
     let (Some("GET"), Some(target), Some("HTTP/1.1")) = (
         request_parts.next(),
         request_parts.next(),
         request_parts.next(),
     ) else {
-        return false;
+        return None;
     };
     if request_parts.next().is_some() {
-        return false;
+        return None;
     }
     let path = target.split('?').next().unwrap_or(target);
-    if path != expected_path {
-        return false;
-    }
+    let base = expected_path.trim_end_matches('/');
+    let endpoint = if path == expected_path {
+        Endpoint::Session
+    } else if path == format!("{base}/request") {
+        Endpoint::Request
+    } else {
+        return None;
+    };
     let mut upgrade = false;
     let mut connection_upgrade = false;
     let mut key = false;
@@ -372,7 +432,7 @@ fn is_websocket_upgrade(headers: &[u8], expected_path: &str) -> bool {
             _ => {}
         }
     }
-    upgrade && connection_upgrade && key && version && host && bodyless
+    (upgrade && connection_upgrade && key && version && host && bodyless).then_some(endpoint)
 }
 
 async fn write_not_found<S>(stream: &mut S) -> io::Result<()>
@@ -442,6 +502,22 @@ fn record_failed_handshake(shared: &Shared, ip: IpAddr) {
 }
 
 async fn handle<S>(
+    ws: tokio_tungstenite::WebSocketStream<S>,
+    addr: SocketAddr,
+    shared: Arc<Shared>,
+    deadline: tokio::time::Instant,
+    endpoint: Endpoint,
+) -> Result<(), ServerError>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    match endpoint {
+        Endpoint::Session => handle_session(ws, addr, shared, deadline).await,
+        Endpoint::Request => handle_request(ws, addr, shared, deadline).await,
+    }
+}
+
+async fn handle_session<S>(
     mut ws: tokio_tungstenite::WebSocketStream<S>,
     addr: SocketAddr,
     shared: Arc<Shared>,
@@ -600,6 +676,386 @@ where
     drop(peers);
     close_session_links(&shared, session_id).await;
     result
+}
+
+async fn handle_request<S>(
+    mut ws: tokio_tungstenite::WebSocketStream<S>,
+    addr: SocketAddr,
+    shared: Arc<Shared>,
+    deadline: tokio::time::Instant,
+) -> Result<(), ServerError>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let first = match tokio::time::timeout_at(deadline, ws.next()).await {
+        Ok(Some(Ok(Message::Binary(first)))) => first,
+        Err(_) => return Ok(()),
+        _ => {
+            record_failed_handshake(&shared, addr.ip());
+            return Ok(());
+        }
+    };
+    if first.len() > MAX_MESSAGE {
+        record_failed_handshake(&shared, addr.ip());
+        return Ok(());
+    }
+    let private = shared.store.key()?;
+    let mut handshake = Builder::new(request_noise_params())
+        .local_private_key(&private)
+        .map_err(|error| io::Error::other(error.to_string()))?
+        .build_responder()
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    let mut plaintext = vec![0; u16::MAX as usize];
+    if handshake.read_message(&first, &mut plaintext).is_err() {
+        record_failed_handshake(&shared, addr.ip());
+        return Ok(());
+    }
+    let mut response = vec![0; u16::MAX as usize];
+    let response_size = handshake
+        .write_message(&[], &mut response)
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    ws.send(Message::Binary(response[..response_size].to_vec()))
+        .await?;
+    let msg3 = match tokio::time::timeout_at(deadline, ws.next()).await {
+        Ok(Some(Ok(Message::Binary(message)))) => message,
+        _ => {
+            record_failed_handshake(&shared, addr.ip());
+            return Ok(());
+        }
+    };
+    if msg3.len() > MAX_MESSAGE {
+        record_failed_handshake(&shared, addr.ip());
+        return Ok(());
+    }
+    let size = match handshake.read_message(&msg3, &mut plaintext) {
+        Ok(size) => size,
+        Err(_) => {
+            record_failed_handshake(&shared, addr.ip());
+            return Ok(());
+        }
+    };
+    let hello: RequestHello = match serde_json::from_slice::<RequestHello>(&plaintext[..size]) {
+        Ok(hello) if hello.v == 1 && hello.mode == "request" => hello,
+        _ => {
+            record_failed_handshake(&shared, addr.ip());
+            return Ok(());
+        }
+    };
+    if !valid_label(hello.label.as_deref()) {
+        record_failed_handshake(&shared, addr.ip());
+        return Ok(());
+    }
+    let remote: [u8; 32] = match handshake
+        .get_remote_static()
+        .and_then(|key| key.try_into().ok())
+    {
+        Some(remote) => remote,
+        None => {
+            record_failed_handshake(&shared, addr.ip());
+            return Ok(());
+        }
+    };
+    let local_public = entangle_transport::public_key(&private);
+    let mut transport = handshake
+        .into_transport_mode()
+        .map_err(|error| io::Error::other(error.to_string()))?;
+
+    let original_device;
+    {
+        let mut pending = shared.pending_requests.lock().await;
+        if pending.requests.len() + pending.reserved_ips.len() >= MAX_PENDING_REQUESTS
+            || pending.reserved_ips.contains(&addr.ip())
+            || pending
+                .requests
+                .iter()
+                .any(|request| request.source == addr.ip().to_string())
+        {
+            send_request_json(
+                &mut ws,
+                &mut transport,
+                &serde_json::json!({"ok": false, "error": "busy"}),
+            )
+            .await?;
+            return Ok(());
+        }
+        original_device = shared
+            .store
+            .devices()?
+            .devices
+            .get(&hex::encode(remote))
+            .cloned();
+        pending.reserved_ips.insert(addr.ip());
+    }
+    if let Err(error) =
+        send_request_json(&mut ws, &mut transport, &serde_json::json!({"ok": true})).await
+    {
+        release_request(&shared, addr.ip()).await;
+        return Err(error);
+    }
+    let sas = match tokio::time::timeout(
+        REQUEST_SAS_TIMEOUT,
+        sas_exchange_server(&mut ws, &mut transport, local_public, remote),
+    )
+    .await
+    {
+        Ok(Ok(sas)) => sas,
+        _ => {
+            release_request(&shared, addr.ip()).await;
+            return Ok(());
+        }
+    };
+    let request = crate::store::EnrollmentRequest {
+        key: hex::encode(remote),
+        label: hello.label,
+        source: addr.ip().to_string(),
+        requested_at: chrono::Utc::now().to_rfc3339(),
+        sas,
+    };
+    {
+        let mut pending = shared.pending_requests.lock().await;
+        pending.reserved_ips.remove(&addr.ip());
+        pending.requests.push(request.clone());
+        if let Err(error) = shared.store.save_requests(&pending.requests) {
+            pending.requests.pop();
+            return Err(error.into());
+        }
+    }
+    tracing::info!(
+        fingerprint = %short_fingerprint(&remote),
+        label = ?request.label,
+        source = %addr.ip(),
+        "enrollment request admitted; run `entangle repeater approve`"
+    );
+    let result = wait_for_request_decision(
+        &mut ws,
+        &mut transport,
+        &shared,
+        &request,
+        remote,
+        original_device,
+    )
+    .await;
+    if let Err(error) = &result {
+        tracing::info!(
+            fingerprint = %short_fingerprint(&remote),
+            label = ?request.label,
+            source = %request.source,
+            outcome = "error",
+            %error,
+            "enrollment request ended"
+        );
+    }
+    remove_request(&shared, &request).await;
+    result
+}
+
+fn request_noise_params() -> NoiseParams {
+    "Noise_XX_25519_ChaChaPoly_BLAKE2s"
+        .parse()
+        .expect("valid request Noise pattern")
+}
+
+fn short_fingerprint(public: &[u8; 32]) -> String {
+    hex::encode(Sha256::digest(public))[..8].to_owned()
+}
+
+async fn send_request_json<S>(
+    ws: &mut tokio_tungstenite::WebSocketStream<S>,
+    transport: &mut TransportState,
+    value: &serde_json::Value,
+) -> Result<(), ServerError>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let plaintext = serde_json::to_vec(value)?;
+    let mut encrypted = vec![0; MAX_MESSAGE];
+    let size = transport
+        .write_message(&plaintext, &mut encrypted)
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    ws.send(Message::Binary(encrypted[..size].to_vec())).await?;
+    Ok(())
+}
+
+async fn recv_request_json<S>(
+    ws: &mut tokio_tungstenite::WebSocketStream<S>,
+    transport: &mut TransportState,
+) -> Result<serde_json::Value, ServerError>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let Some(message) = ws.next().await else {
+        return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "request closed").into());
+    };
+    let Message::Binary(message) = message? else {
+        return Err(io::Error::other("invalid request message").into());
+    };
+    let mut plaintext = vec![0; u16::MAX as usize];
+    let size = transport
+        .read_message(&message, &mut plaintext)
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    Ok(serde_json::from_slice(&plaintext[..size])?)
+}
+
+async fn sas_exchange_server<S>(
+    ws: &mut tokio_tungstenite::WebSocketStream<S>,
+    transport: &mut TransportState,
+    local: [u8; 32],
+    remote: [u8; 32],
+) -> Result<sas::Sas, ServerError>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let role = sas::role(&local, &remote).ok_or_else(|| io::Error::other("equal SAS keys"))?;
+    let mut nonce = [0; 32];
+    use rand::RngCore;
+    rand::rngs::OsRng.fill_bytes(&mut nonce);
+    match role {
+        sas::Role::Committer => {
+            let commit = sas::commitment(&nonce, &local, &remote);
+            send_request_json(
+                ws,
+                transport,
+                &serde_json::json!({"commit": hex::encode(commit)}),
+            )
+            .await?;
+            let remote_nonce = parse_nonce(&recv_request_json(ws, transport).await?, "nonce")?;
+            send_request_json(
+                ws,
+                transport,
+                &serde_json::json!({"nonce": hex::encode(nonce)}),
+            )
+            .await?;
+            Ok(sas::derive(&local, &remote, &nonce, &remote_nonce))
+        }
+        sas::Role::Revealer => {
+            let commit = parse_digest(&recv_request_json(ws, transport).await?, "commit")?;
+            send_request_json(
+                ws,
+                transport,
+                &serde_json::json!({"nonce": hex::encode(nonce)}),
+            )
+            .await?;
+            let remote_nonce = parse_nonce(&recv_request_json(ws, transport).await?, "nonce")?;
+            if !verify_sas_commitment(&commit, &remote_nonce, &remote, &local) {
+                return Err(io::Error::other("SAS commitment mismatch").into());
+            }
+            Ok(sas::derive(&remote, &local, &remote_nonce, &nonce))
+        }
+    }
+}
+
+pub(crate) fn verify_sas_commitment(
+    commitment: &[u8; 32],
+    nonce: &[u8; 32],
+    committer: &[u8; 32],
+    revealer: &[u8; 32],
+) -> bool {
+    sas::commitment(nonce, committer, revealer) == *commitment
+}
+
+fn parse_digest(value: &serde_json::Value, field: &str) -> Result<[u8; 32], ServerError> {
+    let text = value
+        .get(field)
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| io::Error::other("invalid SAS message"))?;
+    hex::decode(text)
+        .ok()
+        .and_then(|bytes| bytes.try_into().ok())
+        .ok_or_else(|| io::Error::other("invalid SAS message").into())
+}
+
+fn parse_nonce(value: &serde_json::Value, field: &str) -> Result<[u8; 32], ServerError> {
+    parse_digest(value, field)
+}
+
+async fn release_request(shared: &Shared, ip: IpAddr) {
+    let mut pending = shared.pending_requests.lock().await;
+    pending.reserved_ips.remove(&ip);
+}
+
+async fn remove_request(shared: &Shared, request: &crate::store::EnrollmentRequest) {
+    let mut pending = shared.pending_requests.lock().await;
+    if let Some(index) = pending
+        .requests
+        .iter()
+        .position(|candidate| candidate == request)
+    {
+        pending.requests.remove(index);
+        if let Err(error) = shared.store.save_requests(&pending.requests) {
+            tracing::warn!(%error, "could not remove enrollment request");
+        }
+    }
+}
+
+async fn wait_for_request_decision<S>(
+    ws: &mut tokio_tungstenite::WebSocketStream<S>,
+    transport: &mut TransportState,
+    shared: &Shared,
+    request: &crate::store::EnrollmentRequest,
+    remote: [u8; 32],
+    original: Option<Device>,
+) -> Result<(), ServerError>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let deadline = tokio::time::Instant::now() + REQUEST_DECISION_TIMEOUT;
+    let mut poll = tokio::time::interval(Duration::from_secs(1));
+    let ping_period = Duration::from_secs(30);
+    let mut ping = tokio::time::interval_at(tokio::time::Instant::now() + ping_period, ping_period);
+    loop {
+        tokio::select! {
+            _ = poll.tick() => {
+                let current = shared.store.devices()?.devices.get(&hex::encode(remote)).cloned();
+                if current != original {
+                    if let Some(device) = current {
+                        let approved = !device.revoked;
+                        send_request_json(ws, transport, &serde_json::json!({"approved": approved})).await?;
+                        tracing::info!(
+                            fingerprint = %short_fingerprint(&remote),
+                            label = ?request.label,
+                            source = %request.source,
+                            outcome = if approved { "approved" } else { "denied" },
+                            "enrollment request decided"
+                        );
+                        remove_request(shared, request).await;
+                        let _ = ws.close(None).await;
+                        return Ok(());
+                    }
+                }
+            }
+            _ = ping.tick() => {
+                ws.send(Message::Ping(Vec::new())).await?;
+            }
+            result = ws.next() => {
+                match result {
+                    Some(Ok(Message::Pong(_))) | Some(Ok(Message::Ping(_))) => {}
+                    Some(Ok(Message::Close(_))) | None | Some(Err(_)) => {
+                        tracing::info!(
+                            fingerprint = %short_fingerprint(&remote),
+                            label = ?request.label,
+                            source = %request.source,
+                            outcome = "disconnected",
+                            "enrollment request ended"
+                        );
+                        remove_request(shared, request).await;
+                        return Ok(());
+                    }
+                    Some(Ok(_)) => {}
+                }
+            }
+            _ = tokio::time::sleep_until(deadline) => {
+                tracing::info!(
+                    fingerprint = %short_fingerprint(&remote),
+                    label = ?request.label,
+                    source = %request.source,
+                    outcome = "timed out",
+                    "enrollment request ended"
+                );
+                remove_request(shared, request).await;
+                return Ok(());
+            }
+        }
+    }
 }
 
 fn valid_group(group: Option<&str>) -> bool {
@@ -1140,5 +1596,34 @@ mod limiter_tests {
 
         assert!(limiter.is_blocked(ip, now + HANDSHAKE_COOLDOWN - Duration::from_secs(1)));
         assert!(!limiter.is_blocked(ip, now + HANDSHAKE_COOLDOWN));
+    }
+}
+
+#[cfg(test)]
+mod request_tests {
+    use super::verify_sas_commitment;
+    use entangle_core::sas;
+
+    #[test]
+    fn wrong_sas_commitment_or_nonce_aborts_verification() {
+        let committer = [1; 32];
+        let revealer = [2; 32];
+        let nonce = [3; 32];
+        let commitment = sas::commitment(&nonce, &committer, &revealer);
+        assert!(verify_sas_commitment(
+            &commitment,
+            &nonce,
+            &committer,
+            &revealer
+        ));
+        assert!(!verify_sas_commitment(
+            &[0; 32], &nonce, &committer, &revealer
+        ));
+        assert!(!verify_sas_commitment(
+            &commitment,
+            &[4; 32],
+            &committer,
+            &revealer
+        ));
     }
 }

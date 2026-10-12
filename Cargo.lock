@@ -474,6 +474,7 @@ version = "0.4.1"
 dependencies = [
  "chrono",
  "data-encoding",
+ "entangle-core",
  "entangle-transport",
  "futures-util",
  "hex",

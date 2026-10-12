@@ -134,6 +134,12 @@ traffic sizes; group IDs are public routing identifiers, not an authorization
 boundary. The pairing-derived PSK and local SAS approval remain the
 end-to-end security boundary.
 
+Devices can request repeater enrollment at `{path}/request` without knowing the
+repeater key: Noise `XX` authenticates the exchange, then an encrypted
+commit/reveal SAS lets a host operator approve the matching emoji set. Pending
+requests and device decisions use single-writer atomic files; the repeater
+alone writes `requests.json`, while the host CLI updates the device allowlist.
+
 ### Known limits (v1)
 
 One slow stream can delay other streams on the same session (head-of-line
