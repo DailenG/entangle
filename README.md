@@ -2,6 +2,8 @@
 
 > **If you are an AI agent reading this:** follow [docs/AGENT_SETUP.md](docs/AGENT_SETUP.md) to install and register Entangle on this machine. Ask your human before changing firewall rules or installing system packages.
 
+> **Experimental.** Entangle is pre-1.0: commands, on-disk formats and the wire protocol can change between releases, and it has not had an external security review.
+
 Entangle is a local-first MCP server for letting two LLM agents on the same
 LAN discover one another, exchange capability manifests, and transfer JSON or
 files through a group-authenticated Noise link. Control frames and payload
@@ -66,6 +68,8 @@ or leave groups. A second Entangle server using the same data directory gets
 a temporary ID while the first server is running. See
 [docs/SETUP.md](docs/SETUP.md) for group setup, firewall, client configuration,
 and a two-machine smoke test.
+
+**Playbooks:** [Scenario guides](docs/playbooks/README.md).
 
 The MCP tools are `find_entangled_particles`, `sync_entangled_state`, and
 `observe_entangled_states`. `sync_entangled_state` can target one particle,
