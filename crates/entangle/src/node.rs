@@ -28,7 +28,7 @@ use std::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex as StdMutex, RwLock,
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tokio::task::JoinHandle;
 use tokio::{
@@ -46,6 +46,7 @@ const REPEATER_CONFIG_POLL: Duration = Duration::from_secs(30);
 const REPEATER_DIRECTORY_POLL: Duration = Duration::from_secs(15);
 const REPEATER_RECONNECT_BASE: Duration = Duration::from_secs(1);
 const REPEATER_RECONNECT_CAP: Duration = Duration::from_secs(60);
+const DISCOVERY_FAILURE_LOG_INTERVAL: Duration = Duration::from_secs(60);
 
 fn build_key_ring(static_private: [u8; 32], groups: &[Group]) -> KeyRing {
     KeyRing {
@@ -59,6 +60,17 @@ fn build_key_ring(static_private: [u8; 32], groups: &[Group]) -> KeyRing {
                 )
             })
             .collect(),
+    }
+}
+
+fn should_retry_resonator(no_mdns: bool, relay_only: bool, is_running: bool) -> bool {
+    !no_mdns && !relay_only && !is_running
+}
+
+fn should_log_discovery_failure(last_log: Option<Instant>, now: Instant) -> bool {
+    match last_log {
+        None => true,
+        Some(last) => now.duration_since(last) >= DISCOVERY_FAILURE_LOG_INTERVAL,
     }
 }
 
@@ -149,7 +161,7 @@ pub struct Particle {
     resonator: Mutex<Option<Resonator>>,
     resonance_task: Mutex<Option<JoinHandle<()>>>,
     discovery_generation: AtomicU64,
-    discovery_failure_logged: AtomicBool,
+    discovery_failure_last_log: StdMutex<Option<Instant>>,
     inbox: Mutex<Vec<InboxItem>>,
     in_flight: StdMutex<HashSet<String>>,
     groups_reload_warned: AtomicBool,
@@ -257,7 +269,7 @@ impl Particle {
             resonator: Mutex::new(None),
             resonance_task: Mutex::new(None),
             discovery_generation: AtomicU64::new(0),
-            discovery_failure_logged: AtomicBool::new(false),
+            discovery_failure_last_log: StdMutex::new(None),
             inbox: Mutex::new(persisted_inbox),
             in_flight: StdMutex::new(HashSet::new()),
             groups_reload_warned: AtomicBool::new(false),
@@ -407,8 +419,10 @@ impl Particle {
         *resonator = Some(next);
         drop(resonator);
         *resonance_task = Some(self.spawn_resonance_events(events, generation));
-        self.discovery_failure_logged
-            .store(false, Ordering::Relaxed);
+        *self
+            .discovery_failure_last_log
+            .lock()
+            .expect("discovery failure log lock") = None;
         Ok(())
     }
 
@@ -435,10 +449,14 @@ impl Particle {
     }
 
     fn log_discovery_failure(&self, error: &anyhow::Error) {
-        if !self.discovery_failure_logged.swap(true, Ordering::Relaxed) {
+        let now = Instant::now();
+        let mut last_log = self
+            .discovery_failure_last_log
+            .lock()
+            .expect("discovery failure log lock");
+        if should_log_discovery_failure(*last_log, now) {
+            *last_log = Some(now);
             warn!(%error, "unable to start mDNS discovery; it will be retried");
-        } else {
-            debug!(%error, "mDNS discovery restart failed; it will be retried");
         }
     }
 
@@ -456,8 +474,10 @@ impl Particle {
                 }
                 _ = interval.tick() => {}
             }
+            let mut restart_attempted = false;
             match groups::list(&self.data_root) {
                 Ok(current) if current != previous => {
+                    restart_attempted = true;
                     let discovered = self
                         .field
                         .read()
@@ -488,6 +508,17 @@ impl Particle {
                         warn!(%error, "could not reload group store");
                         unavailable_logged = true;
                     }
+                }
+            }
+            if !restart_attempted
+                && should_retry_resonator(
+                    self.options.no_mdns,
+                    self.options.relay_only,
+                    self.resonator.lock().await.is_some(),
+                )
+            {
+                if let Err(error) = self.restart_resonator().await {
+                    self.log_discovery_failure(&error);
                 }
             }
         }
@@ -2007,6 +2038,28 @@ mod tests {
             relay_only: false,
             log_level: "warn".into(),
         }
+    }
+
+    #[test]
+    fn missing_resonator_is_retried_only_when_mdns_is_enabled() {
+        assert!(should_retry_resonator(false, false, false));
+        assert!(!should_retry_resonator(true, false, false));
+        assert!(!should_retry_resonator(false, true, false));
+        assert!(!should_retry_resonator(false, false, true));
+    }
+
+    #[test]
+    fn discovery_failure_logs_are_limited_to_once_per_minute() {
+        let now = Instant::now();
+        assert!(should_log_discovery_failure(None, now));
+        assert!(!should_log_discovery_failure(
+            Some(now),
+            now + Duration::from_secs(59)
+        ));
+        assert!(should_log_discovery_failure(
+            Some(now),
+            now + DISCOVERY_FAILURE_LOG_INTERVAL
+        ));
     }
 
     fn free_port() -> u16 {

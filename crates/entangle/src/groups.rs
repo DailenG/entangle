@@ -8,6 +8,7 @@ use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
+    collections::HashMap,
     fs::{self, File, OpenOptions},
     io,
     path::{Path, PathBuf},
@@ -54,6 +55,8 @@ pub enum GroupError {
     TooMany,
     #[error("group not found: {0}")]
     NotFound(String),
+    #[error("could not generate a unique group ID after 16 key attempts")]
+    IdCollision,
     #[error("group member key conflicts for particle {0}")]
     #[allow(dead_code)]
     KeyConflict(String),
@@ -132,33 +135,7 @@ pub fn validate_name(name: &str) -> Result<(), GroupError> {
 
 pub fn list(root: &Path) -> Result<Vec<Group>, GroupError> {
     let _lock = lock_groups(root)?;
-    let directory = groups_dir(root);
-    let mut groups = Vec::new();
-    let entries = match fs::read_dir(&directory) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(groups),
-        Err(error) => return Err(GroupError::io(&directory, error)),
-    };
-    for entry in entries {
-        let entry = entry.map_err(|error| GroupError::io(&directory, error))?;
-        let path = entry.path();
-        if entry.file_name() == ".lock" {
-            continue;
-        }
-        let metadata = fs::symlink_metadata(&path).map_err(|error| GroupError::io(&path, error))?;
-        if !metadata.file_type().is_dir() {
-            return Err(GroupError::malformed(&path, "expected a group directory"));
-        }
-        let group = read_group(&path)?;
-        groups.push(group);
-    }
-    groups.sort_by(|left, right| {
-        left.meta
-            .name
-            .cmp(&right.meta.name)
-            .then_with(|| left.id.cmp(&right.id))
-    });
-    Ok(groups)
+    read_groups_unlocked(root)
 }
 
 pub fn find(root: &Path, name_or_id: &str) -> Result<Option<Group>, GroupError> {
@@ -168,6 +145,17 @@ pub fn find(root: &Path, name_or_id: &str) -> Result<Option<Group>, GroupError> 
 }
 
 pub fn create(root: &Path, name: &str, self_member: Member) -> Result<Group, GroupError> {
+    create_with_key_source(root, name, self_member, |key| {
+        rand::rngs::OsRng.fill_bytes(key);
+    })
+}
+
+fn create_with_key_source(
+    root: &Path,
+    name: &str,
+    self_member: Member,
+    mut fill_key: impl FnMut(&mut [u8; 32]),
+) -> Result<Group, GroupError> {
     validate_name(name)?;
     let Some((identity_id, identity_key)) = identity::read_saved(root)
         .map_err(|error| GroupError::malformed(root, error.to_string()))?
@@ -189,11 +177,17 @@ pub fn create(root: &Path, name: &str, self_member: Member) -> Result<Group, Gro
     if existing.len() >= MAX_GROUPS {
         return Err(GroupError::TooMany);
     }
-    let mut key = [0_u8; 32];
-    rand::rngs::OsRng.fill_bytes(&mut key);
+    let (key, id) = (0..16)
+        .find_map(|_| {
+            let mut key = [0_u8; 32];
+            fill_key(&mut key);
+            let id = group_id(&key);
+            (!existing.iter().any(|group| group.id == id)).then_some((key, id))
+        })
+        .ok_or(GroupError::IdCollision)?;
     let now = timestamp();
     let group = Group {
-        id: group_id(&key),
+        id,
         key,
         meta: GroupMeta {
             version: GROUP_VERSION,
@@ -239,14 +233,11 @@ pub fn insert(
 #[allow(dead_code)]
 pub fn add_member(root: &Path, group_id: &str, member: Member) -> Result<bool, GroupError> {
     validate_member(&member, root)?;
-    if group_id.len() != 8
-        || !group_id
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    {
+    if !is_group_id(group_id) {
         return Err(GroupError::NotFound(group_id.to_owned()));
     }
     let _lock = lock_groups(root)?;
+    cleanup_transaction_dirs(&groups_dir(root))?;
     let path = group_path(root, group_id);
     let mut group = read_group(&path)?;
     if let Some(existing) = group
@@ -338,6 +329,7 @@ fn lock_groups(root: &Path) -> Result<File, GroupError> {
 
 fn read_groups_unlocked(root: &Path) -> Result<Vec<Group>, GroupError> {
     let directory = groups_dir(root);
+    cleanup_transaction_dirs(&directory)?;
     let entries = match fs::read_dir(&directory) {
         Ok(entries) => entries,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -347,7 +339,7 @@ fn read_groups_unlocked(root: &Path) -> Result<Vec<Group>, GroupError> {
     for entry in entries {
         let entry = entry.map_err(|error| GroupError::io(&directory, error))?;
         let path = entry.path();
-        if entry.file_name() == ".lock" {
+        if entry.file_name().to_string_lossy().starts_with('.') {
             continue;
         }
         let metadata = fs::symlink_metadata(&path).map_err(|error| GroupError::io(&path, error))?;
@@ -439,7 +431,6 @@ fn read_group(path: &Path) -> Result<Group, GroupError> {
 
 fn write_group(root: &Path, group: &Group) -> Result<(), GroupError> {
     let path = group_path(root, &group.id);
-    private_fs::create_private_directory(&path).map_err(GroupError::private_fs)?;
     validate_meta(&group.meta, &path.join("meta.json"))?;
     validate_members(&group.members, &path.join("members.json"))?;
     if group.members.is_empty() {
@@ -459,11 +450,176 @@ fn write_group(root: &Path, group: &Group) -> Result<(), GroupError> {
         .map_err(|error| GroupError::malformed(&path.join("meta.json"), error.to_string()))?;
     let members = serde_json::to_vec_pretty(&group.members)
         .map_err(|error| GroupError::malformed(&path.join("members.json"), error.to_string()))?;
-    private_fs::atomic_write(&path.join("key"), key.as_bytes()).map_err(GroupError::private_fs)?;
-    private_fs::atomic_write(&path.join("meta.json"), &meta).map_err(GroupError::private_fs)?;
-    private_fs::atomic_write(&path.join("members.json"), &members)
-        .map_err(GroupError::private_fs)?;
+
+    let replace_existing = match fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.file_type().is_dir() => {
+            let existing = read_group(&path)?;
+            if existing.key != group.key {
+                return Err(GroupError::malformed(
+                    &path.join("key"),
+                    "refusing to replace a group directory with a different key",
+                ));
+            }
+            true
+        }
+        Ok(_) => return Err(GroupError::UnsafePath(path)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+        Err(error) => return Err(GroupError::io(&path, error)),
+    };
+    let staging = create_staging_directory(root, &group.id)?;
+    let write_result = (|| {
+        private_fs::atomic_write(&staging.join("key"), key.as_bytes())
+            .map_err(GroupError::private_fs)?;
+        private_fs::atomic_write(&staging.join("meta.json"), &meta)
+            .map_err(GroupError::private_fs)?;
+        private_fs::atomic_write(&staging.join("members.json"), &members)
+            .map_err(GroupError::private_fs)?;
+        Ok(())
+    })();
+    if let Err(error) = write_result {
+        let _ = remove_transaction_entry(&staging);
+        return Err(error);
+    }
+
+    if replace_existing {
+        let old = unused_transaction_path(root, "old", &group.id)?;
+        fs::rename(&path, &old).map_err(|error| GroupError::io(&path, error))?;
+        if let Err(error) = fs::rename(&staging, &path) {
+            let restore = fs::rename(&old, &path);
+            let _ = remove_transaction_entry(&staging);
+            if let Err(restore_error) = restore {
+                return Err(GroupError::malformed(
+                    &path,
+                    format!("replacement failed ({error}); restoring the old group failed ({restore_error})"),
+                ));
+            }
+            return Err(GroupError::io(&path, error));
+        }
+        remove_transaction_entry(&old)?;
+    } else if let Err(error) = fs::rename(&staging, &path) {
+        let _ = remove_transaction_entry(&staging);
+        return Err(GroupError::io(&path, error));
+    }
     Ok(())
+}
+
+fn create_staging_directory(root: &Path, id: &str) -> Result<PathBuf, GroupError> {
+    for _ in 0..16 {
+        let path = random_transaction_path(root, "staging", id);
+        match private_fs::create_private_directory_exclusive(&path)
+            .map_err(GroupError::private_fs)?
+        {
+            true => return Ok(path),
+            false => continue,
+        }
+    }
+    let path = groups_dir(root);
+    Err(GroupError::io(
+        &path,
+        io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "could not allocate a unique group staging directory",
+        ),
+    ))
+}
+
+fn unused_transaction_path(root: &Path, kind: &str, id: &str) -> Result<PathBuf, GroupError> {
+    for _ in 0..16 {
+        let path = random_transaction_path(root, kind, id);
+        match fs::symlink_metadata(&path) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(path),
+            Ok(_) => continue,
+            Err(error) => return Err(GroupError::io(&path, error)),
+        }
+    }
+    let path = groups_dir(root);
+    Err(GroupError::io(
+        &path,
+        io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "could not allocate a unique group transaction path",
+        ),
+    ))
+}
+
+fn random_transaction_path(root: &Path, kind: &str, id: &str) -> PathBuf {
+    let mut suffix = [0_u8; 4];
+    rand::rngs::OsRng.fill_bytes(&mut suffix);
+    groups_dir(root).join(format!(".{kind}-{id}-{}", hex::encode(suffix)))
+}
+
+fn cleanup_transaction_dirs(directory: &Path) -> Result<(), GroupError> {
+    let entries = match fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(GroupError::io(directory, error)),
+    };
+    let mut candidates = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|error| GroupError::io(directory, error))?;
+        candidates.push((entry.file_name(), entry.path()));
+    }
+    let mut staging = Vec::new();
+    let mut old: HashMap<String, Vec<PathBuf>> = HashMap::new();
+    for (entry_name, path) in candidates {
+        let Some(name) = entry_name.to_str() else {
+            continue;
+        };
+        if name.starts_with(".staging-") {
+            staging.push(path);
+        } else if let Some(remainder) = name.strip_prefix(".old-") {
+            if let Some((id, suffix)) = remainder.split_once('-') {
+                if is_group_id(id) && !suffix.is_empty() {
+                    old.entry(id.to_owned()).or_default().push(path);
+                } else {
+                    remove_transaction_entry(&path)?;
+                }
+            } else {
+                remove_transaction_entry(&path)?;
+            }
+        }
+    }
+    for path in staging {
+        remove_transaction_entry(&path)?;
+    }
+    for (id, mut old_paths) in old {
+        old_paths.sort();
+        let target = directory.join(&id);
+        match fs::symlink_metadata(&target) {
+            Ok(_) => {
+                for path in old_paths {
+                    remove_transaction_entry(&path)?;
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                let restore = old_paths.remove(0);
+                fs::rename(&restore, &target).map_err(|error| GroupError::io(&target, error))?;
+                for path in old_paths {
+                    remove_transaction_entry(&path)?;
+                }
+            }
+            Err(error) => return Err(GroupError::io(&target, error)),
+        }
+    }
+    Ok(())
+}
+
+fn remove_transaction_entry(path: &Path) -> Result<(), GroupError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_dir() => {
+            fs::remove_dir_all(path).map_err(|error| GroupError::io(path, error))
+        }
+        Ok(_) => fs::remove_file(path).map_err(|error| GroupError::io(path, error)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(GroupError::io(path, error)),
+    }
+}
+
+fn is_group_id(id: &str) -> bool {
+    id.len() == 8
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn validate_meta(meta: &GroupMeta, path: &Path) -> Result<(), GroupError> {
@@ -596,6 +752,59 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn create_retries_a_colliding_group_id_without_replacing_the_existing_group() {
+        let root = tempdir().unwrap();
+        let self_member = saved_identity(root.path());
+        let existing_key = [0x21; 32];
+        let existing = insert(
+            root.path(),
+            existing_key,
+            GroupMeta {
+                version: GROUP_VERSION,
+                name: "existing".into(),
+                role: Role::Admin,
+                created_at: timestamp(),
+            },
+            vec![self_member.clone()],
+        )
+        .unwrap();
+        let replacement_key = (0_u8..=u8::MAX)
+            .map(|byte| [byte; 32])
+            .find(|key| group_id(key) != existing.id)
+            .unwrap();
+        let mut attempts = 0;
+
+        let created = create_with_key_source(root.path(), "new", self_member.clone(), |key| {
+            attempts += 1;
+            *key = if attempts == 1 {
+                existing_key
+            } else {
+                replacement_key
+            };
+        })
+        .unwrap();
+
+        assert_eq!(attempts, 2);
+        assert_ne!(created.id, existing.id);
+        assert_eq!(created.key, replacement_key);
+        assert_eq!(find(root.path(), &existing.id).unwrap(), Some(existing));
+
+        let mut attempts = 0;
+        assert!(matches!(
+            create_with_key_source(root.path(), "collision", self_member, |key| {
+                attempts += 1;
+                *key = existing_key;
+            }),
+            Err(GroupError::IdCollision)
+        ));
+        assert_eq!(attempts, 16);
+        assert_eq!(
+            find(root.path(), "existing").unwrap().unwrap().key,
+            existing_key
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn key_file_is_lowercase_hex_with_private_permissions() {
@@ -662,6 +871,36 @@ mod tests {
             GroupError::Malformed { path, .. } => assert_eq!(path, renamed_path),
             error => panic!("expected malformed group data, got {error}"),
         }
+    }
+
+    #[test]
+    fn list_ignores_and_cleans_leftover_staging_directories() {
+        let root = tempdir().unwrap();
+        let group = create_named(root.path(), "work");
+        let staging = root
+            .path()
+            .join("groups")
+            .join(format!(".staging-{}-deadbeef", group.id));
+        fs::create_dir(&staging).unwrap();
+
+        assert_eq!(list(root.path()).unwrap(), vec![group]);
+        assert!(!staging.exists());
+    }
+
+    #[test]
+    fn list_restores_a_group_after_crash_between_directory_renames() {
+        let root = tempdir().unwrap();
+        let group = create_named(root.path(), "work");
+        let path = root.path().join("groups").join(&group.id);
+        let old = root
+            .path()
+            .join("groups")
+            .join(format!(".old-{}-x", group.id));
+        fs::rename(&path, &old).unwrap();
+
+        assert_eq!(list(root.path()).unwrap(), vec![group.clone()]);
+        assert!(path.is_dir());
+        assert!(!old.exists());
     }
 
     #[test]

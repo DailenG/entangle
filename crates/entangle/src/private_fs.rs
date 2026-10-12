@@ -48,6 +48,28 @@ pub fn create_private_directory(path: &Path) -> Result<(), PrivateFsError> {
     }
 }
 
+pub fn create_private_directory_exclusive(path: &Path) -> Result<bool, PrivateFsError> {
+    let mut builder = fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    match builder.create(path) {
+        Ok(()) => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+                    .map_err(|error| PrivateFsError::io(path, error))?;
+            }
+            Ok(true)
+        }
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(false),
+        Err(error) => Err(PrivateFsError::io(path, error)),
+    }
+}
+
 pub fn read_regular_file(path: &Path) -> Result<Option<Vec<u8>>, PrivateFsError> {
     match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_file() => {
