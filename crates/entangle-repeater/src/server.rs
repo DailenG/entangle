@@ -889,6 +889,9 @@ where
     let Message::Binary(message) = message? else {
         return Err(io::Error::other("invalid request message").into());
     };
+    if message.len() > MAX_MESSAGE {
+        return Err(io::Error::other("oversized request message").into());
+    }
     let mut plaintext = vec![0; u16::MAX as usize];
     let size = transport
         .read_message(&message, &mut plaintext)

@@ -517,7 +517,8 @@ fn approve_request(root: PathBuf, output: &mut dyn Write) -> Result<i32> {
             output.flush()?;
             match crate::peer::read_approval_key(requests.len() as u8)? {
                 crate::peer::KeyOutcome::Pick(value) => {
-                    break requests[usize::from(value - 1)].clone()
+                    writeln!(output, "{value}")?;
+                    break requests[usize::from(value - 1)].clone();
                 }
                 crate::peer::KeyOutcome::Cancel => return crate::peer::cancel_approval(output),
                 crate::peer::KeyOutcome::Invalid => {
@@ -551,7 +552,10 @@ fn approve_request(root: PathBuf, output: &mut dyn Write) -> Result<i32> {
         write!(output, "Press 1-5: ")?;
         output.flush()?;
         match crate::peer::read_approval_key(5)? {
-            crate::peer::KeyOutcome::Pick(value) => break usize::from(value),
+            crate::peer::KeyOutcome::Pick(value) => {
+                writeln!(output, "{value}")?;
+                break usize::from(value);
+            }
             crate::peer::KeyOutcome::Cancel => return crate::peer::cancel_approval(output),
             _ => {
                 invalid += 1;
