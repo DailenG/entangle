@@ -2,7 +2,9 @@
 
 use async_trait::async_trait;
 use entangle_core::{Manifest, ParticleId, StateKind};
-use entangle_transport::{self, KeySlot, LinkKeys, SecureStream, TransportError, MAX_PLAINTEXT};
+use entangle_transport::{
+    self, KeyRing, SecureStream, SharedKeyRing, TransportError, MAX_PLAINTEXT,
+};
 pub use entangle_transport::{BoxedIo, LinkIo};
 use serde::{Deserialize, Serialize};
 use std::{fmt, io, net::SocketAddr, sync::Arc, time::Duration};
@@ -54,6 +56,8 @@ pub struct PeerInfo {
     pub addr: SocketAddr,
     /// Authenticated remote Noise static public key.
     pub remote_static: [u8; 32],
+    /// Group ID authenticated by this Noise session.
+    pub group: [u8; 4],
     /// Whether this connection arrived through a tunnel.
     pub relayed: bool,
 }
@@ -112,36 +116,6 @@ pub enum Frame {
         /// Human-readable failure reason.
         reason: String,
     },
-    /// Commit/reveal verification message exchanged after Hello.
-    Verify {
-        /// Committer's lowercase hex commitment.
-        commitment: Option<String>,
-        /// Revealer's lowercase hex nonce.
-        nonce: Option<String>,
-        /// Committer's lowercase hex nonce reveal.
-        reveal: Option<String>,
-    },
-}
-
-/// Optional values carried by one peer-verification round.
-#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
-pub struct VerifyMessage {
-    /// Committer's lowercase hex commitment.
-    pub commitment: Option<String>,
-    /// Revealer's lowercase hex nonce.
-    pub nonce: Option<String>,
-    /// Committer's lowercase hex nonce reveal.
-    pub reveal: Option<String>,
-}
-
-impl From<VerifyMessage> for Frame {
-    fn from(message: VerifyMessage) -> Self {
-        Self::Verify {
-            commitment: message.commitment,
-            nonce: message.nonce,
-            reveal: message.reveal,
-        }
-    }
 }
 
 /// State-sync offer contents excluding the serde enum wrapper.
@@ -271,13 +245,6 @@ pub trait LinkHandler: Send + Sync + 'static {
     /// Validates an incoming manifest and returns this particle's manifest.
     async fn on_hello(&self, peer: &PeerInfo, manifest: Manifest) -> Result<Manifest, LinkError>;
 
-    /// Ingests and responds to a verification round on the Hello connection.
-    async fn on_verify(
-        &self,
-        peer: &PeerInfo,
-        message: VerifyMessage,
-    ) -> Result<VerifyMessage, LinkError>;
-
     /// Validates an incoming offer before the listener acknowledges it.
     async fn on_offer(&self, peer: &PeerInfo, offer: SyncOffer) -> Result<SyncDecision, LinkError>;
 
@@ -304,7 +271,11 @@ impl LinkListener {
     }
 
     /// Accepts peers and completes each Noise handshake in its own task.
-    pub async fn run(self, keys: KeySlot, handler: Arc<dyn LinkHandler>) -> Result<(), LinkError> {
+    pub async fn run(
+        self,
+        keys: SharedKeyRing,
+        handler: Arc<dyn LinkHandler>,
+    ) -> Result<(), LinkError> {
         loop {
             let (stream, addr) = self.listener.accept().await?;
             let keys = Arc::clone(&keys);
@@ -321,14 +292,15 @@ pub async fn serve_io(
     io: BoxedIo,
     peer_addr: SocketAddr,
     relayed: bool,
-    keys: KeySlot,
+    keys: SharedKeyRing,
     handler: Arc<dyn LinkHandler>,
 ) -> Result<(), LinkError> {
-    let keys = current_keys(&keys)?;
-    let stream = entangle_transport::accept_io(io, &keys, HANDSHAKE_TIMEOUT).await?;
+    let current = current_keys(&keys)?;
+    let stream = entangle_transport::accept_io(io, &current, HANDSHAKE_TIMEOUT).await?;
     let peer = PeerInfo {
         addr: peer_addr,
         remote_static: stream.remote_static(),
+        group: stream.group_id(),
         relayed,
     };
     serve_connection(stream, peer, handler).await
@@ -337,11 +309,12 @@ pub async fn serve_io(
 /// Opens a route and completes only the Noise handshake, without sending Hello.
 pub async fn connect_secure(
     route: &Route,
-    keys: KeySlot,
+    keys: SharedKeyRing,
+    group_id: [u8; 4],
     duration: Duration,
 ) -> Result<SecureStream, LinkError> {
     let keys = current_keys(&keys)?;
-    timeout(duration, connect_route(route, &keys, duration))
+    timeout(duration, connect_route(route, &keys, group_id, duration))
         .await
         .map_err(|_| LinkError::Timeout)?
 }
@@ -349,24 +322,27 @@ pub async fn connect_secure(
 /// Connects to a peer, exchanges manifests, and returns its static key.
 pub async fn handshake(
     route: &Route,
-    keys: KeySlot,
+    keys: SharedKeyRing,
+    group_id: [u8; 4],
     manifest: &Manifest,
     duration: Duration,
 ) -> Result<(Manifest, [u8; 32]), LinkError> {
-    let (manifest, remote_static, _) = handshake_stream(route, keys, manifest, duration).await?;
+    let (manifest, remote_static, _) =
+        handshake_stream(route, keys, group_id, manifest, duration).await?;
     Ok((manifest, remote_static))
 }
 
-/// Connects, exchanges manifests, and returns the authenticated stream for Verify rounds.
+/// Connects, exchanges manifests, and returns the authenticated stream.
 pub async fn handshake_stream(
     route: &Route,
-    keys: KeySlot,
+    keys: SharedKeyRing,
+    group_id: [u8; 4],
     manifest: &Manifest,
     duration: Duration,
 ) -> Result<(Manifest, [u8; 32], SecureStream), LinkError> {
     let keys = current_keys(&keys)?;
     timeout(duration, async {
-        let mut stream = connect_route(route, &keys, duration).await?;
+        let mut stream = connect_route(route, &keys, group_id, duration).await?;
         write_frame(
             &mut stream,
             &Frame::Hello {
@@ -389,7 +365,7 @@ pub async fn handshake_stream(
                 ) =>
             {
                 Err(LinkError::Transport(TransportError::Handshake(
-                    "remote rejected the Noise pairing key".into(),
+                    "remote rejected the Noise group key".into(),
                 )))
             }
             Err(error) => Err(error),
@@ -399,42 +375,11 @@ pub async fn handshake_stream(
     .map_err(|_| LinkError::Timeout)?
 }
 
-/// Sends one Verify message over the already-authenticated Hello stream.
-pub async fn send_verify(
-    stream: &mut SecureStream,
-    message: &VerifyMessage,
-) -> Result<(), LinkError> {
-    write_frame(
-        stream,
-        &Frame::Verify {
-            commitment: message.commitment.clone(),
-            nonce: message.nonce.clone(),
-            reveal: message.reveal.clone(),
-        },
-    )
-    .await
-}
-
-/// Receives one Verify message over the already-authenticated Hello stream.
-pub async fn recv_verify(stream: &mut SecureStream) -> Result<VerifyMessage, LinkError> {
-    match read_frame(stream).await? {
-        Frame::Verify {
-            commitment,
-            nonce,
-            reveal,
-        } => Ok(VerifyMessage {
-            commitment,
-            nonce,
-            reveal,
-        }),
-        frame => Err(LinkError::Unexpected(format!("{frame:?}"))),
-    }
-}
-
 /// Opens a link, sends a sync offer, streams its declared bytes, and waits for completion.
 pub async fn offer<R>(
     route: &Route,
-    keys: KeySlot,
+    keys: SharedKeyRing,
+    group_id: [u8; 4],
     offer: SyncOffer,
     source: R,
     duration: Duration,
@@ -442,7 +387,7 @@ pub async fn offer<R>(
 where
     R: AsyncRead + Unpin + Send,
 {
-    let stream = connect_secure(route, keys, duration).await?;
+    let stream = connect_secure(route, keys, group_id, duration).await?;
     offer_on(stream, offer, source, duration).await
 }
 
@@ -488,23 +433,26 @@ where
 
 async fn connect_route(
     route: &Route,
-    keys: &LinkKeys,
+    keys: &KeyRing,
+    group_id: [u8; 4],
     duration: Duration,
 ) -> Result<SecureStream, LinkError> {
     match route {
-        Route::Direct(addr) => Ok(entangle_transport::connect(*addr, keys, duration).await?),
+        Route::Direct(addr) => {
+            Ok(entangle_transport::connect(*addr, keys, group_id, duration).await?)
+        }
         Route::Tunnel(opener) => {
             let io = opener.open().await?;
-            Ok(entangle_transport::connect_io(io, keys, duration).await?)
+            Ok(entangle_transport::connect_io(io, keys, group_id, duration).await?)
         }
     }
 }
 
-fn current_keys(keys: &KeySlot) -> Result<std::sync::Arc<LinkKeys>, LinkError> {
-    keys.read()
-        .map_err(|_| LinkError::Handler("link key slot lock is poisoned".into()))?
-        .clone()
-        .ok_or_else(|| LinkError::Handler("this particle is unpaired".into()))
+fn current_keys(keys: &SharedKeyRing) -> Result<Arc<KeyRing>, LinkError> {
+    Ok(keys
+        .read()
+        .map_err(|_| LinkError::Handler("link key ring lock is poisoned".into()))?
+        .clone())
 }
 
 async fn send_payload<R: AsyncRead + Unpin>(
@@ -542,28 +490,6 @@ async fn serve_connection(
         Frame::Hello { manifest } => {
             let own = handler.on_hello(&peer, manifest).await?;
             write_frame(&mut stream, &Frame::Hello { manifest: own }).await?;
-            for _ in 0..4 {
-                match read_frame(&mut stream).await? {
-                    Frame::Verify {
-                        commitment,
-                        nonce,
-                        reveal,
-                    } => {
-                        let response = handler
-                            .on_verify(
-                                &peer,
-                                VerifyMessage {
-                                    commitment,
-                                    nonce,
-                                    reveal,
-                                },
-                            )
-                            .await?;
-                        write_frame(&mut stream, &response.into()).await?;
-                    }
-                    frame => return Err(LinkError::Unexpected(format!("{frame:?}"))),
-                }
-            }
             Ok(())
         }
         frame => match offer_from_frame(frame) {
@@ -660,7 +586,12 @@ mod tests {
     use super::*;
     use entangle_core::{ParticleId, PROTOCOL_VERSION};
     use sha2::{Digest, Sha256};
-    use std::sync::{Arc, Mutex};
+    use std::{
+        collections::HashMap,
+        sync::{Arc, Mutex, RwLock},
+    };
+
+    const GROUP: [u8; 4] = [0x42; 4];
 
     fn manifest() -> Manifest {
         Manifest {
@@ -676,15 +607,15 @@ mod tests {
         }
     }
 
-    fn keys() -> LinkKeys {
-        LinkKeys {
+    fn keys() -> KeyRing {
+        KeyRing {
             static_private: entangle_transport::generate_static(),
-            psk: [0x33; 32],
+            groups: HashMap::from([(GROUP, [0x33; 32])]),
         }
     }
 
-    fn key_slot(keys: &LinkKeys) -> KeySlot {
-        Arc::new(std::sync::RwLock::new(Some(Arc::new(keys.clone()))))
+    fn key_slot(keys: &KeyRing) -> SharedKeyRing {
+        Arc::new(RwLock::new(Arc::new(keys.clone())))
     }
 
     struct AcceptingHandler {
@@ -716,14 +647,6 @@ mod tests {
             Ok(self.manifest.clone())
         }
 
-        async fn on_verify(
-            &self,
-            _peer: &PeerInfo,
-            message: VerifyMessage,
-        ) -> Result<VerifyMessage, LinkError> {
-            Ok(message)
-        }
-
         async fn on_offer(
             &self,
             peer: &PeerInfo,
@@ -749,7 +672,7 @@ mod tests {
     }
 
     struct DuplexTunnel {
-        keys: KeySlot,
+        keys: SharedKeyRing,
         handler: Arc<dyn LinkHandler>,
     }
 
@@ -789,14 +712,6 @@ mod tests {
             Ok(self.0.clone())
         }
 
-        async fn on_verify(
-            &self,
-            _peer: &PeerInfo,
-            message: VerifyMessage,
-        ) -> Result<VerifyMessage, LinkError> {
-            Ok(message)
-        }
-
         async fn on_offer(
             &self,
             _peer: &PeerInfo,
@@ -816,7 +731,7 @@ mod tests {
     }
 
     async fn start_listener(
-        key: LinkKeys,
+        key: KeyRing,
         handler: Arc<dyn LinkHandler>,
     ) -> (SocketAddr, tokio::task::JoinHandle<()>) {
         let (listener, port) = LinkListener::bind("127.0.0.1:0".parse().unwrap())
@@ -853,10 +768,15 @@ mod tests {
         )
         .await;
         let route = Route::Direct(address);
-        let (peer, remote_static) =
-            handshake(&route, key_slot(&key), &manifest(), Duration::from_secs(2))
-                .await
-                .unwrap();
+        let (peer, remote_static) = handshake(
+            &route,
+            key_slot(&key),
+            GROUP,
+            &manifest(),
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
         assert_eq!(peer, expected);
         assert_ne!(remote_static, [0; 32]);
 
@@ -864,6 +784,7 @@ mod tests {
         let outcome = offer(
             &route,
             key_slot(&key),
+            GROUP,
             make_offer(payload.len()),
             &payload[..],
             Duration::from_secs(5),
@@ -896,10 +817,15 @@ mod tests {
             handler,
         }));
 
-        let (remote, remote_static) =
-            handshake(&route, key_slot(&key), &manifest(), Duration::from_secs(2))
-                .await
-                .unwrap();
+        let (remote, remote_static) = handshake(
+            &route,
+            key_slot(&key),
+            GROUP,
+            &manifest(),
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
         assert_eq!(remote, expected);
         assert_ne!(remote_static, [0; 32]);
 
@@ -910,6 +836,7 @@ mod tests {
         let outcome = offer(
             &route,
             key_slot(&key),
+            GROUP,
             sync_offer,
             &payload[..],
             Duration::from_secs(5),
@@ -928,47 +855,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn hello_connection_supports_four_verify_rounds() {
-        let key = keys();
-        let expected = manifest();
-        let (address, task) = start_listener(
-            key.clone(),
-            Arc::new(accepting_handler(
-                expected.clone(),
-                Arc::new(Mutex::new(Vec::new())),
-            )),
-        )
-        .await;
-        let route = Route::Direct(address);
-        let (peer, remote_static, mut stream) =
-            handshake_stream(&route, key_slot(&key), &manifest(), Duration::from_secs(2))
-                .await
-                .unwrap();
-        assert_eq!(peer, expected);
-        assert_ne!(remote_static, [0; 32]);
-
-        for index in 0..4 {
-            let message = VerifyMessage {
-                commitment: Some(format!("{index:064x}")),
-                nonce: None,
-                reveal: None,
-            };
-            write_frame(&mut stream, &message.clone().into())
-                .await
-                .unwrap();
-            assert_eq!(
-                read_frame(&mut stream).await.unwrap(),
-                Frame::Verify {
-                    commitment: message.commitment,
-                    nonce: message.nonce,
-                    reveal: message.reveal,
-                }
-            );
-        }
-        task.abort();
-    }
-
-    #[tokio::test]
     async fn sync_offer_after_hello_is_rejected_to_preserve_wire_compatibility() {
         let key = keys();
         let received = Arc::new(Mutex::new(Vec::new()));
@@ -978,10 +864,15 @@ mod tests {
         )
         .await;
         let route = Route::Direct(address);
-        let (_, _, stream) =
-            handshake_stream(&route, key_slot(&key), &manifest(), Duration::from_secs(2))
-                .await
-                .unwrap();
+        let (_, _, stream) = handshake_stream(
+            &route,
+            key_slot(&key),
+            GROUP,
+            &manifest(),
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
 
         let result = offer_on(stream, make_offer(1), &b"x"[..], Duration::from_secs(2)).await;
         assert!(result.is_err());
@@ -1002,6 +893,7 @@ mod tests {
         let result = offer(
             &route,
             key_slot(&key),
+            GROUP,
             make_offer(5),
             &b"abc"[..],
             Duration::from_secs(2),
@@ -1024,6 +916,7 @@ mod tests {
         let outcome = offer(
             &route,
             key_slot(&key),
+            GROUP,
             make_offer(3),
             &b"abcdef"[..],
             Duration::from_secs(2),
@@ -1049,7 +942,7 @@ mod tests {
             Arc::new(accepting_handler(manifest(), received)),
         )
         .await;
-        let mut stream = entangle_transport::connect(address, &key, Duration::from_secs(2))
+        let mut stream = entangle_transport::connect(address, &key, GROUP, Duration::from_secs(2))
             .await
             .unwrap();
         write_frame(&mut stream, &make_offer(2).into())
@@ -1076,6 +969,7 @@ mod tests {
         let outcome = offer(
             &route,
             key_slot(&key),
+            GROUP,
             make_offer(0),
             &b""[..],
             Duration::from_secs(2),
@@ -1087,16 +981,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn wrong_pairing_key_is_reported_as_a_handshake_error() {
+    async fn wrong_group_key_is_reported_as_a_handshake_error() {
         let server_key = keys();
         let mut client_key = server_key.clone();
-        client_key.psk[0] ^= 0x80;
+        client_key.groups.get_mut(&GROUP).unwrap()[0] ^= 0x80;
         let (address, task) =
             start_listener(server_key, Arc::new(RejectingHandler(manifest()))).await;
         let route = Route::Direct(address);
         let result = handshake(
             &route,
             key_slot(&client_key),
+            GROUP,
             &manifest(),
             Duration::from_secs(2),
         )

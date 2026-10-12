@@ -4,7 +4,7 @@ use crate::{
     store::Store,
     wire::{Frame, CLOSE, OPEN, OPEN_FAIL},
 };
-use entangle_transport::{self, LinkKeys};
+use entangle_transport::{self, KeyRing};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -476,16 +476,22 @@ async fn forwarding_does_not_expose_end_to_end_noise_plaintext() {
     let (mut a, mut b) = open_sessions(&server, a_private, "aaaaaaaa", b_private, "aaaaaaaa").await;
     let a_stream = a.open(b.static_public).await.unwrap();
     let b_stream = b.accept().await.unwrap();
-    let keys_a = LinkKeys {
+    let group_id = [0xaa; 4];
+    let keys_a = KeyRing {
         static_private: entangle_transport::generate_static(),
-        psk: [47; 32],
+        groups: [(group_id, [47; 32])].into_iter().collect(),
     };
-    let keys_b = LinkKeys {
+    let keys_b = KeyRing {
         static_private: entangle_transport::generate_static(),
-        psk: [47; 32],
+        groups: [(group_id, [47; 32])].into_iter().collect(),
     };
     let (secure_a, secure_b) = tokio::join!(
-        entangle_transport::connect_io(a_stream.into_io(), &keys_a, Duration::from_secs(3)),
+        entangle_transport::connect_io(
+            a_stream.into_io(),
+            &keys_a,
+            group_id,
+            Duration::from_secs(3)
+        ),
         entangle_transport::accept_io(b_stream.into_io(), &keys_b, Duration::from_secs(3))
     );
     let mut secure_a = secure_a.unwrap();

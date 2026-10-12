@@ -14,9 +14,7 @@ use std::{
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PeerState {
     /// The peer was discovered but its Hello handshake has not completed.
-    Resonating,
-    /// The peer authenticated but still needs local human approval.
-    Pending,
+    Seen,
     /// The peer exchanged compatible manifests.
     Entangled,
 }
@@ -41,6 +39,8 @@ pub struct PeerRecord {
     pub static_key: Option<[u8; 32]>,
     /// Current relationship state.
     pub state: PeerState,
+    /// Group selected by the authenticated link.
+    pub group_id: Option<[u8; 4]>,
     /// Route used by the most recent successful Hello, if known.
     pub path: Option<LinkPath>,
     /// Monotonic time at which this record was refreshed.
@@ -64,7 +64,8 @@ impl Field {
                 resonance: resonance.clone(),
                 manifest: None,
                 static_key: None,
-                state: PeerState::Resonating,
+                state: PeerState::Seen,
+                group_id: None,
                 path: None,
                 last_seen: Instant::now(),
             });
@@ -74,22 +75,30 @@ impl Field {
 
     /// Stores a validated manifest and marks the peer entangled.
     #[must_use]
+    #[cfg(test)]
     pub fn entangle(
         &mut self,
         resonance: Resonance,
         manifest: Manifest,
         static_key: [u8; 32],
     ) -> bool {
-        self.entangle_with_path(resonance, manifest, static_key, Some(LinkPath::Direct))
+        self.entangle_with_group(
+            resonance,
+            manifest,
+            static_key,
+            None,
+            Some(LinkPath::Direct),
+        )
     }
 
-    /// Stores a validated manifest, relationship state, and link route.
+    /// Stores a validated manifest, group, relationship state, and route.
     #[must_use]
-    pub fn entangle_with_path(
+    pub fn entangle_with_group(
         &mut self,
         mut resonance: Resonance,
         manifest: Manifest,
         static_key: [u8; 32],
+        group_id: Option<[u8; 4]>,
         path: Option<LinkPath>,
     ) -> bool {
         let id = resonance.particle_id.clone();
@@ -115,6 +124,7 @@ impl Field {
                 manifest: Some(manifest),
                 static_key: Some(static_key),
                 state: PeerState::Entangled,
+                group_id,
                 path,
                 last_seen: Instant::now(),
             },
@@ -122,59 +132,9 @@ impl Field {
         newly_entangled
     }
 
-    /// Stores an authenticated peer without granting it sync permission.
-    #[must_use]
-    pub fn pend(&mut self, resonance: Resonance, manifest: Manifest, static_key: [u8; 32]) -> bool {
-        self.pend_with_path(resonance, manifest, static_key, Some(LinkPath::Direct))
-    }
-
-    /// Stores an authenticated peer awaiting local approval and its route.
-    #[must_use]
-    pub fn pend_with_path(
-        &mut self,
-        mut resonance: Resonance,
-        manifest: Manifest,
-        static_key: [u8; 32],
-        path: Option<LinkPath>,
-    ) -> bool {
-        let id = resonance.particle_id.clone();
-        let newly_pending = !self
-            .peers
-            .get(&id)
-            .is_some_and(|existing| existing.state == PeerState::Pending);
-        self.bindings.insert(id.clone(), static_key);
-        let path = if let Some(existing) = self.peers.get(&id) {
-            for address in &existing.resonance.addrs {
-                if !resonance.addrs.contains(address) {
-                    resonance.addrs.push(*address);
-                }
-            }
-            path.or(existing.path)
-        } else {
-            path
-        };
-        self.peers.insert(
-            id,
-            PeerRecord {
-                resonance,
-                manifest: Some(manifest),
-                static_key: Some(static_key),
-                state: PeerState::Pending,
-                path,
-                last_seen: Instant::now(),
-            },
-        );
-        newly_pending
-    }
-
     /// Removes a peer which disappeared from mDNS.
     pub fn remove(&mut self, id: &ParticleId) {
         self.peers.remove(id);
-    }
-
-    /// Removes an explicit trust binding after local approval is revoked.
-    pub fn unbind(&mut self, id: &ParticleId) {
-        self.bindings.remove(id);
     }
 
     /// Returns the static key first authenticated for this particle ID.
@@ -245,15 +205,14 @@ impl Field {
                     .static_key
                     .map(|key| hex::encode(Sha256::digest(key))[..16].to_owned());
                 let state = match record.state {
-                    PeerState::Resonating => "resonating",
-                    PeerState::Pending => "pending",
-                    PeerState::Entangled => "entangled",
+                    PeerState::Seen => "seen",
+                    PeerState::Entangled => "linked",
                 };
                 let path = record.path.map(|path| match path {
                     LinkPath::Direct => "direct",
                     LinkPath::Repeater => "repeater",
                 });
-                let mut view = json!({
+                let view = json!({
                     "particle_id": record.resonance.particle_id.as_str(),
                     "name": record.resonance.name,
                     "hostname": record.resonance.hostname,
@@ -267,10 +226,6 @@ impl Field {
                     "manifest": record.manifest,
                     "last_seen_secs": record.last_seen.elapsed().as_secs()
                 });
-                if record.state == PeerState::Pending {
-                    view["approval"] =
-                        json!("Waiting for the human to run `entangle peer approve` on this machine.");
-                }
                 view
             })
             .collect()
@@ -312,7 +267,7 @@ mod tests {
             addrs: vec!["192.0.2.1".parse().unwrap()],
             port: 7337,
             context: None,
-            group: None,
+            groups: vec![],
             proto: PROTOCOL_VERSION,
         });
         assert!(field.entangle(
@@ -323,7 +278,7 @@ mod tests {
                 addrs: vec!["192.0.2.2".parse().unwrap()],
                 port: 7337,
                 context: None,
-                group: None,
+                groups: vec![],
                 proto: PROTOCOL_VERSION,
             },
             manifest(id.clone()),
@@ -350,7 +305,7 @@ mod tests {
             addrs: vec!["192.0.2.1".parse().unwrap()],
             port: 7337,
             context: None,
-            group: None,
+            groups: vec![],
             proto: PROTOCOL_VERSION,
         };
 
@@ -374,7 +329,7 @@ mod tests {
             addrs: vec!["192.0.2.1".parse().unwrap()],
             port: 7337,
             context: None,
-            group: None,
+            groups: vec![],
             proto: PROTOCOL_VERSION,
         });
         let previous = field.by_id(&id).unwrap().last_seen;

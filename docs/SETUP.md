@@ -81,33 +81,22 @@ On macOS, allow the Entangle executable to accept incoming connections in the
 system firewall. Multicast behavior can also depend on the network interface
 and router configuration.
 
-## Pairing
+## Groups
 
-Version 0.3 requires all devices to use the same pairing key and cannot
-communicate with version 0.2.x or 0.1.x peers. Upgrade all devices before
-pairing and approve every peer once on each machine.
-The pairing key is never advertised; mDNS publishes only its 8-character
-group ID.
-Migration: croc is no longer required by Entangle 0.2; remove an old
-installation if it was installed only for Entangle.
+Trust is based on membership in a shared group. Each device can belong to up
+to eight groups, and group keys are never advertised; mDNS publishes only
+public group IDs. Group-bound Noise links encrypt control frames and payloads.
 
-On one device, a human runs:
+Create a group in an interactive terminal:
 
 ```sh
-entangle pair init
+entangle group create work
 ```
 
-On each other device, a human enters the code directly into:
-
-```sh
-entangle pair join <code>
-```
-
-Treat the pairing code as a secret. Do not send it through Entangle, place it
-in MCP configuration, or give it to an agent. Check the paired state and
-public group ID with `entangle pair status`.
-Pairing-key changes take effect within a few seconds without reloading the MCP
-client; installing a new Entangle binary still requires a client reload.
+Inspect groups and members with `entangle group list` and
+`entangle group members work`. Devices join with a one-time code from
+`entangle group invite` (added in the next change). Leave a group with
+`entangle group leave work`.
 
 ## Register as an MCP server
 
@@ -164,8 +153,7 @@ are written separately to stderr.
 1. Start the configured MCP server on both devices and check that both
    processes stay running.
 2. Run `entangle scan` on each device. The other particle should appear.
-3. A human approves each peer on both machines using the flow below. Agents
-   must not compare or relay the verification emoji.
+3. Ensure both devices are members of the same group.
 4. Ask agent A to call `find_entangled_particles`, then send a small JSON
    value or file with `sync_entangled_state`.
 5. Ask agent B to call `observe_entangled_states`. Check the JSON value or
@@ -175,20 +163,7 @@ are written separately to stderr.
 The response's `remaining` count is the number of items still in the inbox
 after the call (after collapse, if requested).
 
-## Human peer approval
-
-All machines must run 0.3 before they can communicate; the protocol is not
-compatible with 0.2.x. Each peer must be approved once on each machine. On
-machine B, run `entangle peer verify` and compare its card with machine A.
-On A, run `entangle peer approve` and press the number for the matching set; A
-then shows its card. On B, run `entangle peer approve` and press the number for
-A's card. Approval is human-only; agents must not perform these commands or
-relay the emoji.
-
-Use `entangle peer revoke <peer>` to revoke an approval. Use
-`entangle peer forget <peer>` to remove saved approval, denial, and
-verification state before starting over. Agents may run `entangle peer list`
-and `entangle peer emoji` only.
+`entangle peer list` shows known members and their shared groups.
 
 Received items survive Entangle restarts and MCP client reloads until they are
 collapsed. Collapsing removes the inbox entry; received files remain on disk.
@@ -264,8 +239,9 @@ entangle repeater status
 ```
 
 The repeater forwards the end-to-end encrypted link bytes and cannot read
-sync content, pairing keys, or SAS values. It does learn enrolled static
-public keys, declared group IDs, connection timing, and traffic sizes.
+sync content, group keys, or repeater-enrollment SAS values. It does learn
+enrolled static public keys, declared group IDs, connection timing, and traffic
+sizes.
 
 ### Run the repeater as a service
 
@@ -333,8 +309,8 @@ enrollments; back it up and keep it private.
   isolation. Use `--peer host:7337` when multicast is blocked; `--peer` can be
   repeated and also accepts a resolvable hostname. For example,
   `ENTANGLE_PEER=host-a:7337,host-b:7337` provides a comma-separated list.
-- **Peers do not entangle:** confirm both machines report `paired: yes` and
-  the same pairing group. A pairing-key mismatch prevents the Noise handshake.
+- **Peers do not link:** confirm both machines are members of a shared group.
+  A group-key mismatch prevents the Noise handshake.
 - **Port conflicts:** if the configured link port is occupied, Entangle listens
   on an ephemeral port. Static `--peer` entries for this machine and firewall
   rules must allow the port it selected.

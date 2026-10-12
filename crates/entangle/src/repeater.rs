@@ -2,6 +2,10 @@
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::Subcommand;
+use crossterm::{
+    event::{read, Event, KeyCode, KeyEventKind, KeyModifiers},
+    terminal::{disable_raw_mode, enable_raw_mode},
+};
 use entangle_core::sas;
 use entangle_repeater::{client, invite, server, store::Store};
 use rand::seq::SliceRandom;
@@ -17,6 +21,61 @@ use std::{
 };
 
 static CONFIG_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum KeyOutcome {
+    Pick(u8),
+    Cancel,
+    Invalid,
+    Ignore,
+}
+
+fn classify_key(code: KeyCode, modifiers: KeyModifiers) -> KeyOutcome {
+    match code {
+        KeyCode::Esc => KeyOutcome::Cancel,
+        KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => KeyOutcome::Cancel,
+        KeyCode::Char(value @ '1'..='9') => KeyOutcome::Pick(value as u8 - b'0'),
+        _ => KeyOutcome::Invalid,
+    }
+}
+
+fn classify_event(event: Event) -> KeyOutcome {
+    match event {
+        Event::Key(key) if key.kind == KeyEventKind::Press => classify_key(key.code, key.modifiers),
+        _ => KeyOutcome::Ignore,
+    }
+}
+
+struct RawModeGuard;
+
+impl RawModeGuard {
+    fn enter() -> io::Result<Self> {
+        enable_raw_mode()?;
+        Ok(Self)
+    }
+}
+
+impl Drop for RawModeGuard {
+    fn drop(&mut self) {
+        let _ = disable_raw_mode();
+    }
+}
+
+fn read_approval_key(max: u8) -> Result<KeyOutcome> {
+    let _raw_mode = RawModeGuard::enter()?;
+    loop {
+        match classify_event(read()?) {
+            KeyOutcome::Ignore => continue,
+            KeyOutcome::Pick(value) if value > max => return Ok(KeyOutcome::Invalid),
+            outcome => return Ok(outcome),
+        }
+    }
+}
+
+fn cancel_approval(output: &mut dyn Write) -> Result<i32> {
+    writeln!(output, "\r\nCancelled; nothing was approved or denied.")?;
+    Ok(1)
+}
 
 #[derive(Debug, Subcommand)]
 pub enum RepeaterCommand {
@@ -500,20 +559,20 @@ fn approve_request(root: PathBuf, output: &mut dyn Write) -> Result<i32> {
         loop {
             write!(output, "Press 1-{}: ", requests.len())?;
             output.flush()?;
-            match crate::peer::read_approval_key(requests.len() as u8)? {
-                crate::peer::KeyOutcome::Pick(value) => {
+            match read_approval_key(requests.len() as u8)? {
+                KeyOutcome::Pick(value) => {
                     writeln!(output, "{value}")?;
                     break requests[usize::from(value - 1)].clone();
                 }
-                crate::peer::KeyOutcome::Cancel => return crate::peer::cancel_approval(output),
-                crate::peer::KeyOutcome::Invalid => {
+                KeyOutcome::Cancel => return cancel_approval(output),
+                KeyOutcome::Invalid => {
                     invalid += 1;
                     writeln!(output, "\r\nPress a number from 1 to {}.", requests.len())?;
                     if invalid == 3 {
-                        return crate::peer::cancel_approval(output);
+                        return cancel_approval(output);
                     }
                 }
-                crate::peer::KeyOutcome::Ignore => unreachable!(),
+                KeyOutcome::Ignore => unreachable!(),
             }
         }
     };
@@ -536,17 +595,17 @@ fn approve_request(root: PathBuf, output: &mut dyn Write) -> Result<i32> {
     let choice = loop {
         write!(output, "Press 1-5: ")?;
         output.flush()?;
-        match crate::peer::read_approval_key(5)? {
-            crate::peer::KeyOutcome::Pick(value) => {
+        match read_approval_key(5)? {
+            KeyOutcome::Pick(value) => {
                 writeln!(output, "{value}")?;
                 break usize::from(value);
             }
-            crate::peer::KeyOutcome::Cancel => return crate::peer::cancel_approval(output),
+            KeyOutcome::Cancel => return cancel_approval(output),
             _ => {
                 invalid += 1;
                 writeln!(output, "\r\nPress a number from 1 to 5.")?;
                 if invalid == 3 {
-                    return crate::peer::cancel_approval(output);
+                    return cancel_approval(output);
                 }
             }
         }

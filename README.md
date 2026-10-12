@@ -4,13 +4,12 @@
 
 Entangle is a local-first MCP server for letting two LLM agents on the same
 LAN discover one another, exchange capability manifests, and transfer JSON or
-files through a pairing-key-authenticated Noise link. Control frames and
-payload chunks are encrypted end-to-end and payloads are verified with
-SHA-256.
+files through a group-authenticated Noise link. Control frames and payload
+chunks are encrypted end-to-end and payloads are verified with SHA-256.
 
 Entangle uses mDNS for automatic discovery and a configurable static-peer
 fallback for networks that block multicast. Discovery metadata includes only
-the public pairing-group ID, never the pairing key.
+public group IDs, never group keys.
 
 ## Glossary
 
@@ -18,8 +17,8 @@ the public pairing-group ID, never the pairing key.
 | --- | --- |
 | Particle | A running Entangle process with a persistent identity |
 | Resonance | Local network discovery through mDNS |
-| Entangled | A peer approved by the human on this machine and allowed to sync |
-| State sync | A JSON message or one-file transfer between entangled peers |
+| Linked | A group member authenticated by a group-bound Noise link |
+| State sync | A JSON message or one-file transfer between linked peers |
 | Observe | Read received state syncs from the local inbox |
 | Collapse | Consume observed inbox entries; received files remain on disk |
 | Field | The process-local registry of discovered peers |
@@ -52,12 +51,13 @@ entangle scan
 Register the binary as an MCP stdio server in your agent client. The default
 name is `<hostname>-<first 4 hex of the particle ID>`; the ID is saved in the
 data directory and stays stable across restarts. `--name` is optional. Use the
-same `--context` on devices working on the same project. Pair the devices
-before they can connect: a human runs `entangle pair init` on one device and
-`entangle pair join <code>` on the others. Pairing codes are secrets and must
-only be exchanged by the humans. A second Entangle server using the same data
-directory gets a temporary ID while the first server is running. See
-[docs/SETUP.md](docs/SETUP.md) for pairing, firewall, client configuration,
+same `--context` on devices working on the same project. Create a group with
+`entangle group create <name>`; devices join with a one-time code from
+`entangle group invite` (added in the next change). Use `entangle group list`,
+`entangle group members <name>`, and `entangle group leave <name>` to inspect
+or leave groups. A second Entangle server using the same data directory gets
+a temporary ID while the first server is running. See
+[docs/SETUP.md](docs/SETUP.md) for group setup, firewall, client configuration,
 and a two-machine smoke test.
 
 The MCP tools are `find_entangled_particles`, `sync_entangled_state`, and
@@ -67,9 +67,8 @@ The MCP tools are `find_entangled_particles`, `sync_entangled_state`, and
 ## Design and security
 
 The crate boundaries, message flow, wire format, and security limitations are
-documented in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). Version 0.3 is not
-wire-compatible with 0.1.x or 0.2.x; upgrade all devices before pairing and
-approve each peer once on every machine.
+documented in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). Protocol version 4
+uses group-bound Noise links; all devices must share a group to communicate.
 
 ## License
 
