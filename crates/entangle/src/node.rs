@@ -2140,6 +2140,23 @@ mod tests {
         .expect("both particles should connect and see each other in the repeater directory");
     }
 
+    async fn wait_for_repeater_sessions(a: &Particle, b: &Particle) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let a_connected =
+                    a.find_particles(&json!({}))["self"]["repeater"]["connected"] == true;
+                let b_connected =
+                    b.find_particles(&json!({}))["self"]["repeater"]["connected"] == true;
+                if a_connected && b_connected {
+                    break;
+                }
+                sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("both particles should connect to the repeater");
+    }
+
     async fn wait_for_group_pair(a: &Particle, b: &Particle) {
         tokio::time::timeout(Duration::from_secs(10), async {
             loop {
@@ -3022,7 +3039,7 @@ mod tests {
         );
         let (a, _) = Particle::start(options_a, None).await.unwrap();
         let (b, _) = Particle::start(options_b, None).await.unwrap();
-        wait_for_repeater(&a, &b).await;
+        wait_for_repeater_sessions(&a, &b).await;
         wait_for_group_pair(&a, &b).await;
         tokio::time::timeout(Duration::from_secs(10), async {
             loop {
