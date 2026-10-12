@@ -23,7 +23,7 @@ Use this when you install Entangle on Windows and register it with omp.
    `%LOCALAPPDATA%\Programs\entangle\bin`; the installer prints
    `Entangle executable: <path>`. Record that absolute path for all later
    verification and registration steps. If the installer output is
-   unavailable, use `%LOCALAPPDATA%\Programs\entangle\bin\entangle.exe`.
+   unavailable, use `$env:LOCALAPPDATA\Programs\entangle\bin\entangle.exe` (PowerShell; expand it fully in config files).
    Restart the terminal if the installer adds its directory to PATH.
 
 2. **On the Windows device (PowerShell, only if required):** If Windows

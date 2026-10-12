@@ -119,7 +119,8 @@ proceeding.
    `Entangle MCP executable: <path>` and Windows prints
    `Entangle executable: <path>`. If it did not print a path, use
    `$HOME/.local/bin/entangle` on Unix or
-   `%LOCALAPPDATA%\Programs\entangle\bin\entangle.exe` on Windows. Use this
+   `$env:LOCALAPPDATA\Programs\entangle\bin\entangle.exe` on Windows (PowerShell
+   syntax; write the fully expanded path into config files). Use this
    absolute path for every later CLI check and MCP registration.
 
    Groups created with Entangle 0.6 are incompatible with 0.7 and remain only
@@ -190,7 +191,7 @@ proceeding.
    for each invite. `--via` bypasses mDNS discovery, not a firewall.
 
    On Linux, ask the human to check UFW and only change it if it is active.
-   Run the allow commands only when `sudo ufw status` reports active. These
+   The human runs the allow commands only when `sudo ufw status` reports active. These
    fixed-port rules cover the default link and optional mDNS discovery; they
    do not open the random invite listener:
 
@@ -269,7 +270,7 @@ proceeding.
    continue at step 6. For Claude Code or another client that requires a
    restart, ask the human to paste this line into the restarted agent:
 
-   > Read https://raw.githubusercontent.com/DailenG/entangle/main/docs/AGENT_SETUP.md and continue from step 6; Entangle is already installed and registered at `<path>`.
+   > Read https://raw.githubusercontent.com/DailenG/entangle/main/docs/AGENT_SETUP.md and continue from step 6; Entangle is already installed and registered at `<abs-path>`.
 
    **Other clients:** Follow their documented stdio MCP configuration, then
    ask the human to reload or restart as required. Use the continuation line

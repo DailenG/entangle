@@ -154,7 +154,7 @@ when the example does not match its current schema.
 The installers print the absolute executable path as `Entangle MCP executable:
 <path>` on Unix or `Entangle executable: <path>` on Windows. If the output is
 unavailable, use `$HOME/.local/bin/entangle` or
-`%LOCALAPPDATA%\Programs\entangle\bin\entangle.exe`, respectively. Use that
+`$env:LOCALAPPDATA\Programs\entangle\bin\entangle.exe` (PowerShell; expand it fully in config files), respectively. Use that
 absolute path for all version/help checks and MCP registrations; GUI clients
 often do not inherit your shell's `PATH`. If using a custom `--data-dir`, pass
 the same directory to the MCP server, agent-run read-only CLI commands, and
