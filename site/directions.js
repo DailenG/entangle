@@ -419,8 +419,8 @@
       if (e.target.name === "speed") setSpeed(parseFloat(e.target.value), true);
     });
     document.addEventListener("keydown", function (e) {
-      if (e.target.closest("input, textarea, [contenteditable]")) return;
-      if (e.key === "Escape") close();
+      if (e.key === "Escape") { close(); return; }
+      if (e.target.closest("textarea, select, [contenteditable], input:not([type=radio]):not([type=checkbox]):not([type=button])")) return;
       var n = parseInt(e.key, 10); if (n >= 1 && n <= DIRECTIONS.length) apply(DIRECTIONS[n - 1].id, true);
       if (e.key === "q" || e.key === "Q") { setSpeed(speed === 1 ? 0.25 : 1, true); document.getElementById(speed === 1 ? "speed-normal" : "speed-quarter").checked = true; }
     });
