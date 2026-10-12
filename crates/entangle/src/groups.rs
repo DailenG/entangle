@@ -653,6 +653,26 @@ mod tests {
     }
 
     #[test]
+    fn group_directory_name_must_match_key_id() {
+        let root = tempdir().unwrap();
+        let group = create_named(root.path(), "work");
+        let original_path = root.path().join("groups").join(&group.id);
+        let renamed_id = if group.id == "00000000" {
+            "00000001"
+        } else {
+            "00000000"
+        };
+        let renamed_path = original_path.with_file_name(renamed_id);
+        assert_eq!(renamed_id.len(), 8);
+        fs::rename(&original_path, &renamed_path).unwrap();
+
+        match list(root.path()).unwrap_err() {
+            GroupError::Malformed { path, .. } => assert_eq!(path, renamed_path),
+            error => panic!("expected malformed group data, got {error}"),
+        }
+    }
+
+    #[test]
     fn add_member_is_idempotent_and_rejects_key_conflicts() {
         let root = tempdir().unwrap();
         let group = create_named(root.path(), "work");
