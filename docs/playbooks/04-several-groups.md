@@ -4,7 +4,7 @@ Use this when the same device needs separate group memberships, such as work and
 
 ## You'll need
 
-- Entangle 0.5.0 and a separate saved identity for each device.
+- Entangle 0.6.0 or later and a separate saved identity for each device.
 - An interactive terminal for each human-operated create, invite, and join.
 - A network that permits invite TCP connections, or the inviter's direct
   address for `--via`.

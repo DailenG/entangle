@@ -4,7 +4,7 @@ Use this when a group invite, peer link, discovery path, or repeater does not wo
 
 ## You'll need
 
-- Entangle 0.5.0 on each affected device.
+- Entangle 0.6.0 or later on each affected device.
 - Access to the relevant device's terminal and, for repeater issues, the host.
 - The group name, invite code if still open, and reachable host/port details.
 - A human operator for group invite/join and repeater enrollment or

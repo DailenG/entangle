@@ -4,7 +4,7 @@ Use this when devices on different networks need a common relay for their encryp
 
 ## You'll need
 
-- Entangle 0.5.0 on the host and every device.
+- Entangle 0.6.0 or later on the host and every device.
 - A host with a reachable TCP port, defaulting to 7338 in these commands, and
   a persistent private data volume.
 - An interactive terminal for human-only enrollment and device-management

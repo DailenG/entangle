@@ -4,7 +4,7 @@ Use this when you are connecting your first two devices in one group.
 
 ## You'll need
 
-- Entangle 0.5.0 on both devices.
+- Entangle 0.6.0 or later on both devices.
 - A saved persistent particle identity on each device; start each configured
   Entangle server once if that identity has not been created yet.
 - An interactive terminal on each device for the human-only group commands.

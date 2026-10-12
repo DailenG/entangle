@@ -15,6 +15,3 @@ Use these walkthroughs for common group, network, repeater, and client setups.
 | 09 | [Windows with omp](09-windows-omp.md) | You are installing and configuring Entangle on Windows with omp | Windows device and its group peers |
 | 10 | Leaving a group, removing a device, rekeying — coming with member removal | Membership administration is available | Group members |
 | 11 | [Troubleshooting](11-troubleshooting.md) | Discovery, linking, invitations, or repeater enrollment fails | The affected device and relevant peers |
-
-Playbook 08 is maintained separately and is linked here, but is not part of
-this set of changes.

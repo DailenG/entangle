@@ -4,7 +4,7 @@ Use this when a group already exists and you want to enroll one more device.
 
 ## You'll need
 
-- Entangle 0.5.0 on the current member and new device.
+- Entangle 0.6.0 or later on the current member and new device.
 - A saved persistent particle identity on both devices.
 - The current member's group name and an interactive terminal on both devices.
 - A network that allows the invite TCP connection, or a direct address to use
