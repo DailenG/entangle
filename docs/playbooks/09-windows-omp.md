@@ -20,23 +20,32 @@ Use this when you install Entangle on Windows and register it with omp.
    ```
 
    By default the executable is installed under
-   `%LOCALAPPDATA%\Programs\entangle\bin`; the installer prints the executable
-   path. Restart the terminal if the installer adds its directory to PATH.
+   `%LOCALAPPDATA%\Programs\entangle\bin`; the installer prints
+   `Entangle executable: <path>`. Record that absolute path for all later
+   verification and registration steps. If the installer output is
+   unavailable, use `%LOCALAPPDATA%\Programs\entangle\bin\entangle.exe`.
+   Restart the terminal if the installer adds its directory to PATH.
 
 2. **On the Windows device (PowerShell, only if required):** If Windows
-   Firewall blocks discovery or incoming links, ask the human before changing
-   firewall rules. The following commands require an elevated PowerShell
-   session:
+   Firewall blocks discovery or incoming links, ask the human to run the
+   following program rule in elevated PowerShell. Use the installer's
+   absolute executable path's containing directory as `<abs>`; do not try to
+   elevate:
 
    ```powershell
-   New-NetFirewallRule -DisplayName "Entangle link" -Direction Inbound -Protocol TCP -LocalPort 7337 -Action Allow
-   New-NetFirewallRule -DisplayName "Entangle mDNS" -Direction Inbound -Protocol UDP -LocalPort 5353 -Action Allow
+   New-NetFirewallRule -DisplayName "Entangle" -Direction Inbound -Program "<abs>\entangle.exe" -Action Allow -Profile Private
    ```
 
-   If an agent runs these commands, it must first write them to a temporary
-   `.ps1`, then run `powershell.exe -NoProfile -ExecutionPolicy Bypass -File
-   <path>` (`<path>` is the temporary script's full path) and delete the
-   script. Do not pass inline `-Command` strings.
+   Keep an existing UDP 5353 rule for mDNS. If discovery needs it and no rule
+   exists, the human can add one in elevated PowerShell:
+
+   ```powershell
+   New-NetFirewallRule -DisplayName "Entangle mDNS" -Direction Inbound -Protocol UDP -LocalPort 5353 -Action Allow -Profile Private
+   ```
+
+   Group invitations use a random ephemeral TCP port. Do not add a guessed
+   port rule; if a firewall blocks it, the human must choose an appropriate
+   policy. `--via` bypasses mDNS, not the firewall.
 
 3. **In omp's MCP config:** Add an Entangle server entry in
    `%USERPROFILE%\.omp\agent\mcp.json` and replace `<user>` with the Windows
@@ -48,29 +57,34 @@ Use this when you install Entangle on Windows and register it with omp.
    {
      "mcpServers": {
        "entangle": {
-         "command": "C:\\Users\\<user>\\AppData\\Local\\Programs\\entangle\\bin\\entangle.exe",
+         "command": "<abs-path>",
          "args": ["serve"]
        }
      }
    }
    ```
 
-   Ask the human to reload omp with `/mcp reload`. Its first server start
-   creates the saved identity required by group commands. If a custom data
-   directory is configured, the human must use the same directory for group
-   commands.
+   Copy the exact installer path into `command` and JSON-escape its
+   backslashes. Ask the human to reload omp with `/mcp reload`; omp keeps the
+   current conversation through this reload. Its first server start creates
+   the saved identity required by group commands. If a custom data directory
+   is configured, pass it to the server, agent-run read-only CLI commands,
+   and human group commands.
 
 4. **On the Windows device (PowerShell):** Confirm the command is available
    and inspect its flags.
 
    ```powershell
-   entangle --version
-   entangle --help
+   & "<abs-path>" --version
+   & "<abs-path>" --help
    ```
+
+   Use the absolute path recorded in step 1. Add `--data-dir <directory>`
+   after the executable path and before `--version` or `--help` when configured.
 
 5. **On the group devices (each operator's terminal):** For a new group, a
    person runs `entangle group create <name> --invite <N>` on the first device,
-   where `<N>` is the number of other devices. For an existing group, any
+   where `<N>` is the number of other devices (1–20). For an existing group, any
    member runs `entangle group invite <name>`. A person runs
    `entangle group join <code>` on each other device, or adds
    `--via <host:port>` using the inviter's output if mDNS cannot find the

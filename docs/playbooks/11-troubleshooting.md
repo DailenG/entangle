@@ -4,7 +4,7 @@ Use this when a group invite, peer link, discovery path, or repeater does not wo
 
 ## You'll need
 
-- Entangle 0.6.0 or later on each affected device.
+- Entangle 0.7.x on every machine.
 - Access to the relevant device's terminal and, for repeater issues, the host.
 - The group name, invite code if still open, and reachable host/port details.
 - A human operator for group invite/join and repeater enrollment or
@@ -85,7 +85,7 @@ The cross-network paths were not tested on a real LAN.
 | Members are not linked even though both devices list the group. | Membership does not make a blocked route reachable. | Check the link TCP port, static `--peer` address, and repeater enrollment. |
 | `group <name> is too far out of date ...; re-invite this device` | The device no longer has a retained key epoch shared with a current member. | Ask the admin to invite it again, then join with the new code. Joining refreshes the stale local group to the current key, keeps its local name, and prints `Refreshed <name>: this device was out of date and now has the current key.` |
 | `This device was removed from <group>; ask its admin to invite it.` | The device is revoked in the group's signed membership state. | Ask the group admin to invite this device again. |
-| `group <name> was created by Entangle 0.6; run ... group leave ... and create it again` | This is a pre-v2 group and is not migrated. | Leave the outdated group and create or join a current group again. |
+| `group <name> was created by Entangle 0.6; run ... group leave ... and create it again` | This is a pre-v2 group and is not migrated. | Upgrade every machine to 0.7.x and quit/reload the MCP clients; leave the group on every machine, then only one machine creates it with `group create <name> --invite <N>` and the others join. |
 
 ## Next
 

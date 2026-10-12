@@ -59,32 +59,41 @@ on Windows).
 
 ## Firewall
 
-Allow inbound TCP 7337 for the encrypted link and UDP 5353 for mDNS if
-automatic discovery is desired. If the configured link port is busy, Entangle
-uses an ephemeral port; firewall rules and static peer entries must permit
-that port.
+The encrypted link uses TCP 7337 by default and mDNS discovery uses UDP 5353.
+If the configured link port is busy, Entangle falls back to an ephemeral port.
+Group invites use a separate random ephemeral TCP port that is open only while
+the invite runs; do not guess a fixed port to open. `--via` bypasses mDNS
+discovery, not a firewall.
 
-On Ubuntu with UFW:
+On Linux, check UFW and run the allow commands only when `sudo ufw status`
+reports active. These fixed-port rules cover the default link and optional
+mDNS discovery, not the random invite listener:
 
 ```sh
+sudo ufw status
 sudo ufw allow 7337/tcp
 sudo ufw allow 5353/udp
 ```
 
-On Windows PowerShell (run as Administrator):
+On Windows, ask the human to run this in elevated PowerShell. Set `<abs>` to
+the install directory containing the executable path printed by the installer:
 
 ```powershell
-New-NetFirewallRule -DisplayName "Entangle link" -Direction Inbound -Protocol TCP -LocalPort 7337 -Action Allow
-New-NetFirewallRule -DisplayName "Entangle mDNS" -Direction Inbound -Protocol UDP -LocalPort 5353 -Action Allow
+New-NetFirewallRule -DisplayName "Entangle" -Direction Inbound -Program "<abs>\entangle.exe" -Action Allow -Profile Private
 ```
 
-On macOS, allow the Entangle executable to accept incoming connections in the
-system firewall. Multicast behavior can also depend on the network interface
-and router configuration.
+Keep an existing UDP 5353 mDNS rule. If discovery needs it and no rule exists,
+the human can add one in elevated PowerShell:
 
-Group invites use an additional ephemeral TCP listener. The invite command
-prints its address and port; the firewall must allow that inbound connection
-while the invite is open.
+```powershell
+New-NetFirewallRule -DisplayName "Entangle mDNS" -Direction Inbound -Protocol UDP -LocalPort 5353 -Action Allow -Profile Private
+```
+
+On macOS, ask the human to allow incoming connections for Entangle in the
+system firewall. If an active firewall blocks an invite, the human must choose
+an appropriate policy for its random listener; do not suggest a fixed port.
+Multicast behavior can also depend on the network interface and router
+configuration.
 
 ## Groups
 
@@ -92,11 +101,17 @@ Trust is based on membership in a shared group. Each device can belong to up
 to eight groups, and group keys are never advertised; mDNS publishes only
 public group IDs. Group-bound Noise links encrypt control frames and payloads.
 Every machine in a group must use Entangle 0.7.x. Groups created with 0.6 are
-outdated and must be left and recreated after upgrading.
+outdated and remain only on each machine's local disk. To replace one, the
+human upgrades every machine to 0.7, quits and reloads the MCP clients, then
+runs `entangle group leave <name>` on each machine. On one machine only, the
+human runs `entangle group create <name> --invite <N>`; every other machine
+runs `entangle group join <code>`. Leaving the outdated group deletes only
+that machine's local copy; only one machine recreates the group.
 
 To create a group and invite three other devices from the first machine, run
-this in an interactive terminal. The command remains open until all three
-devices join or the invite expires:
+this in an interactive terminal. `<N>` is the number of other machines, from
+1 to 20. The command remains open until all requested devices join or the
+invite expires:
 
 ```sh
 entangle group create work --invite 3
@@ -136,8 +151,14 @@ process a temporary ID while the first holds the identity lock. Use a matching
 `--context` for agents working in the same project.
 Configuration formats can vary by client version; check your client's docs
 when the example does not match its current schema.
-GUI clients often do not inherit your shell's `PATH`, so use the absolute path
-to the `entangle` executable in their configuration.
+The installers print the absolute executable path as `Entangle MCP executable:
+<path>` on Unix or `Entangle executable: <path>` on Windows. If the output is
+unavailable, use `$HOME/.local/bin/entangle` or
+`%LOCALAPPDATA%\Programs\entangle\bin\entangle.exe`, respectively. Use that
+absolute path for all version/help checks and MCP registrations; GUI clients
+often do not inherit your shell's `PATH`. If using a custom `--data-dir`, pass
+the same directory to the MCP server, agent-run read-only CLI commands, and
+human-run group commands.
 
 **Claude Desktop** (`claude_desktop_config.json`):
 
@@ -155,8 +176,11 @@ to the `entangle` executable in their configuration.
 **Claude Code**:
 
 ```sh
-claude mcp add entangle -- entangle serve --context project-x
+claude mcp add --scope user entangle -- <abs-path> serve
+claude mcp list
 ```
+
+Restart Claude Code to load the registered server.
 
 **LM Studio** commonly uses an MCP server configuration such as `mcp.json`;
 check the current LM Studio docs for the exact location and format:
@@ -172,9 +196,10 @@ check the current LM Studio docs for the exact location and format:
 }
 ```
 
-For a generic stdio MCP client, launch `entangle serve --context project-x`,
-send JSON-RPC lines to its stdin, and read JSON-RPC lines from stdout. Logs
-are written separately to stderr.
+For a generic stdio MCP client, launch `<abs-path> serve` (add
+`--data-dir <directory>` first if configured), send JSON-RPC lines to its
+stdin, and read JSON-RPC lines from stdout. Logs are written separately to
+stderr.
 
 ## Two-machine smoke test
 

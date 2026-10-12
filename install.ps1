@@ -146,29 +146,8 @@ try {
         Write-Output 'Added the install directory to your user PATH; restart your terminal to pick it up.'
     }
     Write-Output 'Reload or restart your MCP client so it runs this version.'
-    Write-Output 'Pairing-key changes take effect without a client reload; binary upgrades require one.'
-    $pairStatusOutput = @()
-    $pairStatusSucceeded = $false
-    try {
-        $pairStatusOutput = @(& $binaryPath pair status 2>$null)
-        $pairStatusSucceeded = $LASTEXITCODE -eq 0
-    } catch {
-        $pairStatusOutput = @()
-    }
-    $paired = $false
-    $pairingGroup = $null
-    foreach ($line in $pairStatusOutput) {
-        if ($line -match '^paired: yes$') {
-            $paired = $true
-        } elseif ($line -match '^group: (.+)$') {
-            $pairingGroup = $matches[1]
-        }
-    }
-    if ($pairStatusSucceeded -and $paired -and $pairingGroup -and $pairingGroup -ne 'none') {
-        Write-Output "Already paired (group $pairingGroup); no pairing needed."
-    } else {
-        Write-Output 'Pair this machine: run `entangle pair init` on your first machine, then `entangle pair join <code>` here.'
-    }
+    Write-Output 'After reloading the MCP client, check `entangle group list`.'
+    Write-Output 'Group create/invite/join commands are typed by a human; see https://raw.githubusercontent.com/DailenG/entangle/main/docs/AGENT_SETUP.md or playbook 01.'
 } finally {
     Remove-Item -LiteralPath $tempDir -Recurse -Force -ErrorAction SilentlyContinue
 }

@@ -104,12 +104,5 @@ case ":${PATH:-}:" in
     *) printf "Add Entangle to PATH with: export PATH=\"%s:\$PATH\"\n" "$install_dir" ;;
 esac
 printf 'Reload or restart your MCP client so it runs this version.\n'
-printf 'Pairing-key changes take effect without a client reload; binary upgrades require one.\n'
-pair_status=$("$install_dir/entangle" pair status 2>/dev/null) || pair_status=
-paired=$(printf '%s\n' "$pair_status" | awk '$1 == "paired:" { print $2; exit }')
-group=$(printf '%s\n' "$pair_status" | awk '$1 == "group:" { print $2; exit }')
-if [ "$paired" = yes ] && [ -n "$group" ] && [ "$group" != none ]; then
-    printf 'Already paired (group %s); no pairing needed.\n' "$group"
-else
-    printf "Pair this machine: run \`entangle pair init\` on your first machine, then \`entangle pair join <code>\` here.\n"
-fi
+printf 'After reloading the MCP client, check `entangle group list`.\n'
+printf 'Group create/invite/join commands are typed by a human; see https://raw.githubusercontent.com/DailenG/entangle/main/docs/AGENT_SETUP.md or playbook 01.\n'

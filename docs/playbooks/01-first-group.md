@@ -4,7 +4,7 @@ Use this when you are connecting your first two devices in one group.
 
 ## You'll need
 
-- Entangle 0.6.0 or later on both devices.
+- Entangle 0.7.x on every machine.
 - A saved persistent particle identity on each device; start each configured
   Entangle server once if that identity has not been created yet.
 - An interactive terminal on each device for the human-only group commands.
@@ -40,9 +40,10 @@ Use this when you are connecting your first two devices in one group.
    entangle group join <code>
    ```
 
-4. **On both devices:** Start or reload the configured Entangle MCP server.
-   Both devices now share the group; they do not need to use the same particle
-   name.
+4. **On both devices:** Verify the group with `entangle group list`. The
+   running server notices group-file changes through `group_watch` within a
+   few seconds; no MCP reload is needed after joining. The devices do not need
+   to use the same particle name.
 
 ## It worked if
 

@@ -115,13 +115,32 @@ proceeding.
    Ask before installing Rust or changing the toolchain. See
    [SETUP.md](SETUP.md) for installer defaults and platform details.
 
-   Groups created with Entangle 0.6 are incompatible with 0.7. `entangle group
-   list` marks them `outdated`; the human must leave each old group and create
-   it again. For a group named `work`, `main.rs` formats the row as:
+   Record the absolute executable path printed by the installer: Unix prints
+   `Entangle MCP executable: <path>` and Windows prints
+   `Entangle executable: <path>`. If it did not print a path, use
+   `$HOME/.local/bin/entangle` on Unix or
+   `%LOCALAPPDATA%\Programs\entangle\bin\entangle.exe` on Windows. Use this
+   absolute path for every later CLI check and MCP registration.
+
+   Groups created with Entangle 0.6 are incompatible with 0.7 and remain only
+   on each machine's local disk. `entangle group list` prints this row for a
+   group named `work`:
 
    ```text
    work  <group-id>  outdated  --  group work was created by Entangle 0.6; run `entangle group leave work` and create it again
    ```
+
+   To replace an outdated group, the human must do these steps in order:
+
+   1. Upgrade every machine to Entangle 0.7.x.
+   2. Quit and reload the MCP clients on every machine.
+   3. On each machine, run `entangle group leave <name>` in a terminal. This
+      deletes only that machine's local outdated group.
+   4. On one machine only, run
+      `entangle group create <name> --invite <N>`, where `<N>` is the number
+      of other machines.
+   5. On every other machine, run `entangle group join <code>` in its
+      terminal. Only one machine recreates the group; the others join it.
 
    After an upgrade, an old process can still hold the saved-identity lock and
    TCP port 7337. A new server can then use an ephemeral identity and fallback
@@ -129,13 +148,12 @@ proceeding.
    human to quit every MCP client, then inspect `pgrep -a entangle` on
    Linux/macOS or Task Manager on Windows. Do not kill processes yourself.
 
-   **Verify:** Run `entangle --version` and `entangle --help`. The help must
-   list `serve`, `node`, `scan`, `group`, `peer`, and `repeater`; confirm every
-   group machine is on the `0.7.x` release line.
+   **Verify:** Run `<abs-path> --version` and `<abs-path> --help`. The help
+   must list `serve`, `node`, `scan`, `group`, `peer`, and `repeater`.
 
-   **If this fails:** Check release availability, the executable directory,
-   and PATH. Report the first failing command. Do not install system packages
-   or change the toolchain without approval.
+   **If this fails:** Check release availability and the executable path.
+   Report the first failing command. Do not install system packages or
+   change the toolchain without approval.
 
 ## 3. Identity
 
@@ -168,42 +186,54 @@ proceeding.
 
    Group invitations use a separate ephemeral TCP listener, open only while
    the invite is active. The inviter prints its direct `--via <host:port>`
-   address. `--via` bypasses mDNS discovery, not a firewall: if the listener
-   port is blocked, the human must allow that port while the invite is open.
-   Allow the configured link port (or its fallback port) for peer links too.
+   address. Do not ask the human to open a guessed invite port: it is random
+   for each invite. `--via` bypasses mDNS discovery, not a firewall.
 
-   Show firewall commands and ask the human to run them. On Ubuntu:
+   On Linux, ask the human to check UFW and only change it if it is active.
+   Run the allow commands only when `sudo ufw status` reports active. These
+   fixed-port rules cover the default link and optional mDNS discovery; they
+   do not open the random invite listener:
 
    ```sh
+   sudo ufw status
    sudo ufw allow 7337/tcp
    sudo ufw allow 5353/udp
    ```
 
-   `New-NetFirewallRule` requires elevated PowerShell. Ask the human to open
-   PowerShell as Administrator and run these commands; never try to elevate:
+   On Windows, ask the human to run an executable rule in elevated
+   PowerShell; never try to elevate. Set `<abs>` to the install directory
+   containing the executable path printed by the installer:
 
    ```powershell
-   New-NetFirewallRule -DisplayName "Entangle link" -Direction Inbound -Protocol TCP -LocalPort 7337 -Action Allow
-   New-NetFirewallRule -DisplayName "Entangle mDNS" -Direction Inbound -Protocol UDP -LocalPort 5353 -Action Allow
+   New-NetFirewallRule -DisplayName "Entangle" -Direction Inbound -Program "<abs>\entangle.exe" -Action Allow -Profile Private
+   ```
+
+   Keep an existing UDP 5353 mDNS rule. If the human needs mDNS and no rule
+   exists, they can add one in the same elevated PowerShell:
+
+   ```powershell
+   New-NetFirewallRule -DisplayName "Entangle mDNS" -Direction Inbound -Protocol UDP -LocalPort 5353 -Action Allow -Profile Private
    ```
 
    On macOS, ask the human to allow incoming connections for Entangle if the
    system firewall prompts.
 
-   **Verify:** Ask the human to confirm the required rules or a successful
-   connection. State which ports were checked; do not claim rules changed
-   unless an approved command changed them.
+   If an active firewall blocks an invite, ask the human to choose an
+   appropriate policy for the random listener; do not suggest a fixed port.
+   **Verify:** Ask the human to confirm the approved firewall policy or a
+   successful connection. Do not claim rules changed unless an approved
+   command changed them.
 
    **If this fails:** Report the exact error. Do not retry with elevated
    privileges or change network policy without approval.
 
 ## 5. Register MCP
 
-5. Find Entangle's absolute path and register it in the detected MCP client.
-   GUI apps may not inherit the shell's PATH. On Linux/macOS, use
-   `command -v entangle`; on Windows, use `(Get-Command entangle).Source`
-   through a temporary `.ps1` script. Use that absolute path in the `command`
-   field.
+5. Use the absolute executable path recorded in step 2 for every CLI check
+   and MCP registration. GUI apps may not inherit the shell's PATH. If no
+   installer ran, resolve the path with `command -v entangle` on Linux/macOS
+   or `(Get-Command entangle).Source` on Windows, using a temporary `.ps1`
+   script.
 
    **omp on Windows:** Use `%USERPROFILE%\.omp\agent\mcp.json` and the same
    `mcpServers` object shape as [playbook 09](playbooks/09-windows-omp.md):
@@ -212,30 +242,48 @@ proceeding.
    {
      "mcpServers": {
        "entangle": {
-         "command": "C:\\Users\\<user>\\AppData\\Local\\Programs\\entangle\\bin\\entangle.exe",
+         "command": "<abs-path>",
          "args": ["serve"]
        }
      }
    }
    ```
 
-   Use the actual absolute executable path. For another client, follow its
-   documented stdio MCP configuration. Ask before editing a configuration
-   file you did not create; show the proposed diff first. If MCP uses a custom
-   `--data-dir`, the human must pass the same directory to group commands.
+   Copy the installer's exact absolute path into `command`; JSON-escape
+   Windows backslashes. For a custom data directory, pass the same
+   `--data-dir <directory>` to the MCP server, every agent-run read-only CLI
+   command, and every human-run group command. For example:
+   `<abs-path> --data-dir <directory> group list`. Ask before editing a
+   configuration file you did not create; show the proposed diff first.
 
-   Ask the human to reload the MCP client. In omp, use `/mcp reload`. The
-   first server start creates the saved identity required by group commands.
-   If there is no saved identity, the CLI reports:
+   **Claude Code:** After the human approves the user-level MCP config change,
+   register the absolute executable path:
+
+   ```sh
+   claude mcp add --scope user entangle -- <abs-path> serve
+   claude mcp list
+   ```
+
+   Restart Claude Code to load the server. Only omp's `/mcp reload` keeps the
+   current conversation; after its reload, ask the human to tell you to
+   continue at step 6. For Claude Code or another client that requires a
+   restart, ask the human to paste this line into the restarted agent:
+
+   > Read https://raw.githubusercontent.com/DailenG/entangle/main/docs/AGENT_SETUP.md and continue from step 6; Entangle is already installed and registered at `<path>`.
+
+   **Other clients:** Follow their documented stdio MCP configuration, then
+   ask the human to reload or restart as required. Use the continuation line
+   above when a restart starts a new conversation.
+
+   The first server start creates the saved identity required by group
+   commands. If there is no saved identity, the CLI reports:
 
    ```text
    this machine has no saved Entangle identity in <data-directory> yet; start Entangle once (for example, open your MCP client) using the same data directory, then retry
    ```
 
-   Tell the human: “After you reload, tell me to continue at step 6.” MCP
-   tools may restart during reload.
-
-   **Verify:** Confirm the client lists Entangle and reconnects after reload;
+   **Verify:** Confirm the client lists Entangle and reconnects after reload
+   or restart; for Claude Code, check `claude mcp list`. Then
    `find_entangled_particles` should return `self` with `version`, `identity`,
    `groups`, and `repeater` fields.
 
@@ -248,16 +296,22 @@ proceeding.
 6. First run the read-only command:
 
    ```sh
-   entangle group list
+   <abs-path> group list
    ```
+
+   If the MCP server uses a custom data directory, add the same
+   `--data-dir <directory>` to this and every other agent-run read-only CLI
+   command. Human group commands must use that same directory too.
 
    Ask the human how many machines will participate, whether a group already
    exists, and (for a new group) what it should be named. Give the human the
    matching instructions below. The agent must never see, ask for, display,
    copy, or repeat an invite code; the human enters it directly in a terminal.
+   Human-only commands refuse to run without an interactive terminal and
+   print `This is a human-only command and requires an interactive terminal.`
 
    **New group:** On the first machine, the human runs this in an interactive
-   terminal, replacing `<N>` with the number of other machines:
+   terminal, replacing `<N>` with the number of other machines (1–20):
 
    ```sh
    entangle group create <name> --invite <N>
@@ -292,26 +346,30 @@ proceeding.
    run:
 
    ```sh
-   entangle group list
-   entangle group members <name>
+   <abs-path> group list
+   <abs-path> group members <name>
    ```
+
+   Add `--data-dir <directory>` before `group` to both commands when the MCP
+   server uses a custom data directory.
 
    ### Rules for agents
 
    - Human-only group commands: `group create`, `group invite`, `group join`,
      `group leave`, `group remove`, `group rekey`, and `group admin`. Agents
-     may run the read-only `entangle group list`,
-     `entangle group members <name>`, and `entangle peer list`.
+     may run the read-only `<abs-path> group list`,
+     `<abs-path> group members <name>`, and `<abs-path> peer list`.
    - The human must run all invite/join commands in a terminal. Invitations
      expire after ten minutes; a wrong code or failed confirmation closes the
      invite. `--count N` sets the successful-join limit (default 1, maximum
-     20). `group join --as <local-name>` changes only the local group label,
-     not the particle name.
+     20). `group create --invite N` accepts 1–20 other machines.
+     `group join --as <local-name>` changes only the local group label, not
+     the particle name.
    - Do not request, display, relay, or log invite codes or group keys. Do not
      remove members, rotate keys, transfer administration, or leave groups;
      those operations require human judgment.
    - Quantum Repeater administration is human-only. Agents may run
-     `entangle repeater devices` and `entangle repeater status`, but never
+     `<abs-path> repeater devices` and `<abs-path> repeater status`, but never
      `repeater serve`, `repeater invite`, `repeater join`, `repeater approve`,
      `repeater revoke`, or `repeater leave`.
    - In `find_entangled_particles`, `path` is the route of the most recent
@@ -323,14 +381,13 @@ proceeding.
    - If `find_entangled_particles.self.warning` is present, report it
      verbatim to the human. Never kill or stop processes to resolve it.
 
-   **Verify:** `entangle group list` shows the expected group and
-   `entangle group members <name>` shows its members. After the next watcher
+   **Verify:** `<abs-path> group list` shows the expected group and
+   `<abs-path> group members <name>` shows its members. After the next watcher
    poll, `find_entangled_particles.self.groups` should include the group.
 
    **If this fails:** Report the exact command and error. Ask the human to
-   check that the inviter is still running, all machines use `0.7.x`, and the
-   same data directory is used for the server and group commands. Never ask
-   for the invite code.
+   check that the inviter is still running and the same data directory is
+   used for the server and group commands. Never ask for the invite code.
 
 ## 7. Verify discovery
 
@@ -339,11 +396,13 @@ proceeding.
    `include_unentangled: true`, discovered but not-yet-linked peers appear as
    `seen`. Shared-group membership does not require a separate peer-approval
    step. Compare `self.version` with each peer's
-   `particles[].manifest.version`.
+   `particles[].manifest.version`; every group machine must use Entangle
+   `0.7.x`. Ask the human to confirm the version of any offline member.
 
    **Verify:** Confirm expected peers are `linked` and compare their
-   `manifest.version` with `self.version`. Use `entangle group members <name>`
-   to distinguish a missing member from a peer that is simply offline.
+   `manifest.version` with `self.version`; confirm each is `0.7.x`. Use
+   `<abs-path> group members <name>` to distinguish a missing member from a
+   peer that is simply offline.
 
    **If this fails:** Check that the peer is running, online, and in the
    shared group. Ask the human before changing firewall or router settings;
@@ -355,7 +414,7 @@ proceeding.
    checked. Do not include invite codes or group keys.
 
    ```text
-   - Entangle version (`entangle --version` and `self.version`):
+   - Entangle version (`<abs-path> --version` and `self.version`):
    - Group list output:
    - Group name or ID and member list:
    - Particle ID:
@@ -382,6 +441,10 @@ proceeding.
    - Send with `sync_entangled_state`: provide exactly one of `state` or
      `file_path`, add a `label` describing the intent, prefer JSON `state` for
      messages and `file_path` for files, and send only a single regular file.
+     Send only files the human asked to share or that are part of the task.
+     Never send anything from Entangle's data directory, including `identity`
+     or `groups/*/key`, SSH keys, credentials, or `.env` files. Ask before
+     sending anything outside the project.
      Choose exactly one targeting form:
 
      ```json
@@ -429,7 +492,8 @@ proceeding.
 | --- | --- | --- |
 | Temporary identity or fallback port | `Another Entangle process on this machine holds the saved identity and/or port {configured_port}. This node is running {reason} (identity: {identity}; link port: {link_port}). Close the other MCP client or old Entangle process, then reload.` | Report `self.warning` verbatim. Ask the human to quit every MCP client, then check for old processes. |
 | Group command ran before the MCP server saved an identity | `this machine has no saved Entangle identity in {0} yet; start Entangle once (for example, open your MCP client) using the same data directory, then retry` | Start the MCP server once with the same data directory, then retry the human-run command. |
-| 0.6 group is outdated | `group {name} was created by Entangle 0.6; run \`entangle group leave {name}\` and create it again` | The human leaves and recreates the group on 0.7.x. |
+| Human-only command needs a TTY | `This is a human-only command and requires an interactive terminal.` | Have the human run the command in an interactive terminal. |
+| 0.6 group is outdated | `group {name} was created by Entangle 0.6; run \`entangle group leave {name}\` and create it again` | Upgrade every machine to 0.7.x and quit/reload its MCP client; the human leaves the group on every machine, then only one machine recreates it with `group create <name> --invite <N>` and the others join. |
 | Invite not found | `No invite {nameplate} found on this network. Check the code and that \`entangle group invite\` is still running; or add --via <host:port>.` | The human checks the code and running invite, then retries with the inviter's direct address if needed. |
 | Wrong code closed the invite | `That code was wrong; the invite is now closed. Ask for a new one.` | The human asks the inviter to start a new invite. Never ask for or repeat the code. |
 

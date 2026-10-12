@@ -5,7 +5,7 @@ or transfers administration to another member.
 
 ## You'll need
 
-- Entangle 0.6.0 or later on each device.
+- Entangle 0.7.x on every machine.
 - The group already joined on each device.
 - A human operator for all membership and key-administration commands.
 - The admin's node online to propagate a removal, rekey, or handoff promptly.

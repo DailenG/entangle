@@ -4,7 +4,7 @@ Use this when multicast is blocked or devices cannot open direct links across th
 
 ## You'll need
 
-- Entangle 0.6.0 or later on each device and an interactive terminal for human-only
+- Entangle 0.7.x on every machine and an interactive terminal for human-only
   group commands.
 - A saved persistent particle identity on each device.
 - For direct joining, TCP reachability to the inviter's printed invite address.

@@ -30,7 +30,7 @@ pub struct Options {
     /// Static host:port peers to dial when multicast is unavailable; comma-separated in ENTANGLE_PEER.
     #[arg(long, global = true, env = "ENTANGLE_PEER", value_delimiter = ',')]
     pub peer: Vec<String>,
-    /// Base data directory (a particle-specific subdirectory is created).
+    /// Directory used directly for Entangle's persistent identity and group state.
     #[arg(long, global = true, env = "ENTANGLE_DATA_DIR")]
     pub data_dir: Option<PathBuf>,
     /// Legacy option retained for existing MCP configurations.

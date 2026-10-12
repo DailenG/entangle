@@ -84,6 +84,7 @@ enum GroupCommand {
     Create {
         #[arg(id = "group_name", value_name = "NAME")]
         name: String,
+        /// Start an invite for 1–20 additional machines.
         #[arg(long)]
         invite: Option<u8>,
     },

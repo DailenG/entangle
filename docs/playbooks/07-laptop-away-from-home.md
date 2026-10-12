@@ -4,7 +4,7 @@ Use this when a laptop must keep reaching group members after it leaves the home
 
 ## You'll need
 
-- Entangle 0.6.0 or later on the laptop and the other group devices.
+- Entangle 0.7.x on every machine.
 - A repeater reachable from the laptop's current network.
 - The laptop enrolled with that repeater and all communicating devices sharing
   the same Entangle group.

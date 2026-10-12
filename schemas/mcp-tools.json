@@ -37,8 +37,7 @@
                     "name": { "type": "string" },
                     "group": { "type": "string", "description": "Stable group ID." }
                   },
-                  "required": ["name", "group"],
-                  "additionalProperties": false
+                  "required": ["name", "group"]
                 }
               },
               "identity": { "type": "string", "enum": ["persistent", "ephemeral"], "description": "Whether this process holds the saved particle identity or is using a temporary one." },
@@ -50,13 +49,11 @@
                   "connected": { "type": "boolean" },
                   "relay_only": { "type": "boolean" }
                 },
-                "required": ["configured", "connected", "relay_only"],
-                "additionalProperties": false
+                "required": ["configured", "connected", "relay_only"]
               },
               "warning": { "type": "string", "description": "Present when the node is using a temporary identity or fallback link port; report it verbatim to the human." }
             },
-            "required": ["particle_id", "name", "version", "protocol", "link_port", "context", "tools", "accepts", "max_payload_bytes", "groups", "identity", "link_port_fallback", "repeater"],
-            "additionalProperties": false
+            "required": ["particle_id", "name", "version", "protocol", "link_port", "context", "tools", "accepts", "max_payload_bytes", "groups", "identity", "link_port_fallback", "repeater"]
           },
           "particles": {
             "type": "array",
@@ -87,8 +84,7 @@
                     "accepts": { "type": "array", "items": { "type": "string", "enum": ["json", "file"] } },
                     "max_payload_bytes": { "type": "integer" }
                   },
-                  "required": ["particle_id", "name", "version", "protocol", "link_port", "context", "tools", "accepts", "max_payload_bytes"],
-                  "additionalProperties": false
+                  "required": ["particle_id", "name", "version", "protocol", "link_port", "context", "tools", "accepts", "max_payload_bytes"]
                 },
                 "last_seen_secs": {
                   "type": "integer",
@@ -96,13 +92,11 @@
                 },
                 "groups": { "type": "array", "items": { "type": "string" }, "description": "Names of current shared groups." }
               },
-              "required": ["particle_id", "name", "hostname", "addrs", "port", "context", "key_fingerprint", "path", "via_repeater", "state", "manifest", "last_seen_secs", "groups"],
-              "additionalProperties": false
+              "required": ["particle_id", "name", "hostname", "addrs", "port", "context", "key_fingerprint", "path", "via_repeater", "state", "manifest", "last_seen_secs", "groups"]
             }
           }
         },
-        "required": ["self", "particles"],
-        "additionalProperties": false
+        "required": ["self", "particles"]
       }
     },
     {
@@ -155,13 +149,11 @@
                 "group": { "type": "string" },
                 "error": { "type": "string" }
               },
-              "required": ["particle_id", "name", "ok"],
-              "additionalProperties": false
+              "required": ["particle_id", "name", "ok"]
             }
           }
         },
-        "required": ["group", "delivered"],
-        "additionalProperties": false
+        "required": ["group", "delivered"]
       }
     },
     {
@@ -201,8 +193,7 @@
                 "path": { "type": ["string", "null"], "description": "Local path for file payloads; null for JSON payloads." },
                 "text": { "type": ["string", "null"], "description": "Inline contents for small UTF-8 files; null otherwise." }
               },
-              "required": ["sync_id", "from_particle_id", "from_name", "group", "group_id", "trust", "kind", "label", "received_at", "bytes", "sha256", "state", "path", "text"],
-              "additionalProperties": false
+              "required": ["sync_id", "from_particle_id", "from_name", "group", "group_id", "trust", "kind", "label", "received_at", "bytes", "sha256", "state", "path", "text"]
             }
           },
           "remaining": {
@@ -210,8 +201,7 @@
             "description": "Items still in the inbox after this call (after collapse, if requested)."
           }
         },
-        "required": ["states", "remaining"],
-        "additionalProperties": false
+        "required": ["states", "remaining"]
       }
     }
   ]

@@ -4,7 +4,7 @@ Use this when several devices should join the same group during one onboarding s
 
 ## You'll need
 
-- Entangle 0.6.0 or later on the inviter and every joiner.
+- Entangle 0.7.x on every machine.
 - A saved persistent particle identity on the inviter and every joiner.
 - One interactive terminal per human-operated invite or join command.
 - A network that permits invite TCP connections; mDNS is optional when joiners
