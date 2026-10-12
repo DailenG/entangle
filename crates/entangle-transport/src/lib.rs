@@ -5,7 +5,13 @@ use snow::{
     resolvers::{CryptoResolver, DefaultResolver},
     Builder, HandshakeState, TransportState,
 };
-use std::{fmt, io, net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    fmt, io,
+    net::SocketAddr,
+    sync::{Arc, RwLock},
+    time::Duration,
+};
 use thiserror::Error;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
@@ -13,10 +19,12 @@ use tokio::{
     time::timeout,
 };
 
-/// Noise pattern used to authenticate peers with a pairing-derived PSK.
+/// Noise pattern used to authenticate peers with a group-derived PSK.
 pub const NOISE_PATTERN: &str = "Noise_XXpsk3_25519_ChaChaPoly_BLAKE2s";
 const MAX_MESSAGE: usize = u16::MAX as usize;
 const TAG_LENGTH: usize = 16;
+const PREFACE: &[u8; 4] = b"ENTG";
+const PREFACE_VERSION: u8 = 1;
 /// Maximum plaintext bytes carried by one Noise transport message.
 pub const MAX_PLAINTEXT: usize = MAX_MESSAGE - TAG_LENGTH;
 
@@ -28,23 +36,23 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> LinkIo for T {}
 /// An owned byte stream that can be used by a Noise link.
 pub type BoxedIo = Box<dyn LinkIo>;
 
-/// Shared, reloadable keys used by listeners and outbound links.
-pub type KeySlot = Arc<std::sync::RwLock<Option<Arc<LinkKeys>>>>;
+/// Shared, reloadable static identity and group PSKs.
+pub type SharedKeyRing = Arc<RwLock<Arc<KeyRing>>>;
 
-/// Static Noise identity and pairing-derived pre-shared key.
+/// Static Noise identity and all locally available group PSKs.
 #[derive(Clone)]
-pub struct LinkKeys {
+pub struct KeyRing {
     /// X25519 static private key.
     pub static_private: [u8; 32],
-    /// Pairing-derived Noise PSK.
-    pub psk: [u8; 32],
+    /// Group-ID-to-Noise-PSK map.
+    pub groups: HashMap<[u8; 4], [u8; 32]>,
 }
 
-impl fmt::Debug for LinkKeys {
+impl fmt::Debug for KeyRing {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("LinkKeys")
+        f.debug_struct("KeyRing")
             .field("static_private", &"[REDACTED]")
-            .field("psk", &"[REDACTED]")
+            .field("groups", &format_args!("[REDACTED; {}]", self.groups.len()))
             .finish()
     }
 }
@@ -83,6 +91,12 @@ pub enum TransportError {
     /// Noise could not authenticate or complete a handshake.
     #[error("Noise handshake failed: {0}")]
     Handshake(String),
+    /// The nine-byte group preface was malformed.
+    #[error("invalid group preface")]
+    BadPreface,
+    /// The requested group is not present in this key ring.
+    #[error("unknown group")]
+    UnknownGroup,
     /// A Noise transport message could not be encrypted or authenticated.
     #[error("Noise transport failed: {0}")]
     Noise(String),
@@ -99,6 +113,7 @@ pub struct SecureStream {
     stream: BoxedIo,
     noise: TransportState,
     remote_static: [u8; 32],
+    group_id: [u8; 4],
 }
 
 impl SecureStream {
@@ -134,17 +149,23 @@ impl SecureStream {
     pub fn remote_static(&self) -> [u8; 32] {
         self.remote_static
     }
+
+    /// Returns the group ID authenticated by this Noise session.
+    pub fn group_id(&self) -> [u8; 4] {
+        self.group_id
+    }
 }
 
 /// Connects as a Noise initiator and completes the XXpsk3 handshake.
 pub async fn connect(
     addr: SocketAddr,
-    keys: &LinkKeys,
+    ring: &KeyRing,
+    group_id: [u8; 4],
     duration: Duration,
 ) -> Result<SecureStream, TransportError> {
     timeout(duration, async {
         let stream = TcpStream::connect(addr).await?;
-        connect_io(Box::new(stream), keys, duration).await
+        connect_io(Box::new(stream), ring, group_id, duration).await
     })
     .await
     .map_err(|_| TransportError::Timeout)?
@@ -153,15 +174,21 @@ pub async fn connect(
 /// Completes the Noise initiator handshake over an already-open byte stream.
 pub async fn connect_io(
     mut stream: BoxedIo,
-    keys: &LinkKeys,
+    ring: &KeyRing,
+    group_id: [u8; 4],
     duration: Duration,
 ) -> Result<SecureStream, TransportError> {
     timeout(duration, async {
-        let (noise, remote_static) = initiator_handshake(&mut stream, keys).await?;
+        if !ring.groups.contains_key(&group_id) {
+            return Err(TransportError::UnknownGroup);
+        }
+        write_preface(&mut stream, group_id).await?;
+        let (noise, remote_static) = initiator_handshake(&mut stream, ring, group_id).await?;
         Ok(SecureStream {
             stream,
             noise,
             remote_static,
+            group_id,
         })
     })
     .await
@@ -171,38 +198,79 @@ pub async fn connect_io(
 /// Accepts a TCP stream as a Noise responder and completes the XXpsk3 handshake.
 pub async fn accept(
     stream: TcpStream,
-    keys: &LinkKeys,
+    ring: &KeyRing,
     duration: Duration,
 ) -> Result<SecureStream, TransportError> {
-    accept_io(Box::new(stream), keys, duration).await
+    accept_io(Box::new(stream), ring, duration).await
 }
 
 /// Completes the Noise responder handshake over an already-open byte stream.
 pub async fn accept_io(
     mut stream: BoxedIo,
-    keys: &LinkKeys,
+    ring: &KeyRing,
     duration: Duration,
 ) -> Result<SecureStream, TransportError> {
     timeout(duration, async {
-        let (noise, remote_static) = responder_handshake(&mut stream, keys).await?;
+        let group_id = read_preface(&mut stream).await?;
+        if !ring.groups.contains_key(&group_id) {
+            return Err(TransportError::UnknownGroup);
+        }
+        let (noise, remote_static) = responder_handshake(&mut stream, ring, group_id).await?;
         Ok(SecureStream {
             stream,
             noise,
             remote_static,
+            group_id,
         })
     })
     .await
     .map_err(|_| TransportError::Timeout)?
 }
 
-fn handshake_state(keys: &LinkKeys, initiator: bool) -> Result<HandshakeState, TransportError> {
+async fn write_preface(
+    stream: &mut (impl AsyncWrite + Unpin),
+    group_id: [u8; 4],
+) -> Result<(), TransportError> {
+    let mut preface = [0_u8; 9];
+    preface[..4].copy_from_slice(PREFACE);
+    preface[4] = PREFACE_VERSION;
+    preface[5..].copy_from_slice(&group_id);
+    stream.write_all(&preface).await?;
+    stream.flush().await?;
+    Ok(())
+}
+
+async fn read_preface(stream: &mut (impl AsyncRead + Unpin)) -> Result<[u8; 4], TransportError> {
+    let mut preface = [0_u8; 9];
+    stream.read_exact(&mut preface).await?;
+    if &preface[..4] != PREFACE || preface[4] != PREFACE_VERSION {
+        return Err(TransportError::BadPreface);
+    }
+    Ok(preface[5..]
+        .try_into()
+        .expect("the preface has four group-ID bytes"))
+}
+
+fn handshake_state(
+    ring: &KeyRing,
+    group_id: [u8; 4],
+    initiator: bool,
+) -> Result<HandshakeState, TransportError> {
     let params = NOISE_PATTERN
         .parse()
         .map_err(|error: snow::Error| TransportError::Handshake(error.to_string()))?;
+    let psk = ring
+        .groups
+        .get(&group_id)
+        .ok_or(TransportError::UnknownGroup)?;
+    let mut prologue = b"entangle-link-v4".to_vec();
+    prologue.extend_from_slice(&group_id);
     let builder = Builder::new(params)
-        .local_private_key(&keys.static_private)
+        .local_private_key(&ring.static_private)
         .map_err(|error| TransportError::Handshake(error.to_string()))?
-        .psk(3, &keys.psk)
+        .psk(3, psk)
+        .map_err(|error| TransportError::Handshake(error.to_string()))?
+        .prologue(&prologue)
         .map_err(|error| TransportError::Handshake(error.to_string()))?;
     if initiator {
         builder
@@ -217,9 +285,10 @@ fn handshake_state(keys: &LinkKeys, initiator: bool) -> Result<HandshakeState, T
 
 async fn initiator_handshake(
     stream: &mut (impl AsyncRead + AsyncWrite + Unpin + Send),
-    keys: &LinkKeys,
+    ring: &KeyRing,
+    group_id: [u8; 4],
 ) -> Result<(TransportState, [u8; 32]), TransportError> {
-    let mut state = handshake_state(keys, true)?;
+    let mut state = handshake_state(ring, group_id, true)?;
     let mut message = vec![0_u8; MAX_MESSAGE];
     let length = state
         .write_message(&[], &mut message)
@@ -250,9 +319,10 @@ async fn initiator_handshake(
 
 async fn responder_handshake(
     stream: &mut (impl AsyncRead + AsyncWrite + Unpin + Send),
-    keys: &LinkKeys,
+    ring: &KeyRing,
+    group_id: [u8; 4],
 ) -> Result<(TransportState, [u8; 32]), TransportError> {
-    let mut state = handshake_state(keys, false)?;
+    let mut state = handshake_state(ring, group_id, false)?;
     let incoming = read_message(stream).await.map_err(handshake_io_error)?;
     let mut payload = vec![0_u8; MAX_MESSAGE];
     state
@@ -318,62 +388,89 @@ async fn read_message(stream: &mut (impl AsyncRead + Unpin)) -> Result<Vec<u8>, 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
     use tokio::net::TcpListener;
 
-    fn keys() -> LinkKeys {
-        LinkKeys {
+    const GROUP_A: [u8; 4] = [0xa1; 4];
+    const GROUP_B: [u8; 4] = [0xb2; 4];
+
+    fn ring(psk_a: [u8; 32], psk_b: [u8; 32]) -> KeyRing {
+        KeyRing {
             static_private: generate_static(),
-            psk: [0x5a; 32],
+            groups: HashMap::from([(GROUP_A, psk_a), (GROUP_B, psk_b)]),
         }
     }
 
     async fn connected_pair(
-        client_keys: LinkKeys,
-        server_keys: LinkKeys,
+        client_ring: KeyRing,
+        server_ring: KeyRing,
+        group_id: [u8; 4],
     ) -> (SecureStream, SecureStream) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let accept = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
-            accept(stream, &server_keys, Duration::from_secs(2))
+            accept(stream, &server_ring, Duration::from_secs(2))
                 .await
                 .unwrap()
         });
-        let client = connect(address, &client_keys, Duration::from_secs(2))
+        let client = connect(address, &client_ring, group_id, Duration::from_secs(2))
             .await
             .unwrap();
         (client, accept.await.unwrap())
     }
 
     #[tokio::test]
-    async fn noise_handshake_and_bidirectional_messages_roundtrip() {
-        let client_keys = keys();
-        let server_keys = keys();
-        let client_public = public_key(&client_keys.static_private);
-        let server_public = public_key(&server_keys.static_private);
-        let (mut client, mut server) = connected_pair(client_keys, server_keys).await;
-
-        assert_eq!(client.remote_static(), server_public);
-        assert_eq!(server.remote_static(), client_public);
-        client.send(b"hello").await.unwrap();
-        assert_eq!(server.recv(Duration::from_secs(1)).await.unwrap(), b"hello");
-        server.send(b"world").await.unwrap();
-        assert_eq!(client.recv(Duration::from_secs(1)).await.unwrap(), b"world");
+    async fn two_group_ring_roundtrips_and_streams_report_the_selected_group() {
+        let client_ring = ring([0x5a; 32], [0x6b; 32]);
+        let server_ring = ring([0x5a; 32], [0x6b; 32]);
+        let client_public = public_key(&client_ring.static_private);
+        let server_public = public_key(&server_ring.static_private);
+        for group_id in [GROUP_A, GROUP_B] {
+            let (mut client, mut server) =
+                connected_pair(client_ring.clone(), server_ring.clone(), group_id).await;
+            assert_eq!(client.remote_static(), server_public);
+            assert_eq!(server.remote_static(), client_public);
+            assert_eq!(client.group_id(), group_id);
+            assert_eq!(server.group_id(), group_id);
+            client.send(b"hello").await.unwrap();
+            assert_eq!(server.recv(Duration::from_secs(1)).await.unwrap(), b"hello");
+            server.send(b"world").await.unwrap();
+            assert_eq!(client.recv(Duration::from_secs(1)).await.unwrap(), b"world");
+        }
     }
 
     #[tokio::test]
-    async fn wrong_psk_fails_with_a_handshake_error() {
-        let client_keys = keys();
-        let mut server_keys = client_keys.clone();
-        server_keys.psk[0] ^= 1;
+    async fn responder_rejects_a_group_missing_from_its_ring() {
+        let client_ring = ring([0x5a; 32], [0x6b; 32]);
+        let mut server_ring = ring([0x5a; 32], [0x6b; 32]);
+        server_ring.groups.remove(&GROUP_B);
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
-            accept(stream, &server_keys, Duration::from_secs(2)).await
+            accept(stream, &server_ring, Duration::from_secs(2)).await
         });
+        let _ = connect(address, &client_ring, GROUP_B, Duration::from_secs(2)).await;
+        assert!(matches!(
+            server.await.unwrap(),
+            Err(TransportError::UnknownGroup)
+        ));
+    }
 
-        let _ = connect(address, &client_keys, Duration::from_secs(2)).await;
+    #[tokio::test]
+    async fn responder_rejects_same_group_id_with_a_different_psk() {
+        let client_ring = ring([0x5a; 32], [0x6b; 32]);
+        let server_ring = ring([0x5a; 32], [0x6b; 32]);
+        let mut server_ring = server_ring;
+        server_ring.groups.get_mut(&GROUP_A).unwrap()[0] ^= 1;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            accept(stream, &server_ring, Duration::from_secs(2)).await
+        });
+        let _client_result = connect(address, &client_ring, GROUP_A, Duration::from_secs(2)).await;
         assert!(matches!(
             server.await.unwrap(),
             Err(TransportError::Handshake(_))
@@ -381,24 +478,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn malformed_preface_is_rejected_before_noise() {
+        let ring = ring([0x5a; 32], [0x6b; 32]);
+        let (client, server) = tokio::io::duplex(128);
+        let accept = tokio::spawn(async move {
+            accept_io(Box::new(server), &ring, Duration::from_secs(1)).await
+        });
+        let mut client = client;
+        client.write_all(b"NOPE\x01\x00\x00\x00\x00").await.unwrap();
+        assert!(matches!(
+            accept.await.unwrap(),
+            Err(TransportError::BadPreface)
+        ));
+    }
+
+    #[tokio::test]
     async fn oversized_plaintext_is_rejected() {
-        let (mut client, _server) = connected_pair(keys(), keys()).await;
+        let (mut client, _server) = connected_pair(
+            ring([0x5a; 32], [0x6b; 32]),
+            ring([0x5a; 32], [0x6b; 32]),
+            GROUP_A,
+        )
+        .await;
         let error = client.send(&vec![0; MAX_PLAINTEXT + 1]).await.unwrap_err();
         assert!(matches!(error, TransportError::Oversize));
     }
 
     #[test]
-    fn generated_static_keys_and_link_key_debug_are_safe() {
+    fn generated_static_keys_and_key_ring_debug_are_safe() {
         let key = generate_static();
         assert_eq!(key.len(), 32);
-        let keys = LinkKeys {
+        let keys = KeyRing {
             static_private: key,
-            psk: [0xa5; 32],
+            groups: HashMap::from([(GROUP_A, [0xa5; 32])]),
         };
         let debug = format!("{keys:?}");
-        assert_eq!(
-            debug,
-            "LinkKeys { static_private: \"[REDACTED]\", psk: \"[REDACTED]\" }"
-        );
+        assert!(debug.contains("static_private: \"[REDACTED]\""));
+        assert!(debug.contains("[REDACTED; 1]"));
     }
 }

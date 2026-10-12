@@ -15,54 +15,48 @@ composes the protocol and platform crates.
 | `entangle` | CLI and `Particle` orchestration that composes the libraries |
 
 `entangle-resonance` has no dependency on transport. It publishes the particle
-ID, protocol, name, version, optional context, and optional public pairing
-group (`grp`) in mDNS TXT records. The pairing key itself is never advertised.
+ID, protocol, name, version, optional context, and public group IDs (`grp`) in
+mDNS TXT records. The `grp` value is a sorted, comma-separated list of zero to
+eight eight-hex group IDs. Group keys are never advertised.
 
-## Pairing and link
+## Groups and link
 
-Both devices must use the same 32-byte pairing key. Its human-entered code is
-RFC 4648 Base32 without padding, prefixed with `ENT1-` and grouped in
-four-character chunks. The public group ID is the first 8 hex characters of
-`SHA-256("entangle-pair-group-v1" || key)`; the Noise PSK is
-`SHA-256("entangle-pair-psk-v1" || key)`.
-The pairing key is stored at `<data_root>/pairing.key`; each persistent
-particle's 32-byte Noise static private key is stored as 64 lowercase hex
-characters at `<data_root>/noise_static.key`. Ephemeral identities keep their
-static key in memory only. On Unix, key files are mode 0600.
+Each machine can belong to up to eight groups stored at
+`<data_root>/groups/<id>/{key,meta.json,members.json}`. The `key` file contains
+the 32-byte group key as lowercase hex; `meta.json` stores the group's name and
+local role, and `members.json` maps particle IDs to names and Noise static
+public keys. Files and directories use private permissions. The group ID is
+the first four bytes of
+`SHA-256("entangle-group-id-v1" || key)`, encoded as eight lowercase hex
+characters. Its Noise PSK is
+`SHA-256("entangle-group-psk-v1" || key)`.
 
-Each TCP connection begins with a three-message
-`Noise_XXpsk3_25519_ChaChaPoly_BLAKE2s` handshake. JSON control frames are
-individual encrypted Noise messages, bounded to 60 KiB. An accepted sync
+Protocol version 4 binds each link to one group. Before the Noise handshake,
+the initiator writes a 9-byte preface: `ENTG`, preface version `1`, and the
+four group-ID bytes. Both sides use the unchanged
+`Noise_XXpsk3_25519_ChaChaPoly_BLAKE2s` pattern, the selected group's PSK at
+position 3, and the prologue
+`b"entangle-link-v4" || group_id_bytes`. A responder rejects malformed
+prefaces and IDs for groups it does not have. Persistent particles store their
+32-byte Noise static private key as 64 lowercase hex characters at
+`<data_root>/noise_static.key`; ephemeral identities keep their static key in
+memory only.
+
+Each link stream performs a three-message Noise handshake. JSON control frames
+are individual encrypted Noise messages, bounded to 60 KiB. An accepted sync
 streams exactly the declared payload size in encrypted messages; each receive
 chunk has a five-second idle timeout. The receiver verifies the byte count and
 SHA-256 before adding the item to its inbox.
 
-## Human peer approval
+SPAKE2 one-time group invites arrive in the next change.
 
-Protocol version 3 separates authentication from authorization. A valid
-pairing-key Noise handshake places a previously unapproved peer in `pending`;
-neither side may sync until its local operator approves that peer. Approved
-particle IDs are pinned to their Noise static public keys. Decisions live in
-`<data_root>/peers/trust.json`; node-owned commit/reveal state is kept in
-`<data_root>/peers/verify/<particle_id>.json`. Unix directories and files use
-private permissions, and writes are atomic.
+## Membership trust
 
-The lower static public key is the committer and the higher is the revealer.
-The committer first commits to a random nonce with
-`SHA-256("entangle-sas-commit-v1" || nonce_c || key_c || key_r)`. Only after
-the revealer's nonce is received does the committer reveal its nonce. Both
-derive three 6-bit emoji indices from
-`SHA-256("entangle-sas-v1" || version || key_c || key_r || nonce_c || nonce_r)`.
-Commit-then-reveal prevents either peer from grinding its nonce in response to
-the other's; an active attacker who already knows the pairing key has a
-1-in-262,144 chance of making all three displayed emoji match by chance.
-Operators compare the set out of band before approving.
-
-Approval is local to each machine. `peer verify` displays this machine's card;
-the human uses `peer approve` on both devices. Agents may inspect `peer list`
-and `peer emoji`, but approval, denial, revocation, and forgetting are
-human-only operations. An ephemeral identity never reads or writes the trust
-store and cannot persist peer approval.
+The authenticated group is the trust boundary. A link's Hello is accepted
+only when its particle ID is present in that group's `members.json` and the
+stored member static key matches the remote Noise-authenticated static key.
+Offers and incoming payloads use the same membership and key-binding check.
+There is no separate peer-approval or verification state.
 
 ## Execution flow
 
@@ -71,7 +65,7 @@ sequenceDiagram
     participant A as Particle A / MCP client
     participant MD as mDNS
     participant B as Particle B
-    A->>MD: advertise public group ID + browse
+    A->>MD: advertise public group IDs + browse
     MD-->>A: Resonance event for B
     A->>B: Noise XXpsk3 handshake
     A->>B: encrypted Hello(manifest)
@@ -84,20 +78,19 @@ sequenceDiagram
     B-->>A: MCP notification
 ```
 
-The protocol is not wire-compatible with 0.1.x or 0.2.x; upgrade all devices
-before pairing. MCP continues to use JSON-RPC 2.0 with newline-delimited
-messages on stdio. Logs go to stderr; stdout belongs exclusively to MCP.
+Protocol version 4 is not wire-compatible with earlier versions; all devices
+must use version 4 to communicate. MCP continues to use JSON-RPC 2.0 with
+newline-delimited messages on stdio. Logs go to stderr; stdout belongs
+exclusively to MCP.
 
 ## Security model and limitations
 
-Noise encrypts and authenticates the link using the pairing-derived PSK.
-Approved static keys are pinned to particle IDs across restarts. A first
-contact remains pending until a human compares and approves the SAS. The
+Noise encrypts and authenticates each link using the selected group's
+derived PSK. A peer is trusted only when the link's group membership binds its
+particle ID to the authenticated static public key. Group keys must be kept
+private and shared only with the devices intended to join that group. The
 optional `--context` value is a project label, not an authorization boundary.
-It is not post-quantum secure beyond the PSK mixing.
-Pairing codes are secrets: transfer them only between humans, never through
-Entangle or to an agent. Keep the key file private and use only devices trusted
-with the same pairing key.
+The protocol is not post-quantum secure.
 
 Further work is tracked in [issue #10](https://github.com/DailenG/entangle/issues/10).
 
@@ -106,7 +99,7 @@ Further work is tracked in [issue #10](https://github.com/DailenG/entangle/issue
 The Quantum Repeater is a blind WebSocket relay for links between networks
 that cannot reach one another directly. A client pins the repeater's static
 key and authenticates its connection with Noise `IK`. After enrollment, each
-live session declares its current public pairing-group ID; that ID is
+live session declares its current public group ID; that ID is
 ephemeral routing metadata, not an enrollment property or a persisted device
 field.
 
@@ -128,11 +121,11 @@ mode removes the TCP listener and disables mDNS.
 
 The peer-to-peer Noise `XXpsk3` session remains end-to-end. The repeater
 forwards its encrypted bytes without inspecting or logging them: it cannot
-see particle names, pairing keys, SAS values, or sync content. It can see
-static device public keys, declared group IDs, connection timing, and
-traffic sizes; group IDs are public routing identifiers, not an authorization
-boundary. The pairing-derived PSK and local SAS approval remain the
-end-to-end security boundary.
+see particle names, group keys, repeater-enrollment SAS values, or sync
+content. It can see static device public keys, declared group IDs, connection
+timing, and traffic sizes; group IDs are public routing identifiers, not an
+authorization boundary. The group-derived PSK and membership-bound static key
+are the end-to-end security boundary.
 
 Devices can request repeater enrollment at `{path}/request` without knowing the
 repeater key: Noise `XX` authenticates the exchange, then an encrypted

@@ -4,10 +4,9 @@
 
 If you are an AI agent reading this, here's what you need to do. The goal is to
 have `entangle` on `PATH`, Entangle registered as an MCP server in your own MCP
-client configuration, and its paired peer discoverable. Ask the human before
+client configuration, and its group members discoverable. Ask the human before
 using `sudo`, installing system packages, changing firewall rules, or editing
 a configuration file you did not create; show them the proposed diff first.
-Never request or repeat a pairing code.
 
 ### Running commands on Windows
 
@@ -102,33 +101,24 @@ proceeding.
    changing the machine's toolchain.
 
    **Verify:** Run `entangle --version` and `entangle --help`; expect help
-   listing `serve`, `node`, `scan`, and `pair`.
+   listing `serve`, `node`, `scan`, `group`, and `peer`.
 
    **If this fails:** Check the release availability, executable directory,
    and PATH. Report the first failing command; do not install system packages
    or change the toolchain without the human's approval.
 
-## Pairing (human step)
+## Groups
 
-Pairing is a human-only step. Do not run `entangle pair init`, `entangle pair
-show`, or `entangle pair join`; never request, display, or repeat the code.
-Ask the human to run `entangle pair init` on one device and `entangle pair
-join <code>` on the others in their own terminal. Then verify with
-`entangle pair status` or `find_entangled_particles.self.paired`. The code is
-a secret and must not be sent through Entangle or included in logs.
-
-Both devices must run version 0.3; it cannot communicate with 0.2.x or 0.1.x
-peers. Upgrade all devices before pairing.
-Pairing-key changes take effect without a client reload; upgrading the Entangle
-binary still requires restarting or reloading the MCP client.
+Human-only commands: `group create`, `group invite`, `group join`, `group
+leave`, `group remove`, `group rekey`, and `group admin`. Agents may run
+`entangle group list`, `entangle group members <name>`, and `entangle peer
+list`. Devices join with a one-time code from `entangle group invite` (added
+in the next change). Ask the human to perform human-only commands in their
+terminal.
+Trust is based on shared group membership, and group keys must never be
+requested or relayed.
 If `find_entangled_particles.self.warning` is present, report its text verbatim
 to the human. Never kill or stop processes to resolve it.
-
-Peer approval is human-only. You may run `entangle peer list` and
-`entangle peer emoji`; never run `peer verify`, `peer approve`, `peer deny`,
-`peer revoke`, or `peer forget`. Never relay or describe the emoji to the
-human. If a peer is pending, tell the human to run `entangle peer approve` on
-this machine and compare the cards themselves.
 
 Quantum Repeater administration is also human-only. Agents may run `entangle
 repeater devices` and `entangle repeater status`, but must never run
@@ -295,8 +285,9 @@ it does not assert that the latest link used the repeater. The
 
    ```text
    - Entangle version:
-   - Paired (from pair status or find_entangled_particles.self):
-   - Pairing group:
+   - Group membership (from `entangle group list` or
+     `find_entangled_particles.self`):
+   - Group name or ID:
    - Particle ID (from find_entangled_particles.self):
    - Particle name:
    - Context (or none):
@@ -318,7 +309,7 @@ it does not assert that the latest link used the repeater. The
 8. **Follow this protocol when collaborating.**
 
    - Call `find_entangled_particles` first. Only particles with state
-     `entangled` can receive a state sync.
+     `linked` can receive a state sync.
    - Send with `sync_entangled_state`: provide exactly one of `state` or
      `file_path`, add a `label` describing the intent, prefer JSON `state` for
      messages and `file_path` for files, and send only a single regular file.
@@ -347,5 +338,5 @@ it does not assert that the latest link used the repeater. The
    particle can observe the expected item before collapsing it.
 
    **If this fails:** Re-run `find_entangled_particles`; report the sync ID and
-   tool error without copying pairing codes into logs, chat, or another
+   tool error without copying private group keys into logs, chat, or another
    channel.

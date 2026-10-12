@@ -3,25 +3,24 @@
 use crate::{
     config::Options,
     field::{Field, LinkPath, PeerRecord, PeerState},
+    groups::{self, Group},
     identity::{self, Identity},
     inbox::{self, InboxItem},
-    pairing,
-    trust::{self, VerificationRecord},
 };
 use anyhow::{anyhow, Context, Result};
 use chrono::Utc;
 use entangle_core::{is_valid_sync_id, Manifest, StateKind, PROTOCOL_VERSION};
 use entangle_link::{
     LinkError, LinkHandler, LinkListener, PayloadReader, PeerInfo, Route, SyncDecision, SyncOffer,
-    TunnelOpener, VerifyMessage,
+    TunnelOpener,
 };
 use entangle_repeater::{client as repeater_client, RepeaterDialer};
 use entangle_resonance::{Advertisement, Resonance, ResonanceEvent, Resonator};
-use entangle_transport::{BoxedIo, KeySlot, LinkKeys, SecureStream};
+use entangle_transport::{BoxedIo, KeyRing, SecureStream, SharedKeyRing};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashSet,
     io,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
@@ -47,6 +46,21 @@ const REPEATER_CONFIG_POLL: Duration = Duration::from_secs(30);
 const REPEATER_DIRECTORY_POLL: Duration = Duration::from_secs(15);
 const REPEATER_RECONNECT_BASE: Duration = Duration::from_secs(1);
 const REPEATER_RECONNECT_CAP: Duration = Duration::from_secs(60);
+
+fn build_key_ring(static_private: [u8; 32], groups: &[Group]) -> KeyRing {
+    KeyRing {
+        static_private,
+        groups: groups
+            .iter()
+            .map(|group| {
+                (
+                    groups::group_id_bytes(&group.key),
+                    groups::derive_psk(&group.key),
+                )
+            })
+            .collect(),
+    }
+}
 
 struct RepeaterOpener {
     dialer: RepeaterDialer,
@@ -120,9 +134,8 @@ pub struct Particle {
     field: Arc<RwLock<Field>>,
     options: Options,
     _identity: Identity,
-    pairing_group: Arc<RwLock<Option<String>>>,
-    active_pairing_key: Arc<RwLock<Option<[u8; 32]>>>,
-    keys: KeySlot,
+    groups: Arc<RwLock<Vec<Group>>>,
+    keys: SharedKeyRing,
     repeater: RwLock<Option<RepeaterDialer>>,
     repeater_configured: AtomicBool,
     relay_directory: StdMutex<HashSet<[u8; 32]>>,
@@ -131,7 +144,7 @@ pub struct Particle {
     reconnect_cap_ms: AtomicU64,
     repeater_directory_poll_ms: AtomicU64,
     link_port_fallback: bool,
-    pairing_root: PathBuf,
+    data_root: PathBuf,
     data_dir: PathBuf,
     resonator: Mutex<Option<Resonator>>,
     resonance_task: Mutex<Option<JoinHandle<()>>>,
@@ -139,11 +152,7 @@ pub struct Particle {
     discovery_failure_logged: AtomicBool,
     inbox: Mutex<Vec<InboxItem>>,
     in_flight: StdMutex<HashSet<String>>,
-    verification_lock: StdMutex<()>,
-    ephemeral_verifications: StdMutex<HashMap<entangle_core::ParticleId, VerificationRecord>>,
-    verify_capacity_warned: AtomicBool,
-    trust_reload_warned: AtomicBool,
-    trust_stamp: StdMutex<Option<trust::FileStamp>>,
+    groups_reload_warned: AtomicBool,
     notifications: Option<mpsc::Sender<Value>>,
     inbound_limit: Arc<Semaphore>,
     shutdown: tokio::sync::watch::Sender<bool>,
@@ -168,24 +177,15 @@ impl Particle {
     ) -> Result<(Arc<Self>, Manifest)> {
         let root = options.data_root();
         let identity = identity::claim(&root)?;
-        let pairing_key = match pairing::load(&root) {
-            Ok(key) => key,
-            Err(error @ pairing::PairingError::Io(_)) => {
-                return Err(error).context("could not load pairing key")
-            }
-            Err(error) => {
-                warn!(%error, "pairing key is unavailable; starting unpaired");
-                None
-            }
-        };
-        let active_pairing_key = Arc::new(RwLock::new(pairing_key));
-        let pairing_group = Arc::new(RwLock::new(pairing_key.as_ref().map(pairing::group_id)));
-        let keys: KeySlot = Arc::new(RwLock::new(pairing_key.map(|key| {
-            Arc::new(LinkKeys {
-                static_private: identity.static_private,
-                psk: pairing::derive_psk(&key),
-            })
-        })));
+        if root.join("pairing.key").exists() || root.join("peers/trust.json").exists() {
+            info!("ignoring pre-0.6 pairing/approval state; use entangle group create/join");
+        }
+        let initial_groups = groups::list(&root)?;
+        let groups = Arc::new(RwLock::new(initial_groups.clone()));
+        let keys: SharedKeyRing = Arc::new(RwLock::new(Arc::new(build_key_ring(
+            identity.static_private,
+            &initial_groups,
+        ))));
         let particle_id = identity.id.clone();
         let name = options.particle_name(&particle_id);
         let data_dir = root.join(particle_id.short());
@@ -193,17 +193,6 @@ impl Particle {
         tokio::fs::create_dir_all(&inbox_dir).await?;
         tokio::fs::create_dir_all(data_dir.join("outbox")).await?;
         let persisted_inbox = inbox::load(&inbox_dir).await;
-        let trust_stamp = if identity.persistent {
-            match trust::file_stamp(&root) {
-                Ok(stamp) => stamp,
-                Err(error) => {
-                    warn!(%error, "could not inspect peer trust store");
-                    None
-                }
-            }
-        } else {
-            None
-        };
         let (listener, link_port, link_port_fallback) = if options.relay_only {
             (None, 0, false)
         } else {
@@ -253,8 +242,7 @@ impl Particle {
             field,
             options,
             _identity: identity,
-            pairing_group,
-            active_pairing_key,
+            groups,
             keys: keys.clone(),
             repeater: RwLock::new(None),
             repeater_configured: AtomicBool::new(repeater_configured),
@@ -264,7 +252,7 @@ impl Particle {
             reconnect_cap_ms: AtomicU64::new(REPEATER_RECONNECT_CAP.as_millis() as u64),
             repeater_directory_poll_ms: AtomicU64::new(REPEATER_DIRECTORY_POLL.as_millis() as u64),
             link_port_fallback,
-            pairing_root: root,
+            data_root: root,
             data_dir,
             resonator: Mutex::new(None),
             resonance_task: Mutex::new(None),
@@ -272,11 +260,7 @@ impl Particle {
             discovery_failure_logged: AtomicBool::new(false),
             inbox: Mutex::new(persisted_inbox),
             in_flight: StdMutex::new(HashSet::new()),
-            verification_lock: StdMutex::new(()),
-            ephemeral_verifications: StdMutex::new(HashMap::new()),
-            verify_capacity_warned: AtomicBool::new(false),
-            trust_reload_warned: AtomicBool::new(false),
-            trust_stamp: StdMutex::new(trust_stamp),
+            groups_reload_warned: AtomicBool::new(false),
             notifications,
             inbound_limit: Arc::new(Semaphore::new(4)),
             shutdown,
@@ -287,8 +271,8 @@ impl Particle {
         if let Some(listener) = listener {
             tokio::spawn(listener.run(particle.keys.clone(), particle.clone()));
         }
-        let pairing_node = particle.clone();
-        tokio::spawn(async move { pairing_node.pairing_watch().await });
+        let group_node = particle.clone();
+        tokio::spawn(async move { group_node.group_watch().await });
         let static_node = particle.clone();
         tokio::spawn(async move { static_node.static_peer_loop().await });
         let repeater_node = particle.clone();
@@ -314,8 +298,14 @@ impl Particle {
             if !particle.options.peer.is_empty() {
                 warn!("--peer entries are ignored in relay-only mode");
             }
-        } else if particle.keys.read().expect("key slot lock").is_none() {
-            info!("particle is unpaired; encrypted links are disabled");
+        } else if particle
+            .keys
+            .read()
+            .expect("key ring lock")
+            .groups
+            .is_empty()
+        {
+            info!("particle is not in a group; encrypted links are disabled");
         } else if !particle.options.no_mdns {
             info!(
                 "particle {} listening on TCP {}",
@@ -347,155 +337,40 @@ impl Particle {
             (false, true) => "using a fallback link port",
             (false, false) => unreachable!(),
         };
-        let mut warning = format!(
+        let warning = format!(
             "Another Entangle process on this machine holds the saved identity and/or port {}. This node is running {reason} (identity: {identity}; link port: {}). Close the other MCP client or old Entangle process, then reload.",
             self.options.link_port, self.manifest.link_port
         );
-        if ephemeral {
-            warning
-                .push_str(" peer approval is unavailable while running on a temporary identity.");
-        }
         Some(warning)
     }
 
-    fn load_trust_store(&self) -> std::result::Result<trust::TrustStore, LinkError> {
-        if self._identity.persistent {
-            trust::load(&self.pairing_root).map_err(|error| {
-                LinkError::Handler(format!("peer trust store unavailable: {error}"))
+    fn group_member(&self, group_id: [u8; 4], particle_id: &str, static_key: &[u8; 32]) -> bool {
+        self.groups
+            .read()
+            .expect("group store lock")
+            .iter()
+            .find(|group| groups::group_id_bytes(&group.key) == group_id)
+            .is_some_and(|group| {
+                group.members.iter().any(|member| {
+                    member.particle_id == particle_id
+                        && member.static_key == hex::encode(static_key)
+                })
             })
-        } else {
-            Ok(trust::TrustStore::default())
-        }
     }
 
-    fn check_verification_capacity(
-        &self,
-        particle_id: &entangle_core::ParticleId,
-        store: &trust::TrustStore,
-        has_record: bool,
-    ) -> std::result::Result<(), LinkError> {
-        if has_record || store.approved.contains_key(particle_id.as_str()) {
-            return Ok(());
-        }
-        let count = if self._identity.persistent {
-            trust::load_verifications(&self.pairing_root)
-                .map_err(|error| {
-                    LinkError::Handler(format!("peer verification state unavailable: {error}"))
-                })?
-                .into_iter()
-                .filter(|record| !store.approved.contains_key(record.particle_id.as_str()))
-                .count()
-        } else {
-            self.ephemeral_verifications
-                .lock()
-                .expect("ephemeral verification lock")
-                .len()
-        };
-        if count < 16 {
-            return Ok(());
-        }
-        if !self.verify_capacity_warned.swap(true, Ordering::Relaxed) {
-            warn!("peer verification record limit reached; refusing new unknown peers");
-        }
-        Err(LinkError::Handler(
-            "too many unapproved peers are waiting for verification".into(),
-        ))
-    }
-
-    fn verification_step(
-        &self,
-        particle_id: &entangle_core::ParticleId,
-        name: &str,
-        remote_key: [u8; 32],
-        incoming: Option<VerifyMessage>,
-    ) -> std::result::Result<(VerifyMessage, VerificationRecord), LinkError> {
-        let _lock = self
-            .verification_lock
-            .lock()
-            .map_err(|_| LinkError::Handler("peer verification lock poisoned".into()))?;
-        let local_key = entangle_transport::public_key(&self._identity.static_private);
-        let mut record = if self._identity.persistent {
-            match trust::load_verification(&self.pairing_root, particle_id).map_err(|error| {
-                LinkError::Handler(format!("peer verification state unavailable: {error}"))
-            })? {
-                Some(record)
-                    if record.local_key == hex::encode(local_key)
-                        && record.remote_key == hex::encode(remote_key) =>
-                {
-                    record
-                }
-                _ => trust::new_verification(
-                    particle_id.clone(),
-                    name.to_owned(),
-                    local_key,
-                    remote_key,
-                )
-                .map_err(|error| LinkError::Handler(error.to_string()))?,
-            }
-        } else {
-            let mut records = self
-                .ephemeral_verifications
-                .lock()
-                .map_err(|_| LinkError::Handler("ephemeral verification lock poisoned".into()))?;
-            match records.get(particle_id).filter(|record| {
-                record.local_key == hex::encode(local_key)
-                    && record.remote_key == hex::encode(remote_key)
-            }) {
-                Some(record) => record.clone(),
-                None => {
-                    let record = trust::new_verification(
-                        particle_id.clone(),
-                        name.to_owned(),
-                        local_key,
-                        remote_key,
-                    )
-                    .map_err(|error| LinkError::Handler(error.to_string()))?;
-                    records.insert(particle_id.clone(), record.clone());
-                    record
-                }
-            }
-        };
-        record.name = name.to_owned();
-        trust::initialize_exchange_state(&mut record)
-            .map_err(|error| LinkError::Handler(error.to_string()))?;
-        if let Some(incoming) = incoming {
-            trust::ingest(&mut record, incoming)
-                .map_err(|_| LinkError::Handler("invalid verification message".into()))?;
-        }
-        if self._identity.persistent {
-            trust::save_verification(&self.pairing_root, &record).map_err(|error| {
-                LinkError::Handler(format!("peer verification state unavailable: {error}"))
-            })?;
-        } else {
-            self.ephemeral_verifications
-                .lock()
-                .map_err(|_| LinkError::Handler("ephemeral verification lock poisoned".into()))?
-                .insert(particle_id.clone(), record.clone());
-        }
-        let outgoing = trust::outgoing(&record);
-        Ok((outgoing, record))
-    }
-
-    async fn run_verify_exchange(
-        &self,
-        stream: &mut entangle_transport::SecureStream,
-        particle_id: &entangle_core::ParticleId,
-        name: &str,
-        remote_key: [u8; 32],
-    ) -> std::result::Result<(), LinkError> {
-        for _ in 0..4 {
-            let (outgoing, _) = self.verification_step(particle_id, name, remote_key, None)?;
-            entangle_link::send_verify(stream, &outgoing).await?;
-            let incoming = entangle_link::recv_verify(stream).await?;
-            let (_, record) =
-                self.verification_step(particle_id, name, remote_key, Some(incoming))?;
-            let complete = record.is_complete()
-                && (record.role == entangle_core::sas::Role::Revealer || outgoing.reveal.is_some());
-            if complete {
-                break;
-            }
-        }
-        Ok(())
+    fn group_names_for_peer(&self, particle_id: &str, static_key: &[u8; 32]) -> Vec<String> {
+        self.groups
+            .read()
+            .expect("group store lock")
+            .iter()
+            .filter(|group| {
+                group.members.iter().any(|member| {
+                    member.particle_id == particle_id
+                        && member.static_key == hex::encode(static_key)
+                })
+            })
+            .map(|group| group.meta.name.clone())
+            .collect()
     }
 
     fn advertisement(&self) -> Advertisement {
@@ -504,11 +379,13 @@ impl Particle {
             name: self.manifest.name.clone(),
             port: self.manifest.link_port,
             context: self.manifest.context.clone(),
-            group: self
-                .pairing_group
+            groups: self
+                .groups
                 .read()
-                .expect("pairing group lock")
-                .clone(),
+                .expect("group store lock")
+                .iter()
+                .map(|group| group.id.clone())
+                .collect(),
             version: self.manifest.version.clone(),
         }
     }
@@ -565,10 +442,11 @@ impl Particle {
         }
     }
 
-    async fn pairing_watch(self: Arc<Self>) {
+    async fn group_watch(self: Arc<Self>) {
         let mut shutdown = self.shutdown.subscribe();
         let mut interval = tokio::time::interval(Duration::from_secs(2));
         let mut unavailable_logged = false;
+        let mut previous = self.groups.read().expect("group store lock").clone();
         loop {
             tokio::select! {
                 changed = shutdown.changed() => {
@@ -578,90 +456,37 @@ impl Particle {
                 }
                 _ = interval.tick() => {}
             }
-            let mut key_changed = false;
-            match pairing::load(&self.pairing_root) {
-                Ok(Some(key)) => {
-                    unavailable_logged = false;
-                    let current = self
-                        .active_pairing_key
+            match groups::list(&self.data_root) {
+                Ok(current) if current != previous => {
+                    let discovered = self
+                        .field
                         .read()
-                        .expect("pairing key lock")
-                        .to_owned();
-                    key_changed = current != Some(key);
-                    if key_changed {
-                        if current.is_some() {
-                            warn!("pairing key changed; dropping entangled peers and refreshing discovery");
-                        }
-                        let psk = pairing::derive_psk(&key);
-                        *self.active_pairing_key.write().expect("pairing key lock") = Some(key);
-                        *self.keys.write().expect("key slot lock") = Some(Arc::new(LinkKeys {
-                            static_private: self._identity.static_private,
-                            psk,
-                        }));
-                        *self.pairing_group.write().expect("pairing group lock") =
-                            Some(pairing::group_id(&key));
-                        self.field.write().expect("field lock").clear();
-                    }
-                }
-                Ok(None) => {
-                    let paired = self.keys.read().expect("key slot lock").is_some();
-                    if paired && !unavailable_logged {
-                        warn!("pairing.key was removed; keeping the active pairing");
-                        unavailable_logged = true;
-                    }
-                    if !paired {
-                        unavailable_logged = false;
-                    }
-                }
-                Err(error) => {
-                    if !unavailable_logged {
-                        warn!(%error, "pairing key is unavailable; keeping the active pairing");
-                        unavailable_logged = true;
-                    }
-                }
-            }
-            let paired = self.keys.read().expect("key slot lock").is_some();
-            if paired && !self.options.no_mdns && !self.options.relay_only {
-                let discovery_down = self.resonator.lock().await.is_none();
-                if key_changed || discovery_down {
+                        .expect("field lock")
+                        .all()
+                        .into_iter()
+                        .map(|peer| peer.resonance)
+                        .collect::<Vec<_>>();
+                    previous = current.clone();
+                    *self.groups.write().expect("group store lock") = current.clone();
+                    *self.keys.write().expect("key ring lock") =
+                        Arc::new(build_key_ring(self._identity.static_private, &current));
+                    self.field.write().expect("field lock").clear();
+                    self.groups_reload_warned.store(false, Ordering::Relaxed);
                     if let Err(error) = self.restart_resonator().await {
                         self.log_discovery_failure(&error);
                     }
-                }
-            }
-            if key_changed {
-                self.dial_static_peers().await;
-            }
-            if self._identity.persistent {
-                match trust::file_stamp(&self.pairing_root) {
-                    Ok(stamp) => {
-                        let changed = {
-                            let mut previous = self.trust_stamp.lock().expect("trust stamp lock");
-                            if *previous == stamp {
-                                false
-                            } else {
-                                *previous = stamp;
-                                true
-                            }
-                        };
-                        if changed {
-                            match trust::load(&self.pairing_root) {
-                                Ok(store) => {
-                                    self.apply_trust_store(&store);
-                                    self.trust_reload_warned.store(false, Ordering::Relaxed);
-                                }
-                                Err(error) => {
-                                    if !self.trust_reload_warned.swap(true, Ordering::Relaxed) {
-                                        warn!(%error, "could not reload peer trust decisions");
-                                    }
-                                }
-                            }
-                        }
+                    for peer in discovered {
+                        self.on_detected(peer).await;
                     }
-                    Err(error) => {
-                        if !self.trust_reload_warned.swap(true, Ordering::Relaxed) {
-                            warn!(%error, "could not inspect peer trust decisions");
-                        }
+                    self.dial_static_peers().await;
+                }
+                Ok(_) => {
+                    unavailable_logged = false;
+                }
+                Err(error) => {
+                    if !unavailable_logged {
+                        warn!(%error, "could not reload group store");
+                        unavailable_logged = true;
                     }
                 }
             }
@@ -690,7 +515,7 @@ impl Particle {
             if *shutdown.borrow() {
                 break;
             }
-            let config_path = self.pairing_root.join("repeater.json");
+            let config_path = self.data_root.join("repeater.json");
             let config = match crate::repeater::read_config(&config_path) {
                 Ok(config) => {
                     self.repeater_configured
@@ -713,11 +538,11 @@ impl Particle {
                 }
                 continue;
             };
-            let paired = self.keys.read().expect("key slot lock").is_some();
-            if !self._identity.persistent || !paired {
+            let has_groups = !self.keys.read().expect("key ring lock").groups.is_empty();
+            if !self._identity.persistent || !has_groups {
                 debug!(
                     persistent = self._identity.persistent,
-                    paired, "repeater connection gated by identity or pairing state"
+                    has_groups, "repeater connection gated by identity or group membership"
                 );
                 self.clear_repeater();
                 if !self
@@ -729,10 +554,11 @@ impl Particle {
                 continue;
             }
             let Some(group) = self
-                .pairing_group
+                .groups
                 .read()
-                .expect("pairing group lock")
-                .clone()
+                .expect("group store lock")
+                .first()
+                .map(|group| group.id.clone())
             else {
                 self.clear_repeater();
                 if !self
@@ -743,6 +569,7 @@ impl Particle {
                 }
                 continue;
             };
+            // TODO(#34 phase 3): the repeater keys sessions by device, not group.
             let repeater_public: [u8; 32] = match hex::decode(&config.repeater_public_key)
                 .ok()
                 .and_then(|bytes| bytes.try_into().ok())
@@ -876,7 +703,7 @@ impl Particle {
                     }
                 }
                 _ = config_poll.tick() => {
-                    match crate::repeater::read_config(&self.pairing_root.join("repeater.json")) {
+                    match crate::repeater::read_config(&self.data_root.join("repeater.json")) {
                         Ok(Some(current)) if current.url == config.url
                             && current.repeater_public_key == config.repeater_public_key => {}
                         _ => {
@@ -886,12 +713,17 @@ impl Particle {
                     }
                 }
                 _ = health_poll.tick() => {
-                    let paired = self.keys.read().expect("key slot lock").is_some();
-                    let current_group = self.pairing_group.read().expect("pairing group lock");
+                    let has_groups = !self.keys.read().expect("key ring lock").groups.is_empty();
+                    let current_group = self
+                        .groups
+                        .read()
+                        .expect("group store lock")
+                        .first()
+                        .map(|group| group.id.clone());
                     let closed = dialer.is_closed();
                     let group_changed = current_group.as_deref() != Some(group);
-                    if closed || !paired || group_changed {
-                        debug!(closed, paired, group_changed, "repeater session health check failed");
+                    if closed || !has_groups || group_changed {
+                        debug!(closed, has_groups, group_changed, "repeater session health check failed");
                         break;
                     }
                 }
@@ -1071,14 +903,12 @@ impl Particle {
     }
 
     async fn dial_static_peers(&self) {
-        if self.options.relay_only || self.keys.read().expect("key slot lock").is_none() {
+        if self.options.relay_only || self.keys.read().expect("key ring lock").groups.is_empty() {
             return;
         }
-        let mut attempted = HashSet::new();
         for peer in &self.options.peer {
             if let Ok(addresses) = lookup_host(peer).await {
                 for address in addresses {
-                    attempted.insert(address);
                     if self
                         .field
                         .read()
@@ -1095,81 +925,6 @@ impl Particle {
                     }
                     self.dial(Route::Direct(address), None).await;
                 }
-            }
-        }
-        let pending = self
-            .field
-            .read()
-            .expect("field lock")
-            .all()
-            .into_iter()
-            .filter(|peer| peer.state == PeerState::Pending)
-            .collect::<Vec<_>>();
-        for peer in pending {
-            let Some(remote_key) = peer.static_key else {
-                continue;
-            };
-            if self.verification_is_complete(&peer.resonance.particle_id, remote_key) {
-                continue;
-            }
-            for address in &peer.resonance.addrs {
-                let socket = SocketAddr::new(*address, peer.resonance.port);
-                if attempted.insert(socket) {
-                    self.dial(Route::Direct(socket), Some(peer.resonance.clone()))
-                        .await;
-                }
-            }
-        }
-    }
-
-    fn verification_is_complete(
-        &self,
-        particle_id: &entangle_core::ParticleId,
-        remote_key: [u8; 32],
-    ) -> bool {
-        let local_key = entangle_transport::public_key(&self._identity.static_private);
-        let record = if self._identity.persistent {
-            trust::load_verification(&self.pairing_root, particle_id)
-                .ok()
-                .flatten()
-        } else {
-            self.ephemeral_verifications
-                .lock()
-                .ok()
-                .and_then(|records| records.get(particle_id).cloned())
-        };
-        record.is_some_and(|record| {
-            record.local_key == hex::encode(local_key)
-                && record.remote_key == hex::encode(remote_key)
-                && record.is_complete()
-        })
-    }
-
-    fn apply_trust_store(&self, store: &trust::TrustStore) {
-        let records = self.field.read().expect("field lock").all();
-        let mut field = self.field.write().expect("field lock");
-        for record in records {
-            let (Some(manifest), Some(static_key)) = (record.manifest, record.static_key) else {
-                continue;
-            };
-            let approved = trust::is_approved(store, &record.resonance.particle_id, &static_key);
-            let denied = trust::is_denied(store, &static_key);
-            if record.state == PeerState::Pending && approved {
-                if field.entangle_with_path(
-                    record.resonance.clone(),
-                    manifest,
-                    static_key,
-                    record.path,
-                ) {
-                    info!(
-                        "peer entangled: {} ({})",
-                        record.resonance.name,
-                        record.resonance.particle_id.short()
-                    );
-                }
-            } else if denied || (record.state == PeerState::Entangled && !approved) {
-                field.remove(&record.resonance.particle_id);
-                field.unbind(&record.resonance.particle_id);
             }
         }
     }
@@ -1199,14 +954,11 @@ impl Particle {
             .and_then(Value::as_bool)
             .unwrap_or(false);
         let mut local = serde_json::to_value(&self.manifest).expect("manifest serializes");
-        let paired = self.keys.read().expect("key slot lock").is_some();
-        let pairing_group = self
-            .pairing_group
-            .read()
-            .expect("pairing group lock")
-            .clone();
-        local["paired"] = json!(paired);
-        local["pairing_group"] = json!(pairing_group);
+        let groups = self.groups.read().expect("group store lock").clone();
+        local["groups"] = json!(groups
+            .iter()
+            .map(|group| json!({"name": &group.meta.name, "group": &group.id}))
+            .collect::<Vec<_>>());
         local["identity"] = json!(if self._identity.persistent {
             "persistent"
         } else {
@@ -1232,28 +984,7 @@ impl Particle {
         if let Some(warning) = self.identity_warning() {
             local["warning"] = json!(warning);
         }
-        if !paired {
-            local["hint"] = json!("Not paired: the human must run `entangle pair init` on one machine and `entangle pair join` on the others.");
-        }
-        let pending_approvals = self
-            .field
-            .read()
-            .expect("field lock")
-            .all()
-            .into_iter()
-            .filter(|peer| peer.state == PeerState::Pending)
-            .count();
-        local["pending_approvals"] = json!(pending_approvals);
-        if pending_approvals > 0 {
-            let pending_hint =
-                "The human must run `entangle peer approve` on this machine; agents must not.";
-            let hint = local["hint"]
-                .as_str()
-                .map(|existing| format!("{existing} {pending_hint}"))
-                .unwrap_or_else(|| pending_hint.to_owned());
-            local["hint"] = json!(hint);
-        }
-        let particles = {
+        let mut particles = {
             let field = self.field.read().expect("field lock");
             if relay_directory.is_empty() {
                 field.view(context, include_unentangled)
@@ -1261,6 +992,23 @@ impl Particle {
                 field.view_with_relay_directory(context, include_unentangled, &relay_directory)
             }
         };
+        for peer in &mut particles {
+            let Some(particle_id) = peer.get("particle_id").and_then(Value::as_str) else {
+                continue;
+            };
+            let static_key = self
+                .field
+                .read()
+                .expect("field lock")
+                .all()
+                .into_iter()
+                .find(|record| record.resonance.particle_id.as_str() == particle_id)
+                .and_then(|record| record.static_key);
+            let shared = static_key
+                .map(|key| self.group_names_for_peer(particle_id, &key))
+                .unwrap_or_default();
+            peer["groups"] = json!(shared);
+        }
         json!({"self": local, "particles": particles})
     }
 
@@ -1301,7 +1049,7 @@ impl Particle {
                     "sync_id": item.sync_id,
                     "from_particle_id": item.from_particle_id,
                     "from_name": item.from_name,
-                    "trust": "untrusted",
+                    "group": item.group,
                     "kind": item.kind,
                     "label": item.label,
                     "received_at": item.received_at,
@@ -1327,10 +1075,8 @@ impl Particle {
 
     /// Sends a JSON or file payload to an already-entangled peer.
     pub async fn sync_state(&self, args: Value) -> Result<Value, String> {
-        if self.keys.read().expect("key slot lock").is_none() {
-            return Err(
-                "this particle is unpaired; pair it with a human-provided code first".into(),
-            );
+        if self.keys.read().expect("key ring lock").groups.is_empty() {
+            return Err("the peer isn't a member of any shared group".into());
         }
         let peer_id = args
             .get("particle_id")
@@ -1348,7 +1094,7 @@ impl Particle {
                 .map_err(|_| "peer field lock poisoned".to_owned())?;
             let matched = peers.resolve(peer_id);
             if matched.is_empty() {
-                return Err(format!("unknown particle: {peer_id}"));
+                return Err("the peer isn't a member of any shared group".into());
             }
             if matched.len() > 1 {
                 return Err(format!("ambiguous particle ID: {peer_id}"));
@@ -1356,17 +1102,13 @@ impl Particle {
             matched.into_iter().next().unwrap()
         };
         let target_peer_id = peer.resonance.particle_id.clone();
-        if peer.state != PeerState::Entangled {
-            if peer.state == PeerState::Pending {
-                return Err(format!(
-                    "particle {} is waiting for approval: the human must run `entangle peer approve` on this machine (agents must not)",
-                    peer.resonance.particle_id.short()
-                ));
-            }
-            return Err(format!(
-                "particle {} is not entangled",
-                peer.resonance.particle_id.short()
-            ));
+        if peer.state != PeerState::Entangled
+            || peer.static_key.is_none_or(|key| {
+                self.group_names_for_peer(peer.resonance.particle_id.as_str(), &key)
+                    .is_empty()
+            })
+        {
+            return Err("the peer isn't a member of any shared group".into());
         }
         let target = peer
             .manifest
@@ -1461,6 +1203,9 @@ impl Particle {
             .binding(&peer.resonance.particle_id)
             .filter(|bound| peer.static_key == Some(*bound))
             .ok_or_else(|| "peer has no authenticated static key".to_owned())?;
+        let group_id = self
+            .select_peer_group(&peer, &remote_key)
+            .ok_or_else(|| "the peer isn't a member of any shared group".to_owned())?;
         let started = std::time::Instant::now();
         let direct_socket = if self.options.relay_only || peer.resonance.port == 0 {
             None
@@ -1476,7 +1221,7 @@ impl Particle {
         let mut established = None;
         if let Some(socket) = direct_socket {
             match self
-                .sync_handshake(&Route::Direct(socket), remote_key)
+                .sync_handshake(&Route::Direct(socket), remote_key, group_id)
                 .await
             {
                 Ok(stream) => established = Some((stream, "direct")),
@@ -1501,7 +1246,7 @@ impl Particle {
                     dialer,
                     target: remote_key,
                 }));
-                match self.sync_handshake(&route, remote_key).await {
+                match self.sync_handshake(&route, remote_key, group_id).await {
                     Ok(stream) => established = Some((stream, "repeater")),
                     Err(error) => {
                         debug!(%error, "repeater Noise connection failed before sync offer")
@@ -1571,15 +1316,43 @@ impl Particle {
         &self,
         route: &Route,
         expected_static: [u8; 32],
+        group_id: [u8; 4],
     ) -> Result<SecureStream, String> {
-        let stream =
-            entangle_link::connect_secure(route, self.keys.clone(), Duration::from_secs(5))
-                .await
-                .map_err(|error| error.to_string())?;
+        let stream = entangle_link::connect_secure(
+            route,
+            self.keys.clone(),
+            group_id,
+            Duration::from_secs(5),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
         if stream.remote_static() != expected_static {
             return Err("remote Noise static key did not match the bound peer key".into());
         }
         Ok(stream)
+    }
+
+    fn select_peer_group(&self, peer: &PeerRecord, static_key: &[u8; 32]) -> Option<[u8; 4]> {
+        let groups = self.groups.read().expect("group store lock");
+        let member_matches = |group: &&Group| {
+            group.members.iter().any(|member| {
+                member.particle_id == peer.resonance.particle_id.as_str()
+                    && member.static_key == hex::encode(static_key)
+            })
+        };
+        let advertised = !peer.resonance.groups.is_empty();
+        groups
+            .iter()
+            .filter(member_matches)
+            .find(|group| {
+                if advertised {
+                    peer.resonance.groups.contains(&group.id)
+                } else {
+                    peer.group_id == Some(groups::group_id_bytes(&group.key))
+                        || peer.group_id.is_none()
+                }
+            })
+            .map(|group| groups::group_id_bytes(&group.key))
     }
 
     async fn on_detected(&self, peer: Resonance) {
@@ -1590,15 +1363,11 @@ impl Particle {
             .write()
             .expect("field lock")
             .resonate(peer.clone());
-        let Some(group) = self
-            .pairing_group
-            .read()
-            .expect("pairing group lock")
-            .clone()
-        else {
-            return;
-        };
-        if peer.group.as_ref() != Some(&group) {
+        let local_groups = self.groups.read().expect("group store lock").clone();
+        if !local_groups
+            .iter()
+            .any(|group| peer.groups.contains(&group.id))
+        {
             return;
         }
         for address in &peer.addrs {
@@ -1618,95 +1387,77 @@ impl Particle {
     }
 
     async fn dial(&self, route: Route, discovery: Option<Resonance>) -> bool {
-        if self.keys.read().expect("key slot lock").is_none() {
-            return false;
-        }
-        match entangle_link::handshake_stream(
-            &route,
-            self.keys.clone(),
-            &self.manifest,
-            Duration::from_secs(5),
-        )
-        .await
-        {
-            Ok((manifest, remote_static, mut stream)) if manifest.protocol == PROTOCOL_VERSION => {
-                if manifest.particle_id == self.manifest.particle_id {
-                    return false;
-                }
-                let store = match self.load_trust_store() {
-                    Ok(store) => store,
-                    Err(error) => {
-                        debug!("peer trust store could not be read: {error}");
+        let groups = self.groups.read().expect("group store lock").clone();
+        let candidates = groups.into_iter().filter(|group| {
+            if discovery
+                .as_ref()
+                .is_some_and(|peer| !peer.groups.contains(&group.id))
+            {
+                return false;
+            }
+            discovery.as_ref().is_none_or(|peer| {
+                group
+                    .members
+                    .iter()
+                    .any(|member| member.particle_id == peer.particle_id.as_str())
+            })
+        });
+        for group in candidates {
+            let group_id = groups::group_id_bytes(&group.key);
+            match entangle_link::handshake_stream(
+                &route,
+                self.keys.clone(),
+                group_id,
+                &self.manifest,
+                Duration::from_secs(5),
+            )
+            .await
+            {
+                Ok((manifest, remote_static, _stream)) if manifest.protocol == PROTOCOL_VERSION => {
+                    if manifest.particle_id == self.manifest.particle_id {
                         return false;
                     }
-                };
-                if trust::is_denied(&store, &remote_static) {
-                    debug!("refusing a peer key present in the local denial list");
-                    return false;
-                }
-                if store
-                    .approved
-                    .get(manifest.particle_id.as_str())
-                    .is_some_and(|approval| approval.static_key != hex::encode(remote_static))
-                {
-                    warn!(
-                        "approved particle presented a different key; run `entangle peer revoke` then re-approve if this is expected"
-                    );
-                    return false;
-                }
-                if self
-                    .field
-                    .read()
-                    .expect("field lock")
-                    .binding(&manifest.particle_id)
-                    .is_some_and(|bound_key| bound_key != remote_static)
-                {
-                    warn!(
-                        particle_id = %manifest.particle_id,
-                        "refusing a peer whose Noise static key changed"
-                    );
-                    return false;
-                }
-                let approved = trust::is_approved(&store, &manifest.particle_id, &remote_static);
-                let existing_verification = if self._identity.persistent {
-                    match trust::load_verification(&self.pairing_root, &manifest.particle_id) {
-                        Ok(record) => record.is_some(),
-                        Err(error) => {
-                            debug!("peer verification state could not be read: {error}");
-                            return false;
-                        }
+                    let member = group.members.iter().any(|member| {
+                        member.particle_id == manifest.particle_id.as_str()
+                            && member.static_key == hex::encode(remote_static)
+                    });
+                    if !member {
+                        debug!(
+                            particle_id = %manifest.particle_id,
+                            group = %group.meta.name,
+                            "peer is not a member of the authenticated group"
+                        );
+                        continue;
                     }
-                } else {
-                    self.ephemeral_verifications
-                        .lock()
-                        .expect("ephemeral verification lock")
-                        .contains_key(&manifest.particle_id)
-                };
-                if let Err(error) = self.check_verification_capacity(
-                    &manifest.particle_id,
-                    &store,
-                    existing_verification,
-                ) {
-                    debug!("{error}");
-                    return false;
-                }
-                let route_path = match &route {
-                    Route::Direct(_) => LinkPath::Direct,
-                    Route::Tunnel(_) => LinkPath::Repeater,
-                };
-                let resonance = discovery.unwrap_or_else(|| match &route {
-                    Route::Direct(address) => Resonance {
-                        particle_id: manifest.particle_id.clone(),
-                        name: manifest.name.clone(),
-                        hostname: address.ip().to_string(),
-                        addrs: vec![address.ip()],
-                        port: manifest.link_port,
-                        context: manifest.context.clone(),
-                        group: None,
-                        proto: manifest.protocol,
-                    },
-                    Route::Tunnel(_) => {
-                        let mut resonance = self
+                    if self
+                        .field
+                        .read()
+                        .expect("field lock")
+                        .binding(&manifest.particle_id)
+                        .is_some_and(|bound_key| bound_key != remote_static)
+                    {
+                        warn!(
+                            particle_id = %manifest.particle_id,
+                            "refusing a peer whose Noise static key changed"
+                        );
+                        return false;
+                    }
+                    let route_path = match &route {
+                        Route::Direct(_) => LinkPath::Direct,
+                        Route::Tunnel(_) => LinkPath::Repeater,
+                    };
+                    let mut resonance = discovery.clone().unwrap_or_else(|| match &route {
+                        Route::Direct(address) => Resonance {
+                            particle_id: manifest.particle_id.clone(),
+                            name: manifest.name.clone(),
+                            hostname: address.ip().to_string(),
+                            addrs: vec![address.ip()],
+                            port: manifest.link_port,
+                            context: manifest.context.clone(),
+                            groups: vec![group.id.clone()],
+                            proto: manifest.protocol,
+                        },
+                        Route::Tunnel(_) => self
                             .field
                             .read()
                             .expect("field lock")
@@ -1719,104 +1470,46 @@ impl Particle {
                                 addrs: vec![],
                                 port: manifest.link_port,
                                 context: manifest.context.clone(),
-                                group: None,
+                                groups: vec![group.id.clone()],
                                 proto: manifest.protocol,
-                            });
-                        resonance.particle_id = manifest.particle_id.clone();
-                        resonance.name = manifest.name.clone();
-                        resonance.context = manifest.context.clone();
-                        resonance.proto = manifest.protocol;
-                        resonance
-                    }
-                });
-                let newly_transitioned = {
-                    let mut field = self.field.write().expect("field lock");
-                    match (approved, route_path) {
-                        (true, LinkPath::Direct) => {
-                            field.entangle(resonance, manifest.clone(), remote_static)
-                        }
-                        (false, LinkPath::Direct) => {
-                            field.pend(resonance, manifest.clone(), remote_static)
-                        }
-                        (true, LinkPath::Repeater) => field.entangle_with_path(
-                            resonance,
-                            manifest.clone(),
-                            remote_static,
-                            Some(route_path),
-                        ),
-                        (false, LinkPath::Repeater) => field.pend_with_path(
-                            resonance,
-                            manifest.clone(),
-                            remote_static,
-                            Some(route_path),
-                        ),
-                    }
-                };
-                if approved {
-                    if newly_transitioned {
+                            }),
+                    });
+                    resonance.particle_id = manifest.particle_id.clone();
+                    resonance.name = manifest.name.clone();
+                    resonance.context = manifest.context.clone();
+                    resonance.proto = manifest.protocol;
+                    let newly_linked = self.field.write().expect("field lock").entangle_with_group(
+                        resonance,
+                        manifest.clone(),
+                        remote_static,
+                        Some(group_id),
+                        Some(route_path),
+                    );
+                    if newly_linked {
                         info!(
-                            "peer entangled: {} ({})",
-                            manifest.name,
-                            manifest.particle_id.short()
-                        );
-                    } else {
-                        debug!(
-                            "peer entangled: {} ({})",
+                            "peer linked: {} ({})",
                             manifest.name,
                             manifest.particle_id.short()
                         );
                     }
-                } else if newly_transitioned {
-                    info!(
-                        "peer awaiting approval: {} ({}); run `entangle peer approve` to verify it",
-                        manifest.name,
-                        manifest.particle_id.short()
+                    return true;
+                }
+                Ok((manifest, _, _)) => {
+                    debug!("peer protocol mismatch: {}", manifest.protocol);
+                }
+                Err(error) => {
+                    let route_description = match &route {
+                        Route::Direct(address) => address.to_string(),
+                        Route::Tunnel(opener) => opener.describe(),
+                    };
+                    debug!(
+                        "group {} handshake via {route_description} failed: {error}",
+                        group.meta.name
                     );
                 }
-                let (_, record) = match self.verification_step(
-                    &manifest.particle_id,
-                    &manifest.name,
-                    remote_static,
-                    None,
-                ) {
-                    Ok(record) => record,
-                    Err(error) => {
-                        debug!("peer verification state could not be prepared: {error}");
-                        return true;
-                    }
-                };
-                let needs_verification = !approved
-                    || !record.is_complete()
-                    || (record.role == entangle_core::sas::Role::Committer
-                        && record.reveal.is_none());
-                if needs_verification {
-                    if let Err(error) = self
-                        .run_verify_exchange(
-                            &mut stream,
-                            &manifest.particle_id,
-                            &manifest.name,
-                            remote_static,
-                        )
-                        .await
-                    {
-                        debug!("peer verification exchange failed: {error}");
-                    }
-                }
-                true
-            }
-            Ok((manifest, _, _)) => {
-                debug!("peer protocol mismatch: {}", manifest.protocol);
-                false
-            }
-            Err(error) => {
-                let route_description = match &route {
-                    Route::Direct(address) => address.to_string(),
-                    Route::Tunnel(opener) => opener.describe(),
-                };
-                debug!("handshake via {route_description} failed: {error}");
-                false
             }
         }
+        false
     }
 
     async fn receive_payload(
@@ -1847,10 +1540,17 @@ impl Particle {
             {
                 return Err("sender key does not match the entangled particle".into());
             }
+            if !self.group_member(
+                peer_info.group,
+                offer.from.as_str(),
+                &peer_info.remote_static,
+            ) {
+                return Err("sender is not a member of the authenticated group".into());
+            }
             let peer = field.by_id(&offer.from);
             let peer = peer
                 .filter(|peer| peer.state == PeerState::Entangled)
-                .ok_or_else(|| "this machine has not approved the sender yet".to_owned())?;
+                .ok_or_else(|| "sender is not a member of a shared group".to_owned())?;
             if field.binding(&offer.from) != Some(peer_info.remote_static) {
                 return Err("sender key does not match the entangled particle".into());
             }
@@ -1858,7 +1558,7 @@ impl Particle {
             peer
         };
         let Some(manifest) = peer.manifest else {
-            return Err("sender is not entangled; handshake first".into());
+            return Err("sender is not a member of a shared group".into());
         };
         if !self.manifest.accepts.contains(&offer.kind) {
             return Err(format!(
@@ -1938,7 +1638,16 @@ impl Particle {
                 }
                 StateKind::File => (None, None),
             };
+            let group = self
+                .groups
+                .read()
+                .expect("group store lock")
+                .iter()
+                .find(|group| groups::group_id_bytes(&group.key) == peer_info.group)
+                .map(|group| group.meta.name.clone())
+                .ok_or_else(|| "authenticated group is no longer available".to_owned())?;
             let item = InboxItem {
+                group,
                 sync_id: offer.sync_id.clone(),
                 from_particle_id: manifest.particle_id.to_string(),
                 from_name: manifest.name.clone(),
@@ -1996,155 +1705,101 @@ impl LinkHandler for Particle {
                 manifest.protocol
             )));
         }
-        if manifest.particle_id != self.manifest.particle_id {
-            let store = self.load_trust_store()?;
-            if trust::is_denied(&store, &peer.remote_static) {
-                return Err(LinkError::Handler("peer key has been denied".into()));
-            }
-            if store
-                .approved
-                .get(manifest.particle_id.as_str())
-                .is_some_and(|approval| approval.static_key != hex::encode(peer.remote_static))
-            {
-                warn!(
-                    "approved particle presented a different key; run `entangle peer revoke` then re-approve if this is expected"
-                );
-                return Err(LinkError::Handler(
-                    "approved particle presented a different key".into(),
-                ));
-            }
-            if self
-                .field
-                .read()
-                .map_err(|_| LinkError::Handler("peer field lock poisoned".into()))?
-                .binding(&manifest.particle_id)
-                .is_some_and(|bound_key| bound_key != peer.remote_static)
-            {
-                warn!(
-                    particle_id = %manifest.particle_id,
-                    "refusing a peer whose Noise static key changed"
-                );
-                return Err(LinkError::Handler(
-                    "particle is already entangled with a different Noise static key".into(),
-                ));
-            }
-            let existing_verification = if self._identity.persistent {
-                trust::load_verification(&self.pairing_root, &manifest.particle_id)
-                    .map_err(|error| {
-                        LinkError::Handler(format!("peer verification state unavailable: {error}"))
-                    })?
-                    .is_some()
-            } else {
-                self.ephemeral_verifications
-                    .lock()
-                    .expect("ephemeral verification lock")
-                    .contains_key(&manifest.particle_id)
-            };
-            let approved = trust::is_approved(&store, &manifest.particle_id, &peer.remote_static);
-            self.check_verification_capacity(&manifest.particle_id, &store, existing_verification)?;
-            self.verification_step(
-                &manifest.particle_id,
-                &manifest.name,
-                peer.remote_static,
-                None,
-            )?;
-
-            let mut field = self.field.write().expect("field lock");
-            if field
-                .binding(&manifest.particle_id)
-                .is_some_and(|bound_key| bound_key != peer.remote_static)
-            {
-                warn!(
-                    particle_id = %manifest.particle_id,
-                    "rejecting a manifest that claims an entangled particle with a different Noise static key"
-                );
-                return Err(LinkError::Handler(
-                    "particle is already entangled with a different Noise static key".into(),
-                ));
-            }
-            let existing = field.by_id(&manifest.particle_id);
-            let route_path = if peer.relayed {
-                LinkPath::Repeater
-            } else {
-                LinkPath::Direct
-            };
-            let resonance = if peer.relayed {
-                let mut resonance =
-                    existing
-                        .map(|record| record.resonance)
-                        .unwrap_or_else(|| Resonance {
-                            particle_id: manifest.particle_id.clone(),
-                            name: manifest.name.clone(),
-                            hostname: "via-repeater".into(),
-                            addrs: vec![],
-                            port: manifest.link_port,
-                            context: manifest.context.clone(),
-                            group: None,
-                            proto: manifest.protocol,
-                        });
-                resonance.particle_id = manifest.particle_id.clone();
-                resonance.name = manifest.name.clone();
-                resonance.context = manifest.context.clone();
-                resonance.proto = manifest.protocol;
-                resonance
-            } else {
-                Resonance {
-                    particle_id: manifest.particle_id.clone(),
-                    name: manifest.name.clone(),
-                    hostname: peer.addr.ip().to_string(),
-                    addrs: vec![peer.addr.ip()],
-                    port: manifest.link_port,
-                    context: manifest.context.clone(),
-                    group: existing.and_then(|record| record.resonance.group),
-                    proto: manifest.protocol,
-                }
-            };
-            let peer_name = manifest.name.clone();
-            let particle_id = manifest.particle_id.clone();
-            if approved {
-                if field.entangle_with_path(
-                    resonance,
-                    manifest,
-                    peer.remote_static,
-                    Some(route_path),
-                ) {
-                    info!("peer entangled: {} ({})", peer_name, particle_id.short());
-                } else {
-                    debug!("peer entangled: {} ({})", peer_name, particle_id.short());
-                }
-            } else {
-                if field.pend_with_path(resonance, manifest, peer.remote_static, Some(route_path)) {
-                    info!(
-                        "peer awaiting approval: {} ({}); run `entangle peer approve` to verify it",
-                        peer_name,
-                        particle_id.short()
-                    );
-                }
-            }
+        if manifest.particle_id == self.manifest.particle_id {
+            return Err(LinkError::Handler(
+                "refusing a link to this particle itself".into(),
+            ));
         }
-        Ok(self.manifest.clone())
-    }
-
-    async fn on_verify(
-        &self,
-        peer: &PeerInfo,
-        message: VerifyMessage,
-    ) -> std::result::Result<VerifyMessage, LinkError> {
-        let matched = self
+        if self
             .field
             .read()
             .map_err(|_| LinkError::Handler("peer field lock poisoned".into()))?
-            .all()
-            .into_iter()
-            .find(|record| record.static_key == Some(peer.remote_static))
-            .ok_or_else(|| LinkError::Handler("verification peer has no Hello record".into()))?;
-        let (response, _) = self.verification_step(
-            &matched.resonance.particle_id,
-            &matched.resonance.name,
+            .binding(&manifest.particle_id)
+            .is_some_and(|bound_key| bound_key != peer.remote_static)
+        {
+            warn!(
+                particle_id = %manifest.particle_id,
+                "refusing a peer whose Noise static key changed"
+            );
+            return Err(LinkError::Handler(
+                "particle is already entangled with a different Noise static key".into(),
+            ));
+        }
+        if !self.group_member(
+            peer.group,
+            manifest.particle_id.as_str(),
+            &peer.remote_static,
+        ) {
+            debug!(
+                particle_id = %manifest.particle_id,
+                group = %hex::encode(peer.group),
+                "dropping Hello from a non-member"
+            );
+            return Err(LinkError::Handler(
+                "Hello particle is not a member of the authenticated group".into(),
+            ));
+        }
+        let mut field = self
+            .field
+            .write()
+            .map_err(|_| LinkError::Handler("peer field lock poisoned".into()))?;
+        if field
+            .binding(&manifest.particle_id)
+            .is_some_and(|bound_key| bound_key != peer.remote_static)
+        {
+            warn!(
+                particle_id = %manifest.particle_id,
+                "refusing a peer whose Noise static key changed"
+            );
+            return Err(LinkError::Handler(
+                "particle is already entangled with a different Noise static key".into(),
+            ));
+        }
+        let mut resonance = field
+            .by_id(&manifest.particle_id)
+            .map(|record| record.resonance.clone())
+            .unwrap_or_else(|| Resonance {
+                particle_id: manifest.particle_id.clone(),
+                name: manifest.name.clone(),
+                hostname: if peer.relayed {
+                    "via-repeater".into()
+                } else {
+                    peer.addr.ip().to_string()
+                },
+                addrs: if peer.relayed {
+                    vec![]
+                } else {
+                    vec![peer.addr.ip()]
+                },
+                port: manifest.link_port,
+                context: manifest.context.clone(),
+                groups: vec![hex::encode(peer.group)],
+                proto: manifest.protocol,
+            });
+        resonance.particle_id = manifest.particle_id.clone();
+        resonance.name = manifest.name.clone();
+        resonance.port = manifest.link_port;
+        resonance.context = manifest.context.clone();
+        resonance.proto = manifest.protocol;
+        let route_path = if peer.relayed {
+            LinkPath::Repeater
+        } else {
+            LinkPath::Direct
+        };
+        if field.entangle_with_group(
+            resonance,
+            manifest.clone(),
             peer.remote_static,
-            Some(message),
-        )?;
-        Ok(response)
+            Some(peer.group),
+            Some(route_path),
+        ) {
+            info!(
+                "peer linked: {} ({})",
+                manifest.name,
+                manifest.particle_id.short()
+            );
+        }
+        Ok(self.manifest.clone())
     }
 
     async fn on_offer(
@@ -2182,10 +1837,17 @@ impl Particle {
             if field.binding(&offer.from) != Some(peer_info.remote_static) {
                 return Err("sender key does not match the entangled particle".into());
             }
+            if !self.group_member(
+                peer_info.group,
+                offer.from.as_str(),
+                &peer_info.remote_static,
+            ) {
+                return Err("sender is not a member of the authenticated group".into());
+            }
             let peer = field
                 .by_id(&offer.from)
                 .filter(|peer| peer.state == PeerState::Entangled)
-                .ok_or_else(|| "this machine has not approved the sender yet".to_owned())?;
+                .ok_or_else(|| "sender is not a member of a shared group".to_owned())?;
             if !peer_info.relayed {
                 let source_ip = peer_info.addr.ip();
                 if !peer.resonance.addrs.contains(&source_ip) {
@@ -2269,7 +1931,9 @@ fn kind_name(kind: &StateKind) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::groups::Member;
     use entangle_core::ParticleId;
+    use std::collections::HashMap;
 
     fn options(name: &str, link_port: u16, data_dir: PathBuf, peer: Option<String>) -> Options {
         Options {
@@ -2314,6 +1978,65 @@ mod tests {
                 return port;
             }
         }
+    }
+
+    fn saved_identity(root: &Path) -> (ParticleId, [u8; 32]) {
+        let identity = identity::claim(root).unwrap();
+        let result = (identity.id.clone(), identity.static_private);
+        drop(identity);
+        result
+    }
+
+    fn test_member(id: &ParticleId, name: &str, private: &[u8; 32], added_by: &str) -> Member {
+        Member {
+            particle_id: id.to_string(),
+            name: name.into(),
+            static_key: hex::encode(entangle_transport::public_key(private)),
+            added_by: added_by.into(),
+            added_at: chrono::Utc::now().to_rfc3339(),
+        }
+    }
+
+    fn insert_test_group(
+        root: &Path,
+        name: &str,
+        key: [u8; 32],
+        members: Vec<Member>,
+        role: groups::Role,
+    ) {
+        groups::insert(
+            root,
+            key,
+            groups::GroupMeta {
+                version: 1,
+                name: name.into(),
+                role,
+                created_at: chrono::Utc::now().to_rfc3339(),
+            },
+            members,
+        )
+        .unwrap();
+    }
+
+    fn prepare_group_pair(root_a: &Path, root_b: &Path, key: [u8; 32]) {
+        let (id_a, private_a) = saved_identity(root_a);
+        let (id_b, private_b) = saved_identity(root_b);
+        let member_a = test_member(&id_a, "particle-a", &private_a, id_a.as_str());
+        let member_b = test_member(&id_b, "particle-b", &private_b, id_a.as_str());
+        insert_test_group(
+            root_a,
+            "test",
+            key,
+            vec![member_a.clone(), member_b.clone()],
+            groups::Role::Admin,
+        );
+        insert_test_group(
+            root_b,
+            "test",
+            key,
+            vec![member_a, member_b],
+            groups::Role::Member,
+        );
     }
 
     async fn start_test_repeater(root: PathBuf, port: u16) -> (JoinHandle<()>, String, [u8; 32]) {
@@ -2380,8 +2103,7 @@ mod tests {
     ) -> (JoinHandle<()>, String, [u8; 32]) {
         let (server, url, repeater_public) =
             start_test_repeater(repeater_root.to_path_buf(), port).await;
-        let key = pairing::initialize(root_a, false).unwrap();
-        pairing::join(root_b, &pairing::encode_code(&key), false).unwrap();
+        prepare_group_pair(root_a, root_b, [0x41; 32]);
         enroll_with_test_repeater(root_a, repeater_root, &url, repeater_public, [0x51; 32]).await;
         enroll_with_test_repeater(root_b, repeater_root, &url, repeater_public, [0x52; 32]).await;
         write_repeater_config(root_a, &url, repeater_public);
@@ -2418,6 +2140,48 @@ mod tests {
         .expect("both particles should connect and see each other in the repeater directory");
     }
 
+    async fn wait_for_repeater_sessions(a: &Particle, b: &Particle) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let a_connected =
+                    a.find_particles(&json!({}))["self"]["repeater"]["connected"] == true;
+                let b_connected =
+                    b.find_particles(&json!({}))["self"]["repeater"]["connected"] == true;
+                if a_connected && b_connected {
+                    break;
+                }
+                sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("both particles should connect to the repeater");
+    }
+
+    async fn wait_for_group_pair(a: &Particle, b: &Particle) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let a_linked = a
+                    .field
+                    .read()
+                    .unwrap()
+                    .by_id(&b.manifest.particle_id)
+                    .is_some_and(|peer| peer.state == PeerState::Entangled);
+                let b_linked = b
+                    .field
+                    .read()
+                    .unwrap()
+                    .by_id(&a.manifest.particle_id)
+                    .is_some_and(|peer| peer.state == PeerState::Entangled);
+                if a_linked && b_linked {
+                    break;
+                }
+                sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("group members should link through the repeater");
+    }
+
     fn peer_manifest(id: ParticleId) -> Manifest {
         Manifest {
             particle_id: id,
@@ -2432,67 +2196,8 @@ mod tests {
         }
     }
 
-    async fn approve_pair(a: &Particle, b: &Particle, root_a: &Path, root_b: &Path) {
-        let (sas_a, sas_b) = tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                let a_pending = a
-                    .field
-                    .read()
-                    .unwrap()
-                    .by_id(&b.manifest.particle_id)
-                    .is_some_and(|peer| peer.state == PeerState::Pending);
-                let b_pending = b
-                    .field
-                    .read()
-                    .unwrap()
-                    .by_id(&a.manifest.particle_id)
-                    .is_some_and(|peer| peer.state == PeerState::Pending);
-                let sas_a = trust::load_verification(root_a, &b.manifest.particle_id)
-                    .unwrap()
-                    .and_then(|record| record.sas);
-                let sas_b = trust::load_verification(root_b, &a.manifest.particle_id)
-                    .unwrap()
-                    .and_then(|record| record.sas);
-                if let (true, true, Some(sas_a), Some(sas_b)) = (a_pending, b_pending, sas_a, sas_b)
-                {
-                    break (sas_a, sas_b);
-                }
-                sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("both peers should complete verification and remain pending");
-        assert_eq!(sas_a, sas_b);
-        let key_a = entangle_transport::public_key(&a._identity.static_private);
-        let key_b = entangle_transport::public_key(&b._identity.static_private);
-        let mut trust_a = trust::load(root_a).unwrap();
-        trust_a.approved.insert(
-            b.manifest.particle_id.to_string(),
-            trust::Approval {
-                name: b.manifest.name.clone(),
-                static_key: hex::encode(key_b),
-                sas: sas_a,
-                approved_at: chrono::Utc::now().to_rfc3339(),
-            },
-        );
-        let mut trust_b = trust::load(root_b).unwrap();
-        trust_b.approved.insert(
-            a.manifest.particle_id.to_string(),
-            trust::Approval {
-                name: a.manifest.name.clone(),
-                static_key: hex::encode(key_a),
-                sas: sas_b,
-                approved_at: chrono::Utc::now().to_rfc3339(),
-            },
-        );
-        trust::save(root_a, &trust_a).unwrap();
-        trust::save(root_b, &trust_b).unwrap();
-        a.apply_trust_store(&trust_a);
-        b.apply_trust_store(&trust_b);
-    }
-
     #[tokio::test]
-    async fn unpaired_particle_listens_but_does_not_dial() {
+    async fn groupless_particle_listens_but_does_not_dial() {
         let temp = tempfile::tempdir().unwrap();
         let target = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
         target.set_nonblocking(true).unwrap();
@@ -2511,7 +2216,7 @@ mod tests {
         .unwrap();
         tokio::time::sleep(Duration::from_millis(100)).await;
 
-        assert!(particle.keys.read().unwrap().is_none());
+        assert!(particle.keys.read().unwrap().groups.is_empty());
         assert!(particle.field.read().unwrap().all().is_empty());
         assert!(std::net::TcpStream::connect(("127.0.0.1", port)).is_ok());
         assert!(matches!(
@@ -2519,30 +2224,182 @@ mod tests {
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
         ));
         let local = particle.find_particles(&json!({}))["self"].clone();
-        assert_eq!(local["paired"], false);
-        assert_eq!(
-            local["hint"],
-            "Not paired: the human must run `entangle pair init` on one machine and `entangle pair join` on the others."
-        );
+        assert!(local["groups"].as_array().unwrap().is_empty());
         particle.shutdown().await;
     }
 
     #[tokio::test]
-    async fn pending_peers_share_sas_and_sync_only_after_both_approve() {
+    async fn mutual_group_members_link_sync_and_label_inbox_items() {
         let temp = tempfile::tempdir().unwrap();
         let root_a = temp.path().join("a");
         let root_b = temp.path().join("b");
-        let key = pairing::initialize(&root_a, false).unwrap();
-        pairing::join(&root_b, &pairing::encode_code(&key), false).unwrap();
+        prepare_group_pair(&root_a, &root_b, [0x41; 32]);
         let a_port = free_port();
         let b_port = port_other_than(a_port);
-        let (notification_tx, mut notification_rx) = mpsc::channel(8);
-        let (b, _) = Particle::start(
-            options("particle-b", b_port, root_b.clone(), None),
-            Some(notification_tx),
+        let (b, _) = Particle::start(options("particle-b", b_port, root_b, None), None)
+            .await
+            .unwrap();
+        let (a, _) = Particle::start(
+            options(
+                "particle-a",
+                a_port,
+                root_a,
+                Some(format!("127.0.0.1:{b_port}")),
+            ),
+            None,
         )
         .await
         .unwrap();
+        tokio::time::timeout(Duration::from_secs(8), async {
+            loop {
+                let linked = a
+                    .field
+                    .read()
+                    .unwrap()
+                    .by_id(&b.manifest.particle_id)
+                    .is_some_and(|peer| peer.state == PeerState::Entangled);
+                if linked {
+                    break;
+                }
+                sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("mutual group members should link");
+        let result = a
+            .sync_state(json!({
+                "particle_id": b.manifest.particle_id.as_str(),
+                "state": { "message": "grouped" },
+                "timeout_secs": 60
+            }))
+            .await
+            .unwrap();
+        assert_eq!(result["delivered"], true);
+        let observed = b.observe(&json!({ "limit": 20 })).await;
+        assert_eq!(observed["states"][0]["group"], "test");
+        a.shutdown().await;
+        b.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn static_peer_dial_uses_first_shared_group_by_name() {
+        let temp = tempfile::tempdir().unwrap();
+        let root_a = temp.path().join("a");
+        let root_b = temp.path().join("b");
+        let (id_a, private_a) = saved_identity(&root_a);
+        let (id_b, private_b) = saved_identity(&root_b);
+        let member_a = test_member(&id_a, "particle-a", &private_a, id_a.as_str());
+        let member_b = test_member(&id_b, "particle-b", &private_b, id_a.as_str());
+        insert_test_group(
+            &root_a,
+            "a",
+            [0xa1; 32],
+            vec![member_a.clone()],
+            groups::Role::Admin,
+        );
+        insert_test_group(
+            &root_a,
+            "b",
+            [0xb2; 32],
+            vec![member_a.clone(), member_b.clone()],
+            groups::Role::Member,
+        );
+        insert_test_group(
+            &root_b,
+            "b",
+            [0xb2; 32],
+            vec![member_a.clone(), member_b.clone()],
+            groups::Role::Admin,
+        );
+        insert_test_group(
+            &root_b,
+            "c",
+            [0xc3; 32],
+            vec![member_b],
+            groups::Role::Member,
+        );
+        let a_port = free_port();
+        let b_port = port_other_than(a_port);
+        let (b, _) = Particle::start(options("particle-b", b_port, root_b, None), None)
+            .await
+            .unwrap();
+        let (a, _) = Particle::start(
+            options(
+                "particle-a",
+                a_port,
+                root_a,
+                Some(format!("127.0.0.1:{b_port}")),
+            ),
+            None,
+        )
+        .await
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(8), async {
+            loop {
+                if a.field
+                    .read()
+                    .unwrap()
+                    .by_id(&b.manifest.particle_id)
+                    .is_some_and(|peer| peer.state == PeerState::Entangled)
+                {
+                    break;
+                }
+                sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("static peer should link using the shared group");
+        assert_eq!(
+            a.field
+                .read()
+                .unwrap()
+                .by_id(&b.manifest.particle_id)
+                .unwrap()
+                .group_id,
+            Some(groups::group_id_bytes(&[0xb2; 32]))
+        );
+        let result = a
+            .sync_state(json!({
+                "particle_id": b.manifest.particle_id.as_str(),
+                "state": { "shared_group": "b" },
+                "timeout_secs": 60
+            }))
+            .await
+            .unwrap();
+        assert_eq!(result["delivered"], true);
+        a.shutdown().await;
+        b.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn group_membership_changes_redial_and_revoke_sync_access() {
+        let temp = tempfile::tempdir().unwrap();
+        let root_a = temp.path().join("a");
+        let root_b = temp.path().join("b");
+        let key = [0x52; 32];
+        let (id_a, private_a) = saved_identity(&root_a);
+        let (id_b, private_b) = saved_identity(&root_b);
+        let member_a = test_member(&id_a, "particle-a", &private_a, id_a.as_str());
+        let member_b = test_member(&id_b, "particle-b", &private_b, id_a.as_str());
+        insert_test_group(
+            &root_a,
+            "test",
+            key,
+            vec![member_a.clone()],
+            groups::Role::Admin,
+        );
+        insert_test_group(
+            &root_b,
+            "test",
+            key,
+            vec![member_a, member_b.clone()],
+            groups::Role::Member,
+        );
+        let a_port = free_port();
+        let b_port = port_other_than(a_port);
+        let (b, _) = Particle::start(options("particle-b", b_port, root_b, None), None)
+            .await
+            .unwrap();
         let (a, _) = Particle::start(
             options(
                 "particle-a",
@@ -2554,337 +2411,55 @@ mod tests {
         )
         .await
         .unwrap();
-        let a_self = a.find_particles(&json!({}))["self"].clone();
-        assert_eq!(a_self["paired"], true);
-        assert_eq!(a_self["pairing_group"], pairing::group_id(&key));
-        let (sas_a, sas_b) = tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                let a_pending = a
-                    .field
-                    .read()
-                    .unwrap()
-                    .by_id(&b.manifest.particle_id)
-                    .is_some_and(|peer| peer.state == PeerState::Pending);
-                let b_pending = b
-                    .field
-                    .read()
-                    .unwrap()
-                    .by_id(&a.manifest.particle_id)
-                    .is_some_and(|peer| peer.state == PeerState::Pending);
-                let sas_a = trust::load_verification(&root_a, &b.manifest.particle_id)
-                    .unwrap()
-                    .and_then(|record| record.sas);
-                let sas_b = trust::load_verification(&root_b, &a.manifest.particle_id)
-                    .unwrap()
-                    .and_then(|record| record.sas);
-                if let (true, true, Some(sas_a), Some(sas_b)) = (a_pending, b_pending, sas_a, sas_b)
-                {
-                    break (sas_a, sas_b);
-                }
-                sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("both peers should complete verification and remain pending");
-        assert_eq!(sas_a, sas_b);
-        assert_eq!(
-            a.sync_state(json!({
-                "particle_id": b.manifest.particle_id.as_str(),
-                "state": { "before": "approval" }
-            }))
-            .await
-            .unwrap_err(),
-            format!(
-                "particle {} is waiting for approval: the human must run `entangle peer approve` on this machine (agents must not)",
-                b.manifest.particle_id.short()
-            )
-        );
-        assert_eq!(
-            b.sync_state(json!({
-                "particle_id": a.manifest.particle_id.as_str(),
-                "state": { "before": "approval" }
-            }))
-            .await
-            .unwrap_err(),
-            format!(
-                "particle {} is waiting for approval: the human must run `entangle peer approve` on this machine (agents must not)",
-                a.manifest.particle_id.short()
-            )
-        );
-        let key_a = entangle_transport::public_key(&a._identity.static_private);
-        let key_b = entangle_transport::public_key(&b._identity.static_private);
-        let mut trust_a = trust::load(&root_a).unwrap();
-        trust_a.approved.insert(
-            b.manifest.particle_id.to_string(),
-            trust::Approval {
-                name: b.manifest.name.clone(),
-                static_key: hex::encode(key_b),
-                sas: sas_a,
-                approved_at: chrono::Utc::now().to_rfc3339(),
-            },
-        );
-        let mut trust_b = trust::load(&root_b).unwrap();
-        trust_b.approved.insert(
-            a.manifest.particle_id.to_string(),
-            trust::Approval {
-                name: a.manifest.name.clone(),
-                static_key: hex::encode(key_a),
-                sas: sas_b,
-                approved_at: chrono::Utc::now().to_rfc3339(),
-            },
-        );
-        trust::save(&root_a, &trust_a).unwrap();
-        trust::save(&root_b, &trust_b).unwrap();
-        a.apply_trust_store(&trust_a);
-        b.apply_trust_store(&trust_b);
-        assert_eq!(
-            a.field
-                .read()
-                .unwrap()
-                .by_id(&b.manifest.particle_id)
-                .unwrap()
-                .state,
-            PeerState::Entangled
-        );
-        assert_eq!(
-            b.field
-                .read()
-                .unwrap()
-                .by_id(&a.manifest.particle_id)
-                .unwrap()
-                .state,
-            PeerState::Entangled
-        );
-        let result = a
-            .sync_state(json!({
-                "particle_id": b.manifest.particle_id.as_str(),
-                "state": { "hello": "world", "count": 7 },
-                "timeout_secs": 60
-            }))
-            .await
-            .unwrap();
-        assert_eq!(result["delivered"], true);
-        assert_eq!(result["path"], "direct");
-        let observed = b.observe(&json!({ "limit": 20 })).await;
-        assert_eq!(observed["states"][0]["state"]["hello"], "world");
-        let source = temp.path().join("source.txt");
-        tokio::fs::write(&source, b"native transport file")
-            .await
-            .unwrap();
-        let result = a
-            .sync_state(json!({
-                "particle_id": b.manifest.particle_id.as_str(),
-                "file_path": source,
-                "timeout_secs": 60
-            }))
-            .await
-            .unwrap();
-        assert_eq!(result["kind"], "file");
-        let observed = b.observe(&json!({ "limit": 20 })).await;
-        let file_item = observed["states"]
-            .as_array()
+        assert!(a
+            .field
+            .read()
             .unwrap()
-            .iter()
-            .find(|item| item["kind"] == "file")
-            .unwrap();
-        assert_eq!(file_item["text"], "native transport file");
-        let duplicate_id = file_item["sync_id"].as_str().unwrap();
-        let original_file = b
-            .data_dir
-            .join("inbox")
-            .join(duplicate_id)
-            .join("source.txt");
-        assert!(original_file.exists());
-        let decision = b
-            .on_offer(
-                &PeerInfo {
-                    addr: SocketAddr::from(([127, 0, 0, 1], a.manifest.link_port)),
-                    remote_static: entangle_transport::public_key(&a._identity.static_private),
-                    relayed: false,
-                },
-                SyncOffer {
-                    from: a.manifest.particle_id.clone(),
-                    sync_id: duplicate_id.to_owned(),
-                    timeout_secs: 60,
-                    kind: StateKind::File,
-                    name: "source.txt".into(),
-                    size: b"native transport file".len() as u64,
-                    sha256: file_item["sha256"].as_str().unwrap().into(),
-                    label: None,
-                },
-            )
+            .by_id(&b.manifest.particle_id)
+            .is_none());
+        assert!(a
+            .sync_state(json!({
+                "particle_id": b.manifest.particle_id.as_str(),
+                "state": { "message": "before membership" }
+            }))
             .await
-            .unwrap();
-        assert!(matches!(
-            decision,
-            SyncDecision::Reject(reason) if reason == "sync_id already in use"
-        ));
-        assert!(original_file.exists());
-        while notification_rx.try_recv().is_ok() {}
-
-        let failed_id = "d00dd00dd00dd00dd00dd00dd00dd00d";
-        let inbox_dir = b.data_dir.join("inbox");
-        tokio::fs::create_dir(inbox_dir.join(format!("{failed_id}.json")))
-            .await
-            .unwrap();
-        let failed_payload = b"{\"persist\":\"failure\"}";
-        let failed_source = temp.path().join("failure.json");
-        tokio::fs::write(&failed_source, failed_payload)
-            .await
-            .unwrap();
-        let failed_offer = entangle_link::offer(
-            &Route::Direct(SocketAddr::from(([127, 0, 0, 1], b_port))),
-            a.keys.clone(),
-            SyncOffer {
-                from: a.manifest.particle_id.clone(),
-                sync_id: failed_id.into(),
-                timeout_secs: 60,
-                kind: StateKind::Json,
-                name: "failure.json".into(),
-                size: failed_payload.len() as u64,
-                sha256: hex::encode(Sha256::digest(failed_payload)),
-                label: None,
-            },
-            tokio::fs::File::open(failed_source).await.unwrap(),
-            Duration::from_secs(15),
-        )
-        .await
-        .unwrap();
-        assert!(matches!(
-            failed_offer,
-            entangle_link::OfferOutcome::Failed(reason)
-                if reason.contains("unable to persist received inbox metadata")
-        ));
-        assert!(!inbox_dir.join(failed_id).exists());
-        assert!(!inbox_dir.join(format!("{failed_id}.json.tmp")).exists());
-        assert!(!b
-            .inbox
-            .lock()
-            .await
-            .iter()
-            .any(|item| item.sync_id == failed_id));
-        assert!(notification_rx.try_recv().is_err());
-        assert!(!b.in_flight.lock().unwrap().contains(failed_id));
-        assert_eq!(
-            b.field
-                .read()
-                .unwrap()
-                .by_id(&a.manifest.particle_id)
-                .unwrap()
-                .static_key,
-            Some(entangle_transport::public_key(&a._identity.static_private))
-        );
-
-        a.shutdown().await;
-        b.shutdown().await;
-    }
-
-    #[tokio::test]
-    async fn concurrent_dials_converge_on_the_same_sas() {
-        let temp = tempfile::tempdir().unwrap();
-        let root_a = temp.path().join("a");
-        let root_b = temp.path().join("b");
-        let key = pairing::initialize(&root_a, false).unwrap();
-        pairing::join(&root_b, &pairing::encode_code(&key), false).unwrap();
-        let a_port = free_port();
-        let b_port = port_other_than(a_port);
-        let (result_a, result_b) = tokio::join!(
-            Particle::start(
-                options(
-                    "concurrent-a",
-                    a_port,
-                    root_a.clone(),
-                    Some(format!("127.0.0.1:{b_port}")),
-                ),
-                None,
-            ),
-            Particle::start(
-                options(
-                    "concurrent-b",
-                    b_port,
-                    root_b.clone(),
-                    Some(format!("127.0.0.1:{a_port}")),
-                ),
-                None,
-            ),
-        );
-        let (a, _) = result_a.unwrap();
-        let (b, _) = result_b.unwrap();
-        let (sas_a, sas_b) = tokio::time::timeout(Duration::from_secs(5), async {
+            .unwrap_err()
+            .contains("isn't a member of any shared group"));
+        groups::add_member(&root_a, &groups::group_id(&key), member_b).unwrap();
+        tokio::time::timeout(Duration::from_secs(8), async {
             loop {
-                let sas_a = trust::load_verification(&root_a, &b.manifest.particle_id)
-                    .unwrap()
-                    .and_then(|record| record.sas);
-                let sas_b = trust::load_verification(&root_b, &a.manifest.particle_id)
-                    .unwrap()
-                    .and_then(|record| record.sas);
-                if let (Some(sas_a), Some(sas_b)) = (sas_a, sas_b) {
-                    break (sas_a, sas_b);
-                }
-                sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("concurrent dials should converge on complete verification records");
-        assert_eq!(sas_a, sas_b);
-        a.shutdown().await;
-        b.shutdown().await;
-    }
-
-    #[tokio::test]
-    async fn unpaired_particle_reloads_pairing_and_authenticates_pending_peer() {
-        let temp = tempfile::tempdir().unwrap();
-        let root_a = temp.path().join("a");
-        let root_b = temp.path().join("b");
-        let key = pairing::initialize(&root_b, false).unwrap();
-        let a_port = free_port();
-        let b_port = port_other_than(a_port);
-        let (a, _) = Particle::start(
-            options(
-                "unpaired-a",
-                a_port,
-                root_a.clone(),
-                Some(format!("127.0.0.1:{b_port}")),
-            ),
-            None,
-        )
-        .await
-        .unwrap();
-        assert_eq!(a.find_particles(&json!({}))["self"]["paired"], false);
-        let (b, _) = Particle::start(
-            options(
-                "paired-b",
-                b_port,
-                root_b,
-                Some(format!("127.0.0.1:{a_port}")),
-            ),
-            None,
-        )
-        .await
-        .unwrap();
-        tokio::fs::write(
-            root_a.join("pairing.key"),
-            format!("{}\n", hex::encode(key)),
-        )
-        .await
-        .unwrap();
-        tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                let paired = a.find_particles(&json!({}))["self"]["paired"] == true;
-                let entangled = a
-                    .field
+                if a.field
                     .read()
                     .unwrap()
                     .by_id(&b.manifest.particle_id)
-                    .is_some_and(|peer| peer.state == PeerState::Pending);
-                if paired && entangled {
+                    .is_some_and(|peer| peer.state == PeerState::Entangled)
+                {
                     break;
                 }
                 sleep(Duration::from_millis(20)).await;
             }
         })
         .await
-        .expect("pairing reload should authenticate a static peer within five seconds");
+        .expect("the group-store watcher should redial after membership is added");
+        groups::leave(&root_a, "test").unwrap();
+        tokio::time::timeout(Duration::from_secs(8), async {
+            loop {
+                if a.groups.read().unwrap().is_empty() {
+                    break;
+                }
+                sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the group-store watcher should observe leaving the group");
+        assert!(a
+            .sync_state(json!({
+                "particle_id": b.manifest.particle_id.as_str(),
+                "state": { "message": "after leave" }
+            }))
+            .await
+            .unwrap_err()
+            .contains("isn't a member of any shared group"));
         a.shutdown().await;
         b.shutdown().await;
     }
@@ -2894,13 +2469,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let root_a = temp.path().join("a");
         let root_b = temp.path().join("b");
-        let key = pairing::initialize(&root_a, false).unwrap();
-        std::fs::create_dir_all(&root_b).unwrap();
-        std::fs::write(
-            root_b.join("pairing.key"),
-            format!("{}\n", hex::encode(key)),
-        )
-        .unwrap();
+        prepare_group_pair(&root_a, &root_b, [0x41; 32]);
         let a_port = free_port();
         let b_port = port_other_than(a_port);
         let (a, _) = Particle::start(
@@ -2932,13 +2501,13 @@ mod tests {
                     .read()
                     .unwrap()
                     .by_id(&b.manifest.particle_id)
-                    .is_some_and(|peer| peer.state == PeerState::Pending);
+                    .is_some_and(|peer| peer.state == PeerState::Entangled);
                 let b_connected = b
                     .field
                     .read()
                     .unwrap()
                     .by_id(&a.manifest.particle_id)
-                    .is_some_and(|peer| peer.state == PeerState::Pending);
+                    .is_some_and(|peer| peer.state == PeerState::Entangled);
                 if a_connected && b_connected {
                     break;
                 }
@@ -2947,13 +2516,12 @@ mod tests {
         })
         .await
         .unwrap();
-        approve_pair(&a, &b, &root_a, &root_b).await;
-
         let sync_id = "fedcba9876543210fedcba9876543210";
-        let keys = a.keys.read().unwrap().clone().unwrap();
+        let keys = a.keys.read().unwrap().clone();
         let mut stream = entangle_transport::connect(
             SocketAddr::from(([127, 0, 0, 1], b_port)),
             &keys,
+            groups::group_id_bytes(&[0x41; 32]),
             Duration::from_secs(2),
         )
         .await
@@ -3005,7 +2573,6 @@ mod tests {
         assert!(local["warning"]
             .as_str()
             .is_some_and(|warning| warning.contains("temporary particle")));
-        assert!(local["hint"].is_string());
         assert!(!root.join("peers").exists());
 
         first.shutdown().await;
@@ -3013,58 +2580,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn different_pairing_keys_cannot_handshake() {
-        let temp = tempfile::tempdir().unwrap();
-        let root_a = temp.path().join("a");
-        let root_b = temp.path().join("b");
-        pairing::initialize(&root_a, false).unwrap();
-        pairing::initialize(&root_b, false).unwrap();
-        let a_port = free_port();
-        let b_port = port_other_than(a_port);
-        let (a, _) = Particle::start(
-            options(
-                "particle-a",
-                a_port,
-                root_a,
-                Some(format!("127.0.0.1:{b_port}")),
-            ),
-            None,
-        )
-        .await
-        .unwrap();
-        let (b, _) = Particle::start(
-            options(
-                "particle-b",
-                b_port,
-                root_b,
-                Some(format!("127.0.0.1:{a_port}")),
-            ),
-            None,
-        )
-        .await
-        .unwrap();
-        assert!(
-            !a.dial(
-                Route::Direct(SocketAddr::from(([127, 0, 0, 1], b_port))),
-                None,
-            )
-            .await
-        );
-        assert!(a.field.read().unwrap().all().is_empty());
-        assert!(b.field.read().unwrap().all().is_empty());
-        a.shutdown().await;
-        b.shutdown().await;
-    }
-
-    #[tokio::test]
     async fn lost_peer_binding_rejects_hello_and_offer_from_another_key() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("node");
-        pairing::initialize(&root, false).unwrap();
+        let (local_id, local_private) = saved_identity(&root);
+        let id = ParticleId::generate();
+        let remote_private = [0x11; 32];
+        insert_test_group(
+            &root,
+            "test",
+            [0x41; 32],
+            vec![
+                test_member(&local_id, "receiver", &local_private, local_id.as_str()),
+                test_member(&id, "peer", &remote_private, local_id.as_str()),
+            ],
+            groups::Role::Admin,
+        );
         let (particle, _) = Particle::start(options("receiver", free_port(), root, None), None)
             .await
             .unwrap();
-        let id = ParticleId::generate();
         let manifest = peer_manifest(id.clone());
         let resonance = Resonance {
             particle_id: id.clone(),
@@ -3073,14 +2607,14 @@ mod tests {
             addrs: vec!["127.0.0.1".parse().unwrap()],
             port: manifest.link_port,
             context: None,
-            group: particle.pairing_group.read().unwrap().clone(),
+            groups: vec![groups::group_id(&[0x41; 32])],
             proto: manifest.protocol,
         };
-        assert!(particle
-            .field
-            .write()
-            .unwrap()
-            .entangle(resonance, manifest.clone(), [0x11; 32]));
+        assert!(particle.field.write().unwrap().entangle(
+            resonance,
+            manifest.clone(),
+            entangle_transport::public_key(&remote_private)
+        ));
         let invalid_offer = SyncOffer {
             from: id.clone(),
             sync_id: "../x".into(),
@@ -3093,7 +2627,8 @@ mod tests {
         };
         let matching_peer = PeerInfo {
             addr: SocketAddr::from(([127, 0, 0, 1], 7337)),
-            remote_static: [0x11; 32],
+            remote_static: entangle_transport::public_key(&remote_private),
+            group: groups::group_id_bytes(&[0x41; 32]),
             relayed: false,
         };
         let decision = particle
@@ -3107,13 +2642,14 @@ mod tests {
         particle.field.write().unwrap().remove(&id);
         assert_eq!(
             particle.field.read().unwrap().binding(&id),
-            Some([0x11; 32])
+            Some(entangle_transport::public_key(&remote_private))
         );
         let hello_error = particle
             .on_hello(
                 &PeerInfo {
                     addr: SocketAddr::from(([127, 0, 0, 1], 7337)),
                     remote_static: [0x22; 32],
+                    group: groups::group_id_bytes(&[0x41; 32]),
                     relayed: false,
                 },
                 manifest,
@@ -3138,6 +2674,7 @@ mod tests {
                 &PeerInfo {
                     addr: SocketAddr::from(([127, 0, 0, 1], 7337)),
                     remote_static: [0x22; 32],
+                    group: groups::group_id_bytes(&[0x41; 32]),
                     relayed: false,
                 },
                 &offer,
@@ -3149,199 +2686,57 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unbound_static_key_cannot_receive_sync_accept_for_approved_particle() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().join("receiver");
-        pairing::initialize(&root, false).unwrap();
-        let port = free_port();
-        let (particle, _) = Particle::start(options("receiver", port, root.clone(), None), None)
-            .await
-            .unwrap();
-        let id = ParticleId::generate();
-        let manifest = peer_manifest(id.clone());
-        let resonance = Resonance {
-            particle_id: id.clone(),
-            name: manifest.name.clone(),
-            hostname: "peer.local.".into(),
-            addrs: vec![],
-            port: manifest.link_port,
-            context: None,
-            group: particle.pairing_group.read().unwrap().clone(),
-            proto: manifest.protocol,
-        };
-        assert!(particle
-            .field
-            .write()
-            .unwrap()
-            .entangle(resonance, manifest, [0x11; 32]));
-        particle.field.write().unwrap().unbind(&id);
-
-        let receiver_keys = particle
-            .keys
-            .read()
-            .unwrap()
-            .as_ref()
-            .unwrap()
-            .as_ref()
-            .clone();
-        let attacker_keys = LinkKeys {
-            static_private: entangle_transport::generate_static(),
-            psk: receiver_keys.psk,
-        };
-        let mut stream = entangle_transport::connect(
-            SocketAddr::from(([127, 0, 0, 1], port)),
-            &attacker_keys,
-            Duration::from_secs(2),
-        )
-        .await
-        .unwrap();
-        let sync_id = "0123456789abcdef0123456789abcdef";
-        entangle_link::write_frame(
-            &mut stream,
-            &entangle_link::Frame::SyncOffer {
-                from: id.clone(),
-                sync_id: sync_id.into(),
-                timeout_secs: 60,
-                kind: StateKind::Json,
-                name: "forged.json".into(),
-                size: 0,
-                sha256: hex::encode(Sha256::digest([])),
-                label: None,
-            },
-        )
-        .await
-        .unwrap();
-        let reply = entangle_link::read_frame(&mut stream).await.unwrap();
-        assert!(matches!(
-            reply,
-            entangle_link::Frame::SyncReject {
-                sync_id: rejected,
-                reason
-            } if rejected == sync_id && reason.contains("sender key")
-        ));
-        assert!(!particle.data_dir.join("inbox").join(sync_id).exists());
-        assert!(!particle
-            .inbox
-            .lock()
-            .await
-            .iter()
-            .any(|item| item.sync_id == sync_id));
-        particle.shutdown().await;
-    }
-
-    #[tokio::test]
-    async fn denied_and_changed_keys_are_rejected_and_revocation_blocks_hello() {
+    async fn unbound_static_key_cannot_receive_sync_offer_for_a_group_member() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("node");
-        pairing::initialize(&root, false).unwrap();
-        let (particle, _) =
-            Particle::start(options("receiver", free_port(), root.clone(), None), None)
-                .await
-                .unwrap();
-        let id = ParticleId::generate();
-        let manifest = peer_manifest(id.clone());
-        let address = SocketAddr::from(([127, 0, 0, 1], 7337));
-        let key = [0x11; 32];
-        let mut store = trust::TrustStore::default();
-        store.denied.insert(
-            hex::encode(key),
-            trust::Denial {
-                particle_id: id.clone(),
-                name: manifest.name.clone(),
-                denied_at: chrono::Utc::now().to_rfc3339(),
-                reason: "denied by operator".into(),
-            },
+        let (local_id, local_private) = saved_identity(&root);
+        let trusted_id = ParticleId::generate();
+        let trusted_private = [0x11; 32];
+        let unbound_private = [0x22; 32];
+        let group_key = [0x41; 32];
+        let group_id = groups::group_id_bytes(&group_key);
+        insert_test_group(
+            &root,
+            "test",
+            group_key,
+            vec![
+                test_member(&local_id, "receiver", &local_private, local_id.as_str()),
+                test_member(&trusted_id, "peer", &trusted_private, local_id.as_str()),
+            ],
+            groups::Role::Admin,
         );
-        trust::save(&root, &store).unwrap();
-        assert!(particle
-            .on_hello(
-                &PeerInfo {
-                    addr: address,
-                    remote_static: key,
-                    relayed: false,
-                },
-                manifest.clone(),
-            )
+        let (particle, _) = Particle::start(options("receiver", free_port(), root, None), None)
             .await
-            .unwrap_err()
-            .to_string()
-            .contains("peer key has been denied"));
-        assert!(trust::load_verification(&root, &id).unwrap().is_none());
-
-        store.denied.clear();
-        store.approved.insert(
-            id.to_string(),
-            trust::Approval {
-                name: manifest.name.clone(),
-                static_key: hex::encode(key),
-                sas: [1, 2, 3],
-                approved_at: chrono::Utc::now().to_rfc3339(),
-            },
-        );
-        trust::save(&root, &store).unwrap();
-        assert!(particle
-            .on_hello(
-                &PeerInfo {
-                    addr: address,
-                    remote_static: [0x22; 32],
-                    relayed: false,
-                },
-                manifest.clone(),
-            )
-            .await
-            .unwrap_err()
-            .to_string()
-            .contains("approved particle presented a different key"));
-        assert!(trust::load_verification(&root, &id).unwrap().is_none());
-
-        let resonance = Resonance {
-            particle_id: id.clone(),
-            name: manifest.name.clone(),
-            hostname: address.ip().to_string(),
-            addrs: vec![address.ip()],
-            port: manifest.link_port,
-            context: None,
-            group: None,
-            proto: manifest.protocol,
+            .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let responder_keys = KeyRing {
+            static_private: unbound_private,
+            groups: HashMap::from([(group_id, groups::derive_psk(&group_key))]),
         };
-        let _ = particle
-            .field
-            .write()
-            .unwrap()
-            .pend(resonance, manifest.clone(), key);
-        particle.apply_trust_store(&store);
-        assert_eq!(
-            particle.field.read().unwrap().by_id(&id).unwrap().state,
-            PeerState::Entangled
-        );
-
-        store.approved.remove(id.as_str());
-        store.denied.insert(
-            hex::encode(key),
-            trust::Denial {
-                particle_id: id.clone(),
-                name: manifest.name,
-                denied_at: chrono::Utc::now().to_rfc3339(),
-                reason: "revoked by operator".into(),
-            },
-        );
-        trust::save(&root, &store).unwrap();
-        particle.apply_trust_store(&store);
-        assert!(particle.field.read().unwrap().by_id(&id).is_none());
-        assert!(particle.field.read().unwrap().binding(&id).is_none());
-        assert!(particle
-            .on_hello(
-                &PeerInfo {
-                    addr: address,
-                    remote_static: key,
-                    relayed: false,
-                },
-                peer_manifest(id.clone()),
+        let accept_task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            entangle_transport::accept_io(
+                Box::new(stream),
+                &responder_keys,
+                Duration::from_secs(5),
             )
             .await
-            .unwrap_err()
-            .to_string()
-            .contains("peer key has been denied"));
+            .unwrap();
+        });
+        let error = match particle
+            .sync_handshake(
+                &Route::Direct(address),
+                entangle_transport::public_key(&trusted_private),
+                group_id,
+            )
+            .await
+        {
+            Ok(_) => panic!("unbound static key must not complete the sync handshake"),
+            Err(error) => error,
+        };
+        assert!(error.contains("remote Noise static key did not match"));
+        accept_task.await.unwrap();
         particle.shutdown().await;
     }
 
@@ -3349,11 +2744,24 @@ mod tests {
     async fn relayed_hello_preserves_discovery_addresses_and_never_learns_placeholder() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("node");
+        let (local_id, local_private) = saved_identity(&root);
+        let id = ParticleId::generate();
+        let remote_private = [0x33; 32];
+        insert_test_group(
+            &root,
+            "test",
+            [0x41; 32],
+            vec![
+                test_member(&local_id, "receiver", &local_private, local_id.as_str()),
+                test_member(&id, "peer", &remote_private, local_id.as_str()),
+            ],
+            groups::Role::Admin,
+        );
         let (particle, _) = Particle::start(options("receiver", free_port(), root, None), None)
             .await
             .unwrap();
-        let id = ParticleId::generate();
-        let manifest = peer_manifest(id.clone());
+        let mut manifest = peer_manifest(id.clone());
+        manifest.link_port = 7338;
         let known_address = "192.0.2.42".parse().unwrap();
         particle.field.write().unwrap().resonate(Resonance {
             particle_id: id.clone(),
@@ -3362,7 +2770,7 @@ mod tests {
             addrs: vec![known_address],
             port: 7338,
             context: None,
-            group: None,
+            groups: vec![groups::group_id(&[0x41; 32])],
             proto: manifest.protocol,
         });
 
@@ -3370,7 +2778,8 @@ mod tests {
             .on_hello(
                 &PeerInfo {
                     addr: RELAY_PLACEHOLDER,
-                    remote_static: [0x33; 32],
+                    remote_static: entangle_transport::public_key(&remote_private),
+                    group: groups::group_id_bytes(&[0x41; 32]),
                     relayed: true,
                 },
                 manifest,
@@ -3425,13 +2834,13 @@ mod tests {
         let (a, _) = Particle::start(options_a, None).await.unwrap();
         let (b, _) = Particle::start(options_b, None).await.unwrap();
         wait_for_repeater(&a, &b).await;
+        wait_for_group_pair(&a, &b).await;
         for particle in [&a, &b] {
             assert_eq!(
                 particle.find_particles(&json!({}))["self"]["repeater"],
                 json!({"configured": true, "connected": true, "relay_only": true})
             );
         }
-        approve_pair(&a, &b, &root_a, &root_b).await;
 
         for (source, target, value) in [
             (&a, &b, json!({"from": "a"})),
@@ -3481,7 +2890,7 @@ mod tests {
                 .iter()
                 .find(|peer| peer["particle_id"] == other.manifest.particle_id.as_str())
                 .unwrap();
-            assert_eq!(peer["state"], "entangled");
+            assert_eq!(peer["state"], "linked");
             assert_eq!(peer["path"], "repeater");
             assert_eq!(peer["via_repeater"], true);
             assert_eq!(peer["addrs"], json!([]));
@@ -3509,7 +2918,7 @@ mod tests {
         let (a, _) = Particle::start(options_a, None).await.unwrap();
         let (b, _) = Particle::start(options_b, None).await.unwrap();
         wait_for_repeater(&a, &b).await;
-        approve_pair(&a, &b, &root_a, &root_b).await;
+        wait_for_group_pair(&a, &b).await;
 
         let result = a
             .sync_state(json!({
@@ -3551,7 +2960,7 @@ mod tests {
         let (a, _) = Particle::start(options_a, None).await.unwrap();
         let (b, _) = Particle::start(options_b, None).await.unwrap();
         wait_for_repeater(&a, &b).await;
-        approve_pair(&a, &b, &root_a, &root_b).await;
+        wait_for_group_pair(&a, &b).await;
 
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
             .await
@@ -3630,8 +3039,8 @@ mod tests {
         );
         let (a, _) = Particle::start(options_a, None).await.unwrap();
         let (b, _) = Particle::start(options_b, None).await.unwrap();
-        wait_for_repeater(&a, &b).await;
-        approve_pair(&a, &b, &root_a, &root_b).await;
+        wait_for_repeater_sessions(&a, &b).await;
+        wait_for_group_pair(&a, &b).await;
         tokio::time::timeout(Duration::from_secs(10), async {
             loop {
                 if a.field
@@ -3688,7 +3097,7 @@ mod tests {
                 .store(100, Ordering::Relaxed);
         }
         wait_for_repeater(&a, &b).await;
-        approve_pair(&a, &b, &root_a, &root_b).await;
+        wait_for_group_pair(&a, &b).await;
 
         server.abort();
         let _ = server.await;

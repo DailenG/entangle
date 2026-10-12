@@ -29,8 +29,8 @@ pub struct Advertisement {
     pub port: u16,
     /// Optional project context.
     pub context: Option<String>,
-    /// Optional public pairing-group identifier (never the pairing key).
-    pub group: Option<String>,
+    /// Public group identifiers (never group keys).
+    pub groups: Vec<String>,
     /// Entangle package version.
     pub version: String,
 }
@@ -50,8 +50,8 @@ pub struct Resonance {
     pub port: u16,
     /// Optional project context.
     pub context: Option<String>,
-    /// Optional public pairing-group identifier (never the pairing key).
-    pub group: Option<String>,
+    /// Public group identifiers shared with this particle.
+    pub groups: Vec<String>,
     /// Remote control protocol version.
     pub proto: u32,
 }
@@ -103,9 +103,8 @@ impl Resonator {
         if let Some(context) = &ad.context {
             properties.push(("ctx", context.clone()));
         }
-        if let Some(group) = &ad.group {
-            properties.push(("grp", group.clone()));
-        }
+        let groups = encode_groups(&ad.groups)?;
+        properties.push(("grp", groups));
         let service = ServiceInfo::new(
             SERVICE_TYPE,
             &instance,
@@ -239,15 +238,7 @@ fn decode_values(
     let proto = property("proto")?
         .parse()
         .map_err(|_| ResonanceError::InvalidTxt("invalid proto".into()))?;
-    let group = property("grp").ok();
-    if group.as_deref().is_some_and(|value| {
-        value.len() != 8
-            || !value
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    }) {
-        return Err(ResonanceError::InvalidTxt("invalid grp".into()));
-    }
+    let groups = decode_groups(&property("grp").unwrap_or_default())?;
     addrs.sort_by_key(|address| match address {
         IpAddr::V4(ip) if !ip.is_loopback() => (0, ip.to_string()),
         IpAddr::V6(ip) if !ip.is_loopback() => (1, ip.to_string()),
@@ -260,9 +251,39 @@ fn decode_values(
         addrs,
         port,
         context: property("ctx").ok(),
-        group,
+        groups,
         proto,
     })
+}
+
+fn encode_groups(groups: &[String]) -> Result<String, ResonanceError> {
+    let mut groups = groups.to_vec();
+    if groups.len() > 8 || groups.iter().any(|group| !valid_group_id(group)) {
+        return Err(ResonanceError::InvalidTxt("invalid grp".into()));
+    }
+    groups.sort();
+    groups.dedup();
+    Ok(groups.join(","))
+}
+
+fn decode_groups(value: &str) -> Result<Vec<String>, ResonanceError> {
+    if value.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut groups = value.split(',').map(str::to_owned).collect::<Vec<_>>();
+    if groups.len() > 8 || groups.iter().any(|group| !valid_group_id(group)) {
+        return Err(ResonanceError::InvalidTxt("invalid grp".into()));
+    }
+    groups.sort();
+    groups.dedup();
+    Ok(groups)
+}
+
+fn valid_group_id(group: &str) -> bool {
+    group.len() == 8
+        && group
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn local_hostname(particle_id: &ParticleId) -> String {
@@ -328,7 +349,7 @@ mod tests {
         assert_eq!(peer.particle_id, id);
         assert_eq!(peer.name, "test node");
         assert_eq!(peer.context.as_deref(), Some("sample"));
-        assert_eq!(peer.group.as_deref(), Some("a1b2c3d4"));
+        assert_eq!(peer.groups, ["a1b2c3d4"]);
         assert_eq!(peer.proto, PROTOCOL_VERSION);
     }
 
@@ -356,9 +377,35 @@ mod tests {
             name: "loopback-test".into(),
             port: 7337,
             context: None,
-            group: None,
+            groups: vec![],
             version: env!("CARGO_PKG_VERSION").into(),
         })
         .unwrap();
+    }
+
+    #[test]
+    fn group_txt_roundtrips_zero_one_and_eight_ids() {
+        for groups in [
+            vec![],
+            vec!["a1b2c3d4".to_owned()],
+            (0..8).map(|value| format!("{value:08x}")).collect(),
+        ] {
+            let encoded = encode_groups(&groups).unwrap();
+            let mut sorted = groups.clone();
+            sorted.sort();
+            sorted.dedup();
+            assert_eq!(decode_groups(&encoded).unwrap(), sorted);
+        }
+    }
+
+    #[test]
+    fn group_txt_rejects_nine_ids_and_malformed_ids() {
+        let nine = (0..9)
+            .map(|value| format!("{value:08x}"))
+            .collect::<Vec<_>>();
+        assert!(encode_groups(&nine).is_err());
+        assert!(decode_groups(&nine.join(",")).is_err());
+        assert!(decode_groups("ABCDEFGH").is_err());
+        assert!(decode_groups("abcd").is_err());
     }
 }
