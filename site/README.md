@@ -13,7 +13,7 @@ Type scale, spacing, radii and icon rules follow the tachyon design system
 `index.html` currently shows four switchable brand directions. Switching changes the palette
 (`html[data-direction]` in `styles.css`), the header mark, the hero copy and the hero animation
 (`directions.js`). Desktop: the labelled "Direction" pill in the bottom-right corner. Phones: the
-pill under the hero visual, or tap the visual. Keys `1`–`4` switch, `Q` toggles quarter speed.
+pill under the hero visual, or tap the visual. Keys `1`–`7` switch, `Q` toggles quarter speed. First load opens on `quadrant` (the working lead); a returning visitor gets their last pick.
 Query parameters: `?d=<id>&speed=quarter`, plus `&t=<seconds>&picker=open` for captures.
 
 | # | id | Physics | Palette (role: hex) |
