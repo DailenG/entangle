@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 152 32" width="152" height="32" role="img" aria-label="Entangle">
+<path d="M5 27 L24 9 L43 27" fill="none" stroke="#9AA7AC" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M5 27 L5.95 26.86 L6.9 26.44 L7.85 25.75 L8.8 24.8 L9.75 23.63 L10.7 22.26 L11.65 20.72 L12.6 19.05 L13.55 17.3 L14.5 15.5 L15.45 13.7 L16.4 11.95 L17.35 10.28 L18.3 8.74 L19.25 7.37 L20.2 6.2 L21.15 5.25 L22.1 4.56 L23.05 4.14 L24 4 L24.95 4.14 L25.9 4.56 L26.85 5.25 L27.8 6.2 L28.75 7.37 L29.7 8.74 L30.65 10.28 L31.6 11.95 L32.55 13.7 L33.5 15.5 L34.45 17.3 L35.4 19.05 L36.35 20.72 L37.3 22.26 L38.25 23.63 L39.2 24.8 L40.15 25.75 L41.1 26.44 L42.05 26.86 L43 27" fill="none" stroke="#0F7A5A" stroke-width="2.25" stroke-linecap="round"/>
+<text x="58" y="23.5" font-family="Inter, ui-sans-serif, system-ui, sans-serif" font-size="22" font-weight="600" letter-spacing="-0.44" fill="#0F1B1E">entangle</text>
+</svg>
