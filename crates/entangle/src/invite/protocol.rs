@@ -26,6 +26,7 @@ use tokio::{
 };
 
 const MAX_FRAME_BYTES: usize = 64 * 1024;
+const JOIN_GRANT_FRAME_MARGIN: usize = 4 * 1024;
 const SESSION_TIMEOUT: Duration = Duration::from_secs(30);
 const SPAKE_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_SESSIONS: usize = 8;
@@ -412,28 +413,8 @@ impl InviteServer {
                 .members
                 .sort_by(|left, right| left.particle_id.cmp(&right.particle_id));
         }
-        sender
-            .send(
-                stream,
-                &Message::JoinGrant {
-                    group_id: proposed.id,
-                    name: proposed.meta.name,
-                    key_hex: hex::encode(proposed.key),
-                    created_at: proposed.meta.created_at,
-                    epoch: proposed.meta.epoch,
-                    admin: proposed.meta.admin,
-                    admin_sign_key: proposed.meta.admin_sign_key,
-                    revoked: proposed.meta.revoked,
-                    members: proposed.members,
-                    retained_keys: proposed
-                        .retained_keys
-                        .into_iter()
-                        .map(|(epoch, key)| (epoch, hex::encode(key)))
-                        .collect(),
-                    updates: proposed.updates,
-                },
-            )
-            .await?;
+        let grant = bounded_join_grant(&proposed)?;
+        sender.send(stream, &grant).await?;
         if receiver.receive::<_, Message>(stream).await? != Message::Done {
             return Err(InviteError::Message("expected Done".into()));
         }
@@ -453,6 +434,46 @@ impl InviteServer {
 
     fn password(&self) -> String {
         self.code.to_string()
+    }
+}
+
+fn bounded_join_grant(group: &Group) -> Result<Message, InviteError> {
+    let mut first_update = 0;
+    loop {
+        let updates = group.updates[first_update..].to_vec();
+        let oldest_key_epoch = updates.first().map(|update| update.epoch.saturating_sub(1));
+        let retained_keys = oldest_key_epoch
+            .into_iter()
+            .flat_map(|oldest| {
+                group
+                    .retained_keys
+                    .range(oldest..)
+                    .map(|(epoch, key)| (*epoch, hex::encode(key)))
+            })
+            .collect();
+        let grant = Message::JoinGrant {
+            group_id: group.id.clone(),
+            name: group.meta.name.clone(),
+            key_hex: hex::encode(group.key),
+            created_at: group.meta.created_at.clone(),
+            epoch: group.meta.epoch,
+            admin: group.meta.admin.clone(),
+            admin_sign_key: group.meta.admin_sign_key.clone(),
+            revoked: group.meta.revoked.clone(),
+            members: group.members.clone(),
+            retained_keys,
+            updates,
+        };
+        let plaintext_len = serde_json::to_vec(&grant)
+            .map_err(|error| InviteError::Message(error.to_string()))?
+            .len();
+        if plaintext_len + 16 <= MAX_FRAME_BYTES - JOIN_GRANT_FRAME_MARGIN {
+            return Ok(grant);
+        }
+        if first_update == group.updates.len() {
+            return Err(InviteError::Oversize);
+        }
+        first_update += 1;
     }
 }
 
@@ -520,8 +541,7 @@ enum JoinMutation {
     Inserted(String),
     Refreshed {
         previous: Box<Group>,
-        installed_epoch: u32,
-        installed_key: [u8; 32],
+        installed: Box<Group>,
     },
 }
 
@@ -609,19 +629,11 @@ where
                     },
                     JoinMutation::Refreshed {
                         previous,
-                        installed_epoch,
-                        installed_key,
-                    } => {
-                        match groups::restore_existing_if_unchanged(
-                            root,
-                            *previous,
-                            installed_epoch,
-                            installed_key,
-                        ) {
-                            Ok(_) => Err(InviteError::Incomplete),
-                            Err(error) => Err(error.into()),
-                        }
-                    }
+                        installed,
+                    } => match groups::restore_existing_if_unchanged(root, *previous, &installed) {
+                        Ok(_) => Err(InviteError::Incomplete),
+                        Err(error) => Err(error.into()),
+                    },
                 }
             } else {
                 Err(error)
@@ -836,8 +848,7 @@ where
         let previous = groups::replace_existing(root, group.clone(), expected_epoch)?;
         *mutation = Some(JoinMutation::Refreshed {
             previous: Box::new(previous),
-            installed_epoch: group.meta.epoch,
-            installed_key: group.key,
+            installed: Box::new(group.clone()),
         });
         group
     } else {
@@ -1420,6 +1431,246 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(server.state().counts().await, (1, 1));
+    }
+
+    #[tokio::test]
+    async fn failed_refresh_confirmation_does_not_restore_a_member_who_left() {
+        let inviter_root = tempfile::tempdir().unwrap();
+        let group = setup_group(inviter_root.path());
+        let joiner_root = tempfile::tempdir().unwrap();
+        let joiner_member = saved_member(joiner_root.path(), "joiner");
+        let departed_root = tempfile::tempdir().unwrap();
+        let departed = saved_member(departed_root.path(), "departed");
+        groups::add_member(inviter_root.path(), &group.id, joiner_member.clone()).unwrap();
+        groups::add_member(inviter_root.path(), &group.id, departed.clone()).unwrap();
+        let admin_private = identity::read_saved(inviter_root.path())
+            .unwrap()
+            .unwrap()
+            .1;
+        let grant = groups::issue_update(
+            inviter_root.path(),
+            &group.id,
+            entangle_core::UpdateKind::Rekey,
+            &admin_private,
+        )
+        .unwrap();
+        let mut local_meta = group.meta.clone();
+        local_meta.name = "local-work".into();
+        groups::insert_with_id(
+            joiner_root.path(),
+            group.id.clone(),
+            group.key,
+            local_meta,
+            grant.members.clone(),
+        )
+        .unwrap();
+
+        let (joiner_stream, mut inviter_stream) = duplex(1024 * 1024);
+        let (installed_tx, installed_rx) = tokio::sync::oneshot::channel();
+        let (continue_tx, continue_rx) = tokio::sync::oneshot::channel();
+        let invitation_group = grant.clone();
+        let inviter_task = tokio::spawn(async move {
+            let (spake, local_msg) = Spake2::<Ed25519Group>::start_a(
+                &Password::new(code().to_string().as_bytes()),
+                &Identity::new(ID_INVITER),
+                &Identity::new(ID_JOINER),
+            );
+            write_tagged_frame(&mut inviter_stream, FRAME_SPAKE, &local_msg)
+                .await
+                .unwrap();
+            let peer_frame = read_frame(&mut inviter_stream).await.unwrap();
+            let peer_msg = tagged_body(&peer_frame, FRAME_SPAKE).unwrap();
+            let shared = spake.finish(peer_msg).unwrap();
+            let keys = DerivedKeys::new(&shared);
+            let confirmation_frame = read_frame(&mut inviter_stream).await.unwrap();
+            let confirmation = tagged_body(&confirmation_frame, FRAME_CONFIRM).unwrap();
+            assert!(bool::from(keys.confirm_joiner.ct_eq(confirmation)));
+            write_tagged_frame(&mut inviter_stream, FRAME_CONFIRM, &keys.confirm_inviter)
+                .await
+                .unwrap();
+
+            let mut sender = SecureJson::new(keys.enc_inviter);
+            let mut receiver = SecureJson::new(keys.enc_joiner);
+            sender
+                .send(
+                    &mut inviter_stream,
+                    &Message::GroupInfo {
+                        name: invitation_group.meta.name.clone(),
+                        group_id: invitation_group.id.clone(),
+                        epoch: invitation_group.meta.epoch,
+                        inviter_name: "inviter".into(),
+                    },
+                )
+                .await
+                .unwrap();
+            assert!(matches!(
+                receiver
+                    .receive::<_, Message>(&mut inviter_stream)
+                    .await
+                    .unwrap(),
+                Message::JoinRequest { .. }
+            ));
+            sender
+                .send(
+                    &mut inviter_stream,
+                    &bounded_join_grant(&invitation_group).unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                receiver
+                    .receive::<_, Message>(&mut inviter_stream)
+                    .await
+                    .unwrap(),
+                Message::Done
+            );
+            installed_tx.send(()).unwrap();
+            continue_rx.await.unwrap();
+            drop(inviter_stream);
+        });
+        let joiner_path = joiner_root.path().to_path_buf();
+        let joiner_task = tokio::spawn(async move {
+            join_with_timeout(
+                joiner_stream,
+                &joiner_path,
+                code(),
+                None,
+                "joiner",
+                Duration::from_secs(5),
+            )
+            .await
+        });
+
+        installed_rx.await.unwrap();
+        groups::remove_member(joiner_root.path(), &group.id, &departed.particle_id).unwrap();
+        continue_tx.send(()).unwrap();
+
+        assert!(matches!(
+            joiner_task.await.unwrap(),
+            Err(InviteError::Group(GroupError::Conflict { name })) if name == "local-work"
+        ));
+        let current = groups::find(joiner_root.path(), &group.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(current.meta.epoch, grant.meta.epoch);
+        assert!(!current
+            .members
+            .iter()
+            .any(|member| member.particle_id == departed.particle_id));
+        inviter_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn oversized_update_history_is_bounded_and_invitation_succeeds() {
+        let inviter_root = tempfile::tempdir().unwrap();
+        let admin = saved_member(inviter_root.path(), "inviter");
+        let revoked = (0..40)
+            .map(|index| entangle_core::Revocation {
+                particle_id: entangle_core::ParticleId::generate().to_string(),
+                static_key: format!("{index:064x}"),
+            })
+            .collect::<Vec<_>>();
+        let group = groups::insert(
+            inviter_root.path(),
+            [0x52; 32],
+            GroupMeta {
+                version: 2,
+                name: "work".into(),
+                created_at: Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
+                epoch: 0,
+                admin: admin.particle_id.clone(),
+                admin_sign_key: admin.sign_key.clone(),
+                revoked: revoked.clone(),
+                leaving: false,
+            },
+            vec![admin],
+        )
+        .unwrap();
+        let admin_private = identity::read_saved(inviter_root.path())
+            .unwrap()
+            .unwrap()
+            .1;
+        let mut group = group;
+        for _ in 0..17 {
+            group = groups::issue_update(
+                inviter_root.path(),
+                &group.id,
+                entangle_core::UpdateKind::Rekey,
+                &admin_private,
+            )
+            .unwrap();
+        }
+        assert!(group
+            .updates
+            .iter()
+            .all(|update| update.revoked.len() == 40));
+        let full_grant = Message::JoinGrant {
+            group_id: group.id.clone(),
+            name: group.meta.name.clone(),
+            key_hex: hex::encode(group.key),
+            created_at: group.meta.created_at.clone(),
+            epoch: group.meta.epoch,
+            admin: group.meta.admin.clone(),
+            admin_sign_key: group.meta.admin_sign_key.clone(),
+            revoked: group.meta.revoked.clone(),
+            members: group.members.clone(),
+            retained_keys: group
+                .retained_keys
+                .iter()
+                .map(|(epoch, key)| (*epoch, hex::encode(key)))
+                .collect(),
+            updates: group.updates.clone(),
+        };
+        assert!(
+            serde_json::to_vec(&full_grant).unwrap().len() + 16 > MAX_FRAME_BYTES,
+            "the regression fixture must exceed the invite frame limit"
+        );
+        let bounded = bounded_join_grant(&group).unwrap();
+        let Message::JoinGrant {
+            retained_keys,
+            updates,
+            ..
+        } = bounded
+        else {
+            unreachable!()
+        };
+        assert!(updates.len() < group.updates.len());
+        assert!(
+            serde_json::to_vec(&Message::JoinGrant {
+                group_id: group.id.clone(),
+                name: group.meta.name.clone(),
+                key_hex: hex::encode(group.key),
+                created_at: group.meta.created_at.clone(),
+                epoch: group.meta.epoch,
+                admin: group.meta.admin.clone(),
+                admin_sign_key: group.meta.admin_sign_key.clone(),
+                revoked: group.meta.revoked.clone(),
+                members: group.members.clone(),
+                retained_keys: retained_keys.clone(),
+                updates: updates.clone(),
+            })
+            .unwrap()
+            .len()
+                + 16
+                <= MAX_FRAME_BYTES - JOIN_GRANT_FRAME_MARGIN
+        );
+        let oldest_key_epoch = updates.first().unwrap().epoch.saturating_sub(1);
+        assert!(retained_keys
+            .iter()
+            .all(|(epoch, _)| *epoch >= oldest_key_epoch));
+
+        let invite_server = server(inviter_root.path(), &group, 1, DEFAULT_TTL);
+        let joiner_root = tempfile::tempdir().unwrap();
+        let _joiner = saved_member(joiner_root.path(), "joiner");
+        let joined = successful_join(&invite_server, joiner_root.path(), "joiner")
+            .await
+            .unwrap();
+        assert_eq!(joined.group.meta.epoch, 17);
+        assert_eq!(
+            joined.group.updates.first().unwrap().epoch,
+            updates.first().unwrap().epoch
+        );
+        assert_eq!(joined.group.updates.last().unwrap().epoch, 17);
     }
 
     #[tokio::test]

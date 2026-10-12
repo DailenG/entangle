@@ -540,7 +540,7 @@ async fn synchronize_updates(
         if updates.is_empty() {
             return Err(LinkError::Stale);
         }
-        updates
+        oldest_updates_that_fit(updates, link_epoch)?
     } else {
         Vec::new()
     };
@@ -556,7 +556,7 @@ async fn synchronize_updates(
         }
         Frame::GroupUpdates { updates } if updates.is_empty() && local_epoch > link_epoch => {
             match read_frame(stream).await? {
-                Frame::GroupUpdatesAck { epoch } if epoch >= local_epoch => {
+                Frame::GroupUpdatesAck { epoch } if epoch > link_epoch && epoch <= local_epoch => {
                     handler.on_updates_ack(peer, epoch);
                     Err(LinkError::Stale)
                 }
@@ -569,6 +569,38 @@ async fn synchronize_updates(
         }
         frame => Err(LinkError::Unexpected(format!("{frame:?}"))),
     }
+}
+
+fn oldest_updates_that_fit(
+    updates: Vec<GroupUpdate>,
+    link_epoch: u32,
+) -> Result<Vec<GroupUpdate>, LinkError> {
+    let mut selected = Vec::new();
+    let mut expected_epoch = Some(
+        link_epoch
+            .checked_add(1)
+            .ok_or_else(|| LinkError::Handler("group update epoch overflow".into()))?,
+    );
+    for update in updates {
+        if expected_epoch != Some(update.epoch) {
+            return Err(LinkError::Handler(
+                "group update history is not contiguous".into(),
+            ));
+        }
+        let mut candidate = selected.clone();
+        candidate.push(update.clone());
+        let frame = Frame::GroupUpdates { updates: candidate };
+        if serde_json::to_vec(&frame)?.len() > MAX_FRAME_BYTES {
+            if selected.is_empty() {
+                return Err(LinkError::Oversize);
+            }
+            break;
+        }
+        let update_epoch = update.epoch;
+        selected.push(update);
+        expected_epoch = update_epoch.checked_add(1);
+    }
+    Ok(selected)
 }
 
 /// Opens a link, sends a sync offer, streams its declared bytes, and waits for completion.
@@ -943,6 +975,17 @@ mod tests {
         }
     }
 
+    fn group_update_with_revocations(epoch: u32) -> GroupUpdate {
+        let mut update = group_update(epoch);
+        update.revoked = (0..40)
+            .map(|_| entangle_core::Revocation {
+                particle_id: ParticleId::generate().to_string(),
+                static_key: "55".repeat(32),
+            })
+            .collect();
+        update
+    }
+
     #[async_trait]
     impl LinkHandler for CatchUpHandler {
         async fn on_hello(
@@ -1270,6 +1313,102 @@ mod tests {
         })
         .await
         .expect("the ahead member should receive an update acknowledgement");
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn oversized_update_history_catches_up_over_multiple_links() {
+        let updates = (1..=17)
+            .map(group_update_with_revocations)
+            .collect::<Vec<_>>();
+        assert!(
+            serde_json::to_vec(&Frame::GroupUpdates {
+                updates: updates.clone()
+            })
+            .unwrap()
+            .len()
+                > MAX_FRAME_BYTES
+        );
+        let mut responder_keys = keys();
+        responder_keys.groups.insert(
+            GROUP,
+            entangle_transport::GroupKeys {
+                current: 17,
+                keys: (0..=17)
+                    .map(|epoch| (epoch, if epoch == 0 { [0x33; 32] } else { [0x44; 32] }))
+                    .collect(),
+            },
+        );
+        let mut initiator_keys = keys();
+        initiator_keys.groups.insert(
+            GROUP,
+            entangle_transport::GroupKeys {
+                current: 0,
+                keys: BTreeMap::from([(0, [0x33; 32])]),
+            },
+        );
+        let responder = Arc::new(CatchUpHandler {
+            manifest: manifest(),
+            particle_id: ParticleId::generate(),
+            epoch: AtomicU32::new(17),
+            updates: updates.clone(),
+            received_updates: Mutex::new(Vec::new()),
+            acknowledged: Mutex::new(Vec::new()),
+        });
+        let initiator = CatchUpHandler {
+            manifest: manifest(),
+            particle_id: ParticleId::generate(),
+            epoch: AtomicU32::new(0),
+            updates: Vec::new(),
+            received_updates: Mutex::new(Vec::new()),
+            acknowledged: Mutex::new(Vec::new()),
+        };
+        let initiator_keys = key_slot(&initiator_keys);
+        let (address, task) =
+            start_listener(responder_keys, responder.clone() as Arc<dyn LinkHandler>).await;
+        let mut redials = 0;
+        while initiator.epoch.load(Ordering::SeqCst) < 17 {
+            let result = connect_secure_with_handler(
+                &Route::Direct(address),
+                Arc::clone(&initiator_keys),
+                GROUP,
+                &initiator,
+                Duration::from_secs(2),
+            )
+            .await;
+            assert!(matches!(result, Err(LinkError::Stale)));
+            redials += 1;
+            let epoch = initiator.epoch.load(Ordering::SeqCst);
+            let mut keys = initiator_keys.write().unwrap();
+            let mut updated = (**keys).clone();
+            let group_keys = updated.groups.get_mut(&GROUP).unwrap();
+            group_keys.current = epoch;
+            group_keys.keys.insert(epoch, [0x44; 32]);
+            *keys = Arc::new(updated);
+        }
+        assert!(redials > 1);
+        assert_eq!(*initiator.received_updates.lock().unwrap(), updates);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if responder.acknowledged.lock().unwrap().len() == redials {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the ahead member should receive every partial update acknowledgement");
+
+        let final_link = connect_secure_with_handler(
+            &Route::Direct(address),
+            Arc::clone(&initiator_keys),
+            GROUP,
+            &initiator,
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+        drop(final_link);
         task.abort();
     }
 

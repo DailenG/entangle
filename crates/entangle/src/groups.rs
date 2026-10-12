@@ -360,8 +360,7 @@ pub fn replace_existing(
 pub fn restore_existing_if_unchanged(
     root: &Path,
     previous: Group,
-    installed_epoch: u32,
-    installed_key: [u8; 32],
+    installed: &Group,
 ) -> Result<(), GroupError> {
     let _lock = lock_groups(root)?;
     cleanup_transaction_dirs(&groups_dir(root))?;
@@ -371,7 +370,19 @@ pub fn restore_existing_if_unchanged(
         .ok_or_else(|| GroupError::Conflict {
             name: previous.meta.name.clone(),
         })?;
-    if current.outdated || current.meta.epoch != installed_epoch || current.key != installed_key {
+    let mut current_meta = current.meta.clone();
+    current_meta.name.clear();
+    let mut installed_meta = installed.meta.clone();
+    installed_meta.name.clear();
+    if current.outdated
+        || installed.outdated
+        || current.id != installed.id
+        || current.key != installed.key
+        || current_meta != installed_meta
+        || current.members != installed.members
+        || current.retained_keys != installed.retained_keys
+        || current.updates != installed.updates
+    {
         return Err(GroupError::Conflict {
             name: current.meta.name,
         });
@@ -1895,14 +1906,69 @@ mod tests {
             restore_existing_if_unchanged(
                 joiner_root.path(),
                 previous,
-                grant.meta.epoch,
-                grant.key
+                &grant
             ),
             Err(GroupError::Conflict { name }) if name == "local-work"
         ));
         assert_eq!(
             find(joiner_root.path(), &group.id).unwrap().unwrap(),
             concurrent_state
+        );
+    }
+
+    #[test]
+    fn rollback_does_not_restore_a_member_who_left_after_grant_installation() {
+        let admin_root = tempdir().unwrap();
+        let joiner_root = tempdir().unwrap();
+        let departed_root = tempdir().unwrap();
+        let admin = saved_identity(admin_root.path());
+        let joiner = saved_identity(joiner_root.path());
+        let departed = saved_identity(departed_root.path());
+        let group = insert(
+            admin_root.path(),
+            [0x4b; 32],
+            group_meta("work", &admin),
+            vec![admin.clone(), joiner, departed.clone()],
+        )
+        .unwrap();
+        let mut local_meta = group.meta.clone();
+        local_meta.name = "local-work".into();
+        insert_with_id(
+            joiner_root.path(),
+            group.id.clone(),
+            group.key,
+            local_meta,
+            group.members.clone(),
+        )
+        .unwrap();
+        let snapshot = find(joiner_root.path(), &group.id).unwrap().unwrap();
+        let admin_private = identity::read_saved(admin_root.path()).unwrap().unwrap().1;
+        let grant = issue_update(
+            admin_root.path(),
+            &group.id,
+            UpdateKind::Rekey,
+            &admin_private,
+        )
+        .unwrap();
+        let mut installed = grant.clone();
+        installed.meta.name = "local-work".into();
+        let previous =
+            replace_existing(joiner_root.path(), installed.clone(), snapshot.meta.epoch).unwrap();
+
+        remove_member(joiner_root.path(), &group.id, &departed.particle_id).unwrap();
+        let after_leave = find(joiner_root.path(), &group.id).unwrap().unwrap();
+        assert!(!after_leave
+            .members
+            .iter()
+            .any(|member| member.particle_id == departed.particle_id));
+
+        assert!(matches!(
+            restore_existing_if_unchanged(joiner_root.path(), previous, &installed),
+            Err(GroupError::Conflict { name }) if name == "local-work"
+        ));
+        assert_eq!(
+            find(joiner_root.path(), &group.id).unwrap().unwrap(),
+            after_leave
         );
     }
 
