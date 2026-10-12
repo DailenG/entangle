@@ -23,6 +23,7 @@ use invite::{
 };
 use sha2::Digest;
 use std::{
+    future::Future,
     io::{self, IsTerminal, Write},
     net::{IpAddr, Ipv4Addr, SocketAddr},
     process::ExitCode,
@@ -95,8 +96,8 @@ enum GroupCommand {
     Join {
         code: String,
         /// Local group name to use instead of the inviter's name.
-        #[arg(long)]
-        name: Option<String>,
+        #[arg(long = "as")]
+        local_name: Option<String>,
         /// Connect directly instead of using mDNS.
         #[arg(long)]
         via: Option<String>,
@@ -283,11 +284,15 @@ async fn run_group(
         GroupCommand::Invite { name, count } => {
             run_invite(&data_root, &name, count, options, output).await?;
         }
-        GroupCommand::Join { code, name, via } => {
+        GroupCommand::Join {
+            code,
+            local_name,
+            via,
+        } => {
             run_join(
                 &data_root,
                 &code,
-                name.as_deref(),
+                local_name.as_deref(),
                 via.as_deref(),
                 options,
                 output,
@@ -533,9 +538,7 @@ async fn run_join(
         writeln!(output, "{error}")?;
         return Ok(1);
     };
-    let mut particle_options = options.clone();
-    particle_options.name = None;
-    let particle_name = particle_options.particle_name(&particle_id);
+    let particle_name = options.particle_name(&particle_id);
     let mut last_error = None;
     if let Some(via) = via {
         let addresses = tokio::net::lookup_host(via).await?;
@@ -565,27 +568,53 @@ async fn run_join(
                 .await
                 .unwrap_or_default()
         };
-        for candidate in candidates {
-            for address in candidate.addrs.iter() {
-                let target = SocketAddr::new(*address, candidate.port);
-                match tokio::net::TcpStream::connect(target).await {
-                    Ok(stream) => {
-                        match protocol::join(stream, data_root, code, local_name, &particle_name)
+        match try_join_candidates(candidates, |candidate| {
+            let particle_name = particle_name.clone();
+            async move {
+                let mut wrong_code = false;
+                let mut candidate_error = None;
+                for address in candidate.addrs {
+                    let target = SocketAddr::new(address, candidate.port);
+                    match tokio::net::TcpStream::connect(target).await {
+                        Ok(stream) => {
+                            match protocol::join(
+                                stream,
+                                data_root,
+                                code,
+                                local_name,
+                                &particle_name,
+                            )
                             .await
-                        {
-                            Ok(joined) => {
-                                write_join_success(output, joined)?;
-                                return Ok(0);
+                            {
+                                Ok(joined) => return Ok(joined),
+                                Err(InviteError::WrongCode) => wrong_code = true,
+                                Err(error) if is_terminal_join_error(&error) => return Err(error),
+                                Err(error) => candidate_error = Some(error),
                             }
-                            Err(error) if is_terminal_join_error(&error) => {
-                                return write_join_failure(output, error);
-                            }
-                            Err(error) => last_error = Some(error),
                         }
+                        Err(error) => candidate_error = Some(error.into()),
                     }
-                    Err(error) => last_error = Some(error.into()),
+                }
+                if wrong_code {
+                    Err(InviteError::WrongCode)
+                } else {
+                    Err(candidate_error.unwrap_or(InviteError::Closed))
                 }
             }
+        })
+        .await
+        {
+            Ok(joined) => {
+                write_join_success(output, joined)?;
+                return Ok(0);
+            }
+            Err(CandidateJoinFailure::WrongCode) => {
+                return write_join_failure(output, InviteError::WrongCode);
+            }
+            Err(CandidateJoinFailure::Terminal(error)) => {
+                return write_join_failure(output, error);
+            }
+            Err(CandidateJoinFailure::Other) => {}
         }
     }
     let _ = last_error;
@@ -597,11 +626,47 @@ async fn run_join(
     Ok(1)
 }
 
+#[derive(Debug)]
+enum CandidateJoinFailure {
+    WrongCode,
+    Terminal(InviteError),
+    Other,
+}
+
+async fn try_join_candidates<C, T, F, Fut>(
+    candidates: impl IntoIterator<Item = C>,
+    mut attempt: F,
+) -> std::result::Result<T, CandidateJoinFailure>
+where
+    F: FnMut(C) -> Fut,
+    Fut: Future<Output = std::result::Result<T, InviteError>>,
+{
+    let mut total = 0;
+    let mut wrong_code = 0;
+    for candidate in candidates {
+        total += 1;
+        match attempt(candidate).await {
+            Ok(value) => return Ok(value),
+            Err(InviteError::WrongCode) => wrong_code += 1,
+            Err(error) if is_terminal_join_error(&error) => {
+                return Err(CandidateJoinFailure::Terminal(error))
+            }
+            Err(_) => {}
+        }
+    }
+    if total > 0 && wrong_code == total {
+        Err(CandidateJoinFailure::WrongCode)
+    } else {
+        Err(CandidateJoinFailure::Other)
+    }
+}
+
 fn is_terminal_join_error(error: &InviteError) -> bool {
     matches!(
         error,
         InviteError::WrongCode
             | InviteError::Declined { .. }
+            | InviteError::Incomplete
             | InviteError::Group(groups::GroupError::MissingIdentity(_))
     )
 }
@@ -622,7 +687,7 @@ fn write_join_failure(output: &mut dyn Write, error: InviteError) -> Result<i32>
             )?,
             "name_taken" => writeln!(
                 output,
-                "A group named {} already exists here; rerun with --name <other>.",
+                "A group named {} already exists here; rerun with --as <other>.",
                 group_name.unwrap_or_else(|| "that group".into())
             )?,
             _ => writeln!(output, "The inviter declined this join: {reason}.")?,
@@ -631,6 +696,10 @@ fn write_join_failure(output: &mut dyn Write, error: InviteError) -> Result<i32>
             let error = groups::GroupError::MissingIdentity(path);
             writeln!(output, "{error}")?;
         }
+        InviteError::Incomplete => writeln!(
+            output,
+            "The join didn't complete; nothing was kept. Run the same command again while the invite is open."
+        )?,
         other => writeln!(output, "Invite join failed: {other}")?,
     }
     Ok(1)
@@ -691,6 +760,117 @@ mod tests {
     fn detects_broken_pipe_root_cause() {
         let error = anyhow::Error::new(io::Error::new(io::ErrorKind::BrokenPipe, "closed"));
         assert!(is_broken_pipe(&error));
+    }
+
+    #[tokio::test]
+    async fn wrong_code_candidate_does_not_stop_the_join_loop() {
+        let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let result = try_join_candidates([0, 1], {
+            let attempts = std::sync::Arc::clone(&attempts);
+            move |candidate| {
+                let attempts = std::sync::Arc::clone(&attempts);
+                async move {
+                    attempts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if candidate == 0 {
+                        Err(InviteError::WrongCode)
+                    } else {
+                        Ok(candidate)
+                    }
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(result, 1);
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::Relaxed), 2);
+
+        assert!(matches!(
+            try_join_candidates([0, 1], |_| async {
+                Err::<usize, InviteError>(InviteError::WrongCode)
+            })
+            .await,
+            Err(CandidateJoinFailure::WrongCode)
+        ));
+        assert!(matches!(
+            try_join_candidates([0, 1], |candidate| async move {
+                if candidate == 0 {
+                    Err::<usize, InviteError>(InviteError::WrongCode)
+                } else {
+                    Err(InviteError::Closed)
+                }
+            })
+            .await,
+            Err(CandidateJoinFailure::Other)
+        ));
+    }
+
+    #[tokio::test]
+    async fn join_preserves_configured_particle_name() {
+        let inviter_root = tempfile::tempdir().unwrap();
+        let identity = identity::claim(inviter_root.path()).unwrap();
+        let inviter_id = identity.id.to_string();
+        let inviter_member = Member {
+            particle_id: inviter_id.clone(),
+            name: "inviter".into(),
+            static_key: hex::encode(entangle_transport::public_key(&identity.static_private)),
+            added_by: inviter_id,
+            added_at: "2026-10-12T00:00:00Z".into(),
+        };
+        drop(identity);
+        let group = groups::insert(
+            inviter_root.path(),
+            [0x42; 32],
+            groups::GroupMeta {
+                version: 1,
+                name: "work".into(),
+                role: Role::Admin,
+                created_at: "2026-10-12T00:00:00Z".into(),
+            },
+            vec![inviter_member],
+        )
+        .unwrap();
+        let invite = InviteServer::new(
+            inviter_root.path(),
+            group.id.clone(),
+            "inviter".into(),
+            InviteCode::parse("7-amber-photon-quasar").unwrap(),
+            1,
+            Duration::from_secs(30),
+        )
+        .unwrap();
+
+        let joiner_root = tempfile::tempdir().unwrap();
+        identity::claim(joiner_root.path()).unwrap();
+        let mut options = options(joiner_root.path());
+        options.name = Some("office-agent".into());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let via = listener.local_addr().unwrap().to_string();
+        let task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            invite.handle(stream).await
+        });
+        let mut output = Vec::new();
+        assert_eq!(
+            run_join(
+                joiner_root.path(),
+                "7-amber-photon-quasar",
+                None,
+                Some(&via),
+                &options,
+                &mut output,
+            )
+            .await
+            .unwrap(),
+            0
+        );
+        task.await.unwrap().unwrap();
+        let updated = groups::find(inviter_root.path(), &group.id)
+            .unwrap()
+            .unwrap();
+        assert!(updated
+            .members
+            .iter()
+            .any(|member| member.name == "office-agent"));
     }
 
     #[tokio::test]
@@ -807,7 +987,7 @@ mod tests {
             },
             GroupCommand::Join {
                 code: "7-amber-photon-quasar".into(),
-                name: None,
+                local_name: None,
                 via: None,
             },
             GroupCommand::Leave {

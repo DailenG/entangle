@@ -1473,18 +1473,23 @@ impl Particle {
                         );
                         return false;
                     }
-                    let introductions = group
-                        .members
-                        .iter()
-                        .filter(|member| {
-                            member.added_by == self.manifest.particle_id.as_str()
-                                && member.particle_id != manifest.particle_id.as_str()
-                        })
-                        .cloned()
-                        .collect();
-                    if let Err(error) =
-                        entangle_link::introduce_on(stream, introductions, Duration::from_secs(5))
-                            .await
+                    let peer_info = PeerInfo {
+                        addr: match &route {
+                            Route::Direct(address) => *address,
+                            Route::Tunnel(_) => RELAY_PLACEHOLDER,
+                        },
+                        remote_static,
+                        group: group_id,
+                        relayed: matches!(&route, Route::Tunnel(_)),
+                    };
+                    if let Err(error) = entangle_link::introduce_on(
+                        stream,
+                        peer_info,
+                        manifest.particle_id.clone(),
+                        self,
+                        Duration::from_secs(5),
+                    )
+                    .await
                     {
                         debug!(
                             particle_id = %manifest.particle_id,
@@ -1744,6 +1749,33 @@ impl Particle {
 
 #[async_trait::async_trait]
 impl LinkHandler for Particle {
+    fn members_to_introduce(
+        &self,
+        peer: &PeerInfo,
+        recipient: &ParticleId,
+    ) -> std::result::Result<Vec<Member>, LinkError> {
+        let group_id = hex::encode(peer.group);
+        let groups = self
+            .groups
+            .read()
+            .map_err(|_| LinkError::Handler("group store lock poisoned".into()))?;
+        Ok(groups
+            .iter()
+            .find(|group| group.id == group_id)
+            .map(|group| {
+                group
+                    .members
+                    .iter()
+                    .filter(|member| {
+                        member.added_by == self.manifest.particle_id.as_str()
+                            && member.particle_id != recipient.as_str()
+                    })
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
+
     async fn on_hello(
         &self,
         peer: &PeerInfo,
@@ -2739,6 +2771,91 @@ mod tests {
             .is_err());
         a.shutdown().await;
         b.shutdown().await;
+        c.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn inbound_link_introduces_new_member_when_inviter_cannot_dial_peer() {
+        let temp = tempfile::tempdir().unwrap();
+        let root_a = temp.path().join("a");
+        let root_b = temp.path().join("b");
+        let root_c = temp.path().join("c");
+        let key = [0x65; 32];
+        let (id_a, private_a) = saved_identity(&root_a);
+        let (id_b, _private_b) = saved_identity(&root_b);
+        let (id_c, private_c) = saved_identity(&root_c);
+        let member_a = test_member(&id_a, "particle-a", &private_a, id_a.as_str());
+        let member_c = test_member(&id_c, "particle-c", &private_c, id_a.as_str());
+        insert_test_group(
+            &root_a,
+            "work",
+            key,
+            vec![member_a.clone(), member_c.clone()],
+            groups::Role::Admin,
+        );
+        insert_test_group(
+            &root_c,
+            "work",
+            key,
+            vec![member_a, member_c],
+            groups::Role::Member,
+        );
+        let group = groups::find(&root_a, "work").unwrap().unwrap();
+        let invite = crate::invite::protocol::InviteServer::new(
+            &root_a,
+            group.id,
+            "particle-a".into(),
+            crate::invite::code::InviteCode::parse("7-amber-photon-quasar").unwrap(),
+            1,
+            Duration::from_secs(30),
+        )
+        .unwrap();
+        let (joiner, inviter) = tokio::io::duplex(1024 * 1024);
+        let invite_task = tokio::spawn(async move { invite.handle(inviter).await });
+        crate::invite::protocol::join(
+            joiner,
+            &root_b,
+            crate::invite::code::InviteCode::parse("7-amber-photon-quasar").unwrap(),
+            None,
+            "particle-b",
+        )
+        .await
+        .unwrap();
+        invite_task.await.unwrap().unwrap();
+
+        let a_port = free_port();
+        let c_port = port_other_than(a_port);
+        let (a, _) = Particle::start(options("particle-a", a_port, root_a, None), None)
+            .await
+            .unwrap();
+        let (c, _) = Particle::start(
+            options(
+                "particle-c",
+                c_port,
+                root_c.clone(),
+                Some(format!("127.0.0.1:{a_port}")),
+            ),
+            None,
+        )
+        .await
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(8), async {
+            loop {
+                if groups::find(&root_c, "work")
+                    .unwrap()
+                    .unwrap()
+                    .members
+                    .iter()
+                    .any(|member| member.particle_id == id_b.as_str())
+                {
+                    break;
+                }
+                sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("C should learn B from A's response to C's inbound-only link");
+        a.shutdown().await;
         c.shutdown().await;
     }
 

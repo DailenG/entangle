@@ -255,6 +255,15 @@ pub trait LinkHandler: Send + Sync + 'static {
     /// Validates an incoming manifest and returns this particle's manifest.
     async fn on_hello(&self, peer: &PeerInfo, manifest: Manifest) -> Result<Manifest, LinkError>;
 
+    /// Returns members this particle added in the authenticated group.
+    fn members_to_introduce(
+        &self,
+        _peer: &PeerInfo,
+        _recipient: &ParticleId,
+    ) -> Result<Vec<Member>, LinkError> {
+        Ok(Vec::new())
+    }
+
     /// Validates an incoming offer before the listener acknowledges it.
     async fn on_offer(&self, peer: &PeerInfo, offer: SyncOffer) -> Result<SyncDecision, LinkError>;
 
@@ -451,14 +460,23 @@ where
     .map_err(|_| LinkError::Timeout)?
 }
 
-/// Sends member introductions on an authenticated outbound Hello stream.
-pub async fn introduce_on(
+/// Exchanges member introductions on an authenticated outbound Hello stream.
+pub async fn introduce_on<H: LinkHandler + ?Sized>(
     mut stream: SecureStream,
-    members: Vec<Member>,
+    peer: PeerInfo,
+    sender: ParticleId,
+    handler: &H,
     duration: Duration,
 ) -> Result<u32, LinkError> {
     timeout(duration, async {
+        let members = handler.members_to_introduce(&peer, &sender)?;
         write_frame(&mut stream, &Frame::Introduce { members }).await?;
+        let members = match read_frame(&mut stream).await? {
+            Frame::Introduce { members } => members,
+            frame => return Err(LinkError::Unexpected(format!("{frame:?}"))),
+        };
+        let added = handler.on_introduce(&peer, &sender, members).await?;
+        write_frame(&mut stream, &Frame::IntroduceAck { added }).await?;
         match read_frame(&mut stream).await? {
             Frame::IntroduceAck { added } => Ok(added),
             frame => Err(LinkError::Unexpected(format!("{frame:?}"))),
@@ -527,25 +545,45 @@ async fn serve_connection(
         Frame::Hello { manifest } => {
             let sender = manifest.particle_id.clone();
             let own = handler.on_hello(&peer, manifest).await?;
+            let members = handler.members_to_introduce(&peer, &sender)?;
             write_frame(&mut stream, &Frame::Hello { manifest: own }).await?;
-            match read_frame(&mut stream).await {
-                Ok(Frame::Introduce { members }) => {
-                    let added = handler.on_introduce(&peer, &sender, members).await?;
-                    write_frame(&mut stream, &Frame::IntroduceAck { added }).await
+            timeout(Duration::from_secs(5), async {
+                write_frame(&mut stream, &Frame::Introduce { members }).await?;
+                let members = match read_frame(&mut stream).await {
+                    Ok(Frame::Introduce { members }) => members,
+                    Ok(frame) => return Err(LinkError::Unexpected(format!("{frame:?}"))),
+                    Err(LinkError::Transport(TransportError::Io(error)))
+                        if matches!(
+                            error.kind(),
+                            io::ErrorKind::UnexpectedEof
+                                | io::ErrorKind::ConnectionReset
+                                | io::ErrorKind::BrokenPipe
+                        ) =>
+                    {
+                        return Ok(())
+                    }
+                    Err(error) => return Err(error),
+                };
+                let added = handler.on_introduce(&peer, &sender, members).await?;
+                write_frame(&mut stream, &Frame::IntroduceAck { added }).await?;
+                match read_frame(&mut stream).await {
+                    Ok(Frame::IntroduceAck { .. }) => Ok(()),
+                    Ok(frame) => Err(LinkError::Unexpected(format!("{frame:?}"))),
+                    Err(LinkError::Transport(TransportError::Io(error)))
+                        if matches!(
+                            error.kind(),
+                            io::ErrorKind::UnexpectedEof
+                                | io::ErrorKind::ConnectionReset
+                                | io::ErrorKind::BrokenPipe
+                        ) =>
+                    {
+                        Ok(())
+                    }
+                    Err(error) => Err(error),
                 }
-                Ok(frame) => Err(LinkError::Unexpected(format!("{frame:?}"))),
-                Err(LinkError::Transport(TransportError::Io(error)))
-                    if matches!(
-                        error.kind(),
-                        io::ErrorKind::UnexpectedEof
-                            | io::ErrorKind::ConnectionReset
-                            | io::ErrorKind::BrokenPipe
-                    ) =>
-                {
-                    Ok(())
-                }
-                Err(error) => Err(error),
-            }
+            })
+            .await
+            .map_err(|_| LinkError::Timeout)?
         }
         frame => match offer_from_frame(frame) {
             Ok(offer) => serve_offer(&mut stream, &peer, &handler, offer).await,

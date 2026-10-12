@@ -21,12 +21,14 @@ use subtle::ConstantTimeEq;
 use thiserror::Error;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
-    sync::{watch, Mutex},
+    sync::{watch, Mutex, Semaphore},
     time::{timeout, Instant},
 };
 
 const MAX_FRAME_BYTES: usize = 64 * 1024;
 const SESSION_TIMEOUT: Duration = Duration::from_secs(30);
+const SPAKE_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_SESSIONS: usize = 8;
 const DEFAULT_TTL: Duration = Duration::from_secs(10 * 60);
 const ID_INVITER: &[u8] = b"entangle-invite-inviter";
 const ID_JOINER: &[u8] = b"entangle-invite-joiner";
@@ -49,8 +51,12 @@ pub enum InviteError {
     InvalidFrame,
     #[error("invite session timed out")]
     Timeout,
+    #[error("invite has reached its concurrent session limit")]
+    Busy,
     #[error("that code was wrong")]
     WrongCode,
+    #[error("the join did not complete")]
+    Incomplete,
     #[error("invite is closed")]
     Closed,
     #[error("invite has no remaining capacity")]
@@ -177,6 +183,7 @@ pub struct InviteServer {
     inviter_name: String,
     code: InviteCode,
     state: std::sync::Arc<InviteState>,
+    sessions: std::sync::Arc<Semaphore>,
 }
 
 impl InviteServer {
@@ -204,6 +211,7 @@ impl InviteServer {
             inviter_name,
             code,
             state: std::sync::Arc::new(InviteState::new(count, ttl)?),
+            sessions: std::sync::Arc::new(Semaphore::new(MAX_SESSIONS)),
         })
     }
 
@@ -212,10 +220,29 @@ impl InviteServer {
     }
 
     /// Serves one concurrent join attempt.
-    pub async fn handle<S>(&self, mut stream: S) -> Result<Option<String>, InviteError>
+    pub async fn handle<S>(&self, stream: S) -> Result<Option<String>, InviteError>
     where
         S: AsyncRead + AsyncWrite + Unpin,
     {
+        self.handle_with_policy(stream, SESSION_TIMEOUT, SPAKE_TIMEOUT, true)
+            .await
+    }
+
+    async fn handle_with_policy<S>(
+        &self,
+        mut stream: S,
+        session_timeout: Duration,
+        spake_timeout: Duration,
+        send_committed: bool,
+    ) -> Result<Option<String>, InviteError>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
+        let _permit = self
+            .sessions
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| InviteError::Busy)?;
         if self.state.terminal().await.is_some() {
             return Err(InviteError::Closed);
         }
@@ -223,12 +250,14 @@ impl InviteServer {
         let mut confirmed = false;
         let mut reserved = false;
         let result = timeout(
-            SESSION_TIMEOUT,
+            session_timeout,
             self.handle_inner(
                 &mut stream,
                 &mut joiner_message_received,
                 &mut confirmed,
                 &mut reserved,
+                spake_timeout,
+                send_committed,
             ),
         )
         .await
@@ -252,6 +281,8 @@ impl InviteServer {
         joiner_message_received: &mut bool,
         confirmed: &mut bool,
         reserved: &mut bool,
+        spake_timeout: Duration,
+        send_committed: bool,
     ) -> Result<Option<String>, InviteError>
     where
         S: AsyncRead + AsyncWrite + Unpin,
@@ -264,7 +295,7 @@ impl InviteServer {
         );
         write_tagged_frame(stream, FRAME_SPAKE, &local_msg).await?;
         let mut terminal = self.state.subscribe();
-        let peer_msg = read_before_terminal(stream, &mut terminal).await?;
+        let peer_msg = read_before_terminal_timeout(stream, &mut terminal, spake_timeout).await?;
         let peer_msg = tagged_body(&peer_msg, FRAME_SPAKE)?;
         *joiner_message_received = true;
         let shared = spake.finish(peer_msg).map_err(|_| InviteError::WrongCode)?;
@@ -318,22 +349,44 @@ impl InviteServer {
         let joined_name = request.name.clone();
         self.state.reserve().await?;
         *reserved = true;
-        groups::add_member(&self.root, &self.group_id, request)?;
-        let updated = groups::find(&self.root, &self.group_id)?
+        let mut proposed = groups::find(&self.root, &self.group_id)?
             .ok_or_else(|| GroupError::NotFound(self.group_id.clone()))?;
+        if let Some(existing) = proposed
+            .members
+            .iter()
+            .find(|member| member.particle_id == request.particle_id)
+        {
+            if existing.static_key != request.static_key {
+                return Err(GroupError::KeyConflict(request.particle_id).into());
+            }
+        } else {
+            proposed.members.push(request.clone());
+            proposed
+                .members
+                .sort_by(|left, right| left.particle_id.cmp(&right.particle_id));
+        }
         sender
             .send(
                 stream,
                 &Message::JoinGrant {
-                    name: updated.meta.name,
-                    key_hex: hex::encode(updated.key),
-                    created_at: updated.meta.created_at,
-                    members: updated.members,
+                    name: proposed.meta.name,
+                    key_hex: hex::encode(proposed.key),
+                    created_at: proposed.meta.created_at,
+                    members: proposed.members,
                 },
             )
             .await?;
         if receiver.receive::<_, Message>(stream).await? != Message::Done {
             return Err(InviteError::Message("expected Done".into()));
+        }
+        groups::add_member(&self.root, &self.group_id, request)?;
+        if send_committed {
+            sender.send(stream, &Message::Committed).await?;
+        } else {
+            return Err(InviteError::Io(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "simulated missing commit confirmation",
+            )));
         }
         self.state.completed().await;
         *reserved = false;
@@ -368,6 +421,7 @@ enum Message {
         members: Vec<Member>,
     },
     Done,
+    Committed,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -394,11 +448,33 @@ pub struct Joined {
 
 /// Joins an inviter over an arbitrary byte stream.
 pub async fn join<S>(
+    stream: S,
+    root: &Path,
+    code: InviteCode,
+    local_name: Option<&str>,
+    particle_name: &str,
+) -> Result<Joined, InviteError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    join_with_timeout(
+        stream,
+        root,
+        code,
+        local_name,
+        particle_name,
+        SESSION_TIMEOUT,
+    )
+    .await
+}
+
+async fn join_with_timeout<S>(
     mut stream: S,
     root: &Path,
     code: InviteCode,
     local_name: Option<&str>,
     particle_name: &str,
+    session_timeout: Duration,
 ) -> Result<Joined, InviteError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -411,21 +487,37 @@ where
     else {
         return Err(GroupError::MissingIdentity(root.to_owned()).into());
     };
+    let mut inserted_group = None;
     let result = timeout(
-        SESSION_TIMEOUT,
+        session_timeout,
         join_inner(
             &mut stream,
             root,
             code,
             local_name,
             particle_name,
-            id,
-            static_private,
+            (id, static_private),
+            &mut inserted_group,
         ),
     )
-    .await
-    .map_err(|_| InviteError::Timeout)?;
-    result
+    .await;
+    let result = match result {
+        Ok(result) => result,
+        Err(_) => Err(InviteError::Timeout),
+    };
+    match result {
+        Ok(joined) => Ok(joined),
+        Err(error) => {
+            if let Some(group_id) = inserted_group.take() {
+                match groups::leave(root, &group_id) {
+                    Ok(_) | Err(GroupError::NotFound(_)) => Err(InviteError::Incomplete),
+                    Err(error) => Err(error.into()),
+                }
+            } else {
+                Err(error)
+            }
+        }
+    }
 }
 
 async fn join_inner<S>(
@@ -434,12 +526,13 @@ async fn join_inner<S>(
     code: InviteCode,
     local_name: Option<&str>,
     particle_name: &str,
-    id: entangle_core::ParticleId,
-    static_private: [u8; 32],
+    identity: (entangle_core::ParticleId, [u8; 32]),
+    inserted_group: &mut Option<String>,
 ) -> Result<Joined, InviteError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    let (id, static_private) = identity;
     let (spake, local_msg) = Spake2::<Ed25519Group>::start_b(
         &Password::new(code.to_string().as_bytes()),
         &Identity::new(ID_INVITER),
@@ -554,7 +647,12 @@ where
         },
         grant.3,
     )?;
+    *inserted_group = Some(group.id.clone());
     sender.send(stream, &Message::Done).await?;
+    if receiver.receive::<_, Message>(stream).await? != Message::Committed {
+        return Err(InviteError::Message("expected commit confirmation".into()));
+    }
+    *inserted_group = None;
     Ok(Joined {
         group,
         inviter_name,
@@ -634,6 +732,16 @@ async fn read_before_terminal<R: AsyncRead + Unpin>(
             Err(InviteError::Closed)
         }
     }
+}
+
+async fn read_before_terminal_timeout<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    terminal: &mut watch::Receiver<Option<InviteEnd>>,
+    duration: Duration,
+) -> Result<Vec<u8>, InviteError> {
+    timeout(duration, read_before_terminal(reader, terminal))
+        .await
+        .map_err(|_| InviteError::Timeout)?
 }
 
 fn tagged_body(frame: &[u8], expected: u8) -> Result<&[u8], InviteError> {
@@ -885,6 +993,167 @@ mod tests {
         drop(joiner);
         let _ = task.await.unwrap();
         assert_eq!(server.state().terminal().await, Some(InviteEnd::Failed));
+    }
+
+    #[tokio::test]
+    async fn spake_timeout_before_joiner_message_does_not_kill_invite() {
+        let inviter_root = tempfile::tempdir().unwrap();
+        let group = setup_group(inviter_root.path());
+        let server = server(inviter_root.path(), &group, 1, DEFAULT_TTL);
+        let (mut joiner, inviter) = duplex(1024);
+        let server_task = server.clone();
+        let task = tokio::spawn(async move {
+            server_task
+                .handle_with_policy(
+                    inviter,
+                    Duration::from_secs(1),
+                    Duration::from_millis(10),
+                    true,
+                )
+                .await
+        });
+        let spake = read_frame(&mut joiner).await.unwrap();
+        tagged_body(&spake, FRAME_SPAKE).unwrap();
+        assert!(matches!(task.await.unwrap(), Err(InviteError::Timeout)));
+        assert_eq!(server.state().terminal().await, None);
+        assert_eq!(server.state().counts().await, (0, 1));
+    }
+
+    #[tokio::test]
+    async fn bad_done_does_not_commit_member_or_consume_slot() {
+        let inviter_root = tempfile::tempdir().unwrap();
+        let group = setup_group(inviter_root.path());
+        let server = server(inviter_root.path(), &group, 1, DEFAULT_TTL);
+        let joiner_root = tempfile::tempdir().unwrap();
+        let _joiner_member = saved_member(joiner_root.path(), "joiner");
+        let (mut joiner, inviter) = duplex(1024 * 1024);
+        let server_task = server.clone();
+        let task = tokio::spawn(async move { server_task.handle(inviter).await });
+        let (mut sender, mut receiver) = confirm_joiner(&mut joiner, code()).await;
+        assert!(matches!(
+            receiver.receive::<_, Message>(&mut joiner).await.unwrap(),
+            Message::GroupInfo { .. }
+        ));
+        let (joiner_id, joiner_private) =
+            identity::read_saved(joiner_root.path()).unwrap().unwrap();
+        sender
+            .send(
+                &mut joiner,
+                &Message::JoinRequest {
+                    particle_id: joiner_id.to_string(),
+                    name: "joiner".into(),
+                    static_key: hex::encode(entangle_transport::public_key(&joiner_private)),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            receiver.receive::<_, Message>(&mut joiner).await.unwrap(),
+            Message::JoinGrant { .. }
+        ));
+        sender
+            .send(
+                &mut joiner,
+                &Message::Decline {
+                    reason: DeclineReason::AlreadyMember,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(matches!(task.await.unwrap(), Err(InviteError::Message(_))));
+        let unchanged = groups::find(inviter_root.path(), &group.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(unchanged.members.len(), 1);
+        assert_eq!(server.state().counts().await, (0, 1));
+        assert_eq!(server.state().terminal().await, None);
+
+        successful_join(&server, joiner_root.path(), "joiner")
+            .await
+            .unwrap();
+        assert_eq!(server.state().counts().await, (1, 1));
+    }
+
+    #[tokio::test]
+    async fn missing_committed_rolls_back_joiner_but_allows_retry() {
+        let inviter_root = tempfile::tempdir().unwrap();
+        let group = setup_group(inviter_root.path());
+        let server = server(inviter_root.path(), &group, 1, DEFAULT_TTL);
+        let joiner_root = tempfile::tempdir().unwrap();
+        let joiner_member = saved_member(joiner_root.path(), "joiner");
+        let joiner_id = joiner_member.particle_id.clone();
+        let (joiner, inviter) = duplex(1024 * 1024);
+        let server_task = server.clone();
+        let task = tokio::spawn(async move {
+            server_task
+                .handle_with_policy(inviter, SESSION_TIMEOUT, SPAKE_TIMEOUT, false)
+                .await
+        });
+        assert!(matches!(
+            join_with_timeout(
+                joiner,
+                joiner_root.path(),
+                code(),
+                None,
+                "joiner",
+                Duration::from_secs(1),
+            )
+            .await,
+            Err(InviteError::Incomplete)
+        ));
+        assert!(task.await.unwrap().is_err());
+        assert!(groups::list(joiner_root.path()).unwrap().is_empty());
+        let inviter_group = groups::find(inviter_root.path(), &group.id)
+            .unwrap()
+            .unwrap();
+        assert!(inviter_group
+            .members
+            .iter()
+            .any(|member| member.particle_id == joiner_id));
+        assert_eq!(server.state().counts().await, (0, 1));
+
+        successful_join(&server, joiner_root.path(), "joiner")
+            .await
+            .unwrap();
+        assert_eq!(server.state().counts().await, (1, 1));
+    }
+
+    #[tokio::test]
+    async fn ninth_concurrent_session_is_refused_without_closing_invite() {
+        let inviter_root = tempfile::tempdir().unwrap();
+        let group = setup_group(inviter_root.path());
+        let server = server(inviter_root.path(), &group, 1, DEFAULT_TTL);
+        let mut clients = Vec::new();
+        let mut tasks = Vec::new();
+        for _ in 0..MAX_SESSIONS {
+            let (mut client, inviter) = duplex(1024);
+            let session = server.clone();
+            tasks.push(tokio::spawn(async move { session.handle(inviter).await }));
+            let frame = read_frame(&mut client).await.unwrap();
+            tagged_body(&frame, FRAME_SPAKE).unwrap();
+            clients.push(client);
+        }
+
+        let (mut ninth_client, ninth_inviter) = duplex(1024);
+        assert!(matches!(
+            server.handle(ninth_inviter).await,
+            Err(InviteError::Busy)
+        ));
+        assert!(read_frame(&mut ninth_client).await.is_err());
+        for task in tasks {
+            task.abort();
+            let _ = task.await;
+        }
+        drop(clients);
+        assert_eq!(server.state().terminal().await, None);
+        assert_eq!(server.state().counts().await, (0, 1));
+
+        let joiner_root = tempfile::tempdir().unwrap();
+        let _joiner_member = saved_member(joiner_root.path(), "joiner");
+        successful_join(&server, joiner_root.path(), "joiner")
+            .await
+            .unwrap();
+        assert_eq!(server.state().counts().await, (1, 1));
     }
 
     #[tokio::test]

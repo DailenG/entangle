@@ -56,7 +56,9 @@ same `--context` on devices working on the same project. Create a group with
 device and `entangle group join <code>` on each other device. Invitations
 expire after ten minutes; `--count N` sets the number of successful joins, and
 `--via <host:port>` provides a direct-connect fallback when multicast is
-blocked. A wrong code or failed confirmation closes that invite. The inviter
+blocked. Use `--as <local-name>` on `group join` to choose a different local
+group label without changing the particle name. A wrong code or failed
+confirmation closes that invite. The inviter
 should stay online briefly so existing members can learn about newly joined
 devices through one-hop introductions. Use `entangle group list`,
 `entangle group members <name>`, and `entangle group leave <name>` to inspect

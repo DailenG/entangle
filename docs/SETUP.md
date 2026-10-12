@@ -96,6 +96,9 @@ entangle group invite work --count 3
 entangle group join 7-amber-photon-quasar
 ```
 
+Use `--as <local-name>` on `group join` to choose a different local group label;
+it does not change the particle name advertised by this device.
+
 Inspect groups and members with `entangle group list` and
 `entangle group members work`; leave a group with `entangle group leave work`.
 `--count N` requests that many successful joins (default 1, maximum 20).

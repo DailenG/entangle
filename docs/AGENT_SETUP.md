@@ -114,7 +114,8 @@ leave`, `group remove`, `group rekey`, and `group admin`. Agents may run
 `entangle group list`, `entangle group members <name>`, and `entangle peer
 list`. One device invites with `entangle group invite <name> [--count N]`;
 the human enters the one-time code on each other device with
-`entangle group join <code>`. `--count N` sets the successful-join limit
+`entangle group join <code> [--as <local-name>]`. `--as` changes only the local
+group label, not the particle name. `--count N` sets the successful-join limit
 (default 1, maximum 20). `group join --via <host:port>` is the direct
 connection fallback when multicast discovery is blocked. Invites expire after
 ten minutes, and a wrong code or failed confirmation closes the invite. Ask
