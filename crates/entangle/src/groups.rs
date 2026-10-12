@@ -23,6 +23,7 @@ const PSK_DOMAIN: &[u8] = b"entangle-group-psk-v1";
 const SIGN_DOMAIN: &[u8] = b"entangle-sign-v1";
 const UPDATE_DOMAIN: &[u8] = b"entangle-group-update-v1\n";
 const RETAINED_LIMIT: usize = 16;
+const RETAINED_UPDATE_LIMIT: usize = RETAINED_LIMIT + 1;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -312,6 +313,26 @@ pub fn insert_with_id(
     Ok(group)
 }
 
+pub fn replace_existing(root: &Path, mut group: Group) -> Result<Group, GroupError> {
+    if !is_group_id(&group.id) {
+        return Err(GroupError::NotFound(group.id));
+    }
+    let _lock = lock_groups(root)?;
+    cleanup_transaction_dirs(&groups_dir(root))?;
+    let previous = read_groups_unlocked(root)?
+        .into_iter()
+        .find(|existing| existing.id == group.id)
+        .ok_or_else(|| GroupError::NotFound(group.id.clone()))?;
+    if previous.outdated {
+        return Err(GroupError::Outdated {
+            name: previous.meta.name,
+        });
+    }
+    group.meta.name = previous.meta.name.clone();
+    write_group(root, &group)?;
+    Ok(previous)
+}
+
 #[allow(dead_code)]
 pub fn add_member(root: &Path, group_id: &str, member: Member) -> Result<bool, GroupError> {
     validate_member(&member, root)?;
@@ -516,8 +537,10 @@ fn issue_update_with(
     group.meta.admin_sign_key = new_admin_sign_key;
     group.meta.revoked = revoked;
     group.updates.push(update);
-    if group.updates.len() > RETAINED_LIMIT {
-        group.updates.drain(..group.updates.len() - RETAINED_LIMIT);
+    if group.updates.len() > RETAINED_UPDATE_LIMIT {
+        group
+            .updates
+            .drain(..group.updates.len() - RETAINED_UPDATE_LIMIT);
     }
     write_group(root, &group)?;
     Ok(group)
@@ -569,8 +592,10 @@ pub fn apply_updates(
                 .any(|revocation| revocation.particle_id == member.particle_id)
         });
         group.updates.push(update);
-        if group.updates.len() > RETAINED_LIMIT {
-            group.updates.drain(..group.updates.len() - RETAINED_LIMIT);
+        if group.updates.len() > RETAINED_UPDATE_LIMIT {
+            group
+                .updates
+                .drain(..group.updates.len() - RETAINED_UPDATE_LIMIT);
         }
         let self_revoked = group
             .meta
@@ -971,7 +996,7 @@ fn read_group(path: &Path) -> Result<Group, GroupError> {
         .ok_or_else(|| GroupError::malformed(&updates_path, "missing update log"))?;
     let updates: Vec<GroupUpdate> = serde_json::from_slice(&updates_bytes)
         .map_err(|error| GroupError::malformed(&updates_path, error.to_string()))?;
-    if updates.len() > RETAINED_LIMIT {
+    if updates.len() > RETAINED_UPDATE_LIMIT {
         return Err(GroupError::malformed(
             &updates_path,
             "too many retained group updates",
@@ -1604,7 +1629,7 @@ mod tests {
     }
 
     #[test]
-    fn retained_keys_and_updates_are_capped_at_sixteen() {
+    fn retained_update_log_covers_every_negotiable_epoch() {
         let root = tempdir().unwrap();
         let admin = saved_identity(root.path());
         let group = insert(
@@ -1615,12 +1640,52 @@ mod tests {
         )
         .unwrap();
         let private = identity::read_saved(root.path()).unwrap().unwrap().1;
-        for _ in 0..20 {
+
+        let at_epoch_1 = issue_update(root.path(), &group.id, UpdateKind::Rekey, &private).unwrap();
+        let at_epoch_2 = issue_update(root.path(), &group.id, UpdateKind::Rekey, &private).unwrap();
+        for _ in 0..15 {
             issue_update(root.path(), &group.id, UpdateKind::Rekey, &private).unwrap();
         }
-        let stored = find(root.path(), &group.id).unwrap().unwrap();
-        assert_eq!(stored.retained_keys.len(), 16);
-        assert_eq!(stored.updates.len(), 16);
+
+        let at_epoch_17 = find(root.path(), &group.id).unwrap().unwrap();
+        assert_eq!(at_epoch_17.meta.epoch, 17);
+        assert_eq!(at_epoch_17.retained_keys.len(), 16);
+        assert_eq!(at_epoch_17.retained_keys.keys().next(), Some(&1));
+        assert_eq!(at_epoch_17.updates.len(), 17);
+        let updates_from_oldest = updates_since(&at_epoch_17, 1).unwrap();
+        assert_eq!(updates_from_oldest.len(), 16);
+        let stale_at_1 = tempdir().unwrap();
+        saved_identity(stale_at_1.path());
+        std::fs::create_dir_all(groups_dir(stale_at_1.path())).unwrap();
+        write_group(stale_at_1.path(), &at_epoch_1).unwrap();
+        let applied =
+            apply_updates(stale_at_1.path(), &group.id, &updates_from_oldest, None).unwrap();
+        assert_eq!(applied.epoch, 17);
+        assert_eq!(
+            find(stale_at_1.path(), &group.id).unwrap().unwrap().key,
+            at_epoch_17.key
+        );
+
+        issue_update(root.path(), &group.id, UpdateKind::Rekey, &private).unwrap();
+        let at_epoch_18 = find(root.path(), &group.id).unwrap().unwrap();
+        assert_eq!(at_epoch_18.retained_keys.len(), 16);
+        assert_eq!(at_epoch_18.retained_keys.keys().next(), Some(&2));
+        assert_eq!(at_epoch_18.updates.len(), 17);
+        assert_eq!(at_epoch_18.updates.first().unwrap().epoch, 2);
+        assert_eq!(at_epoch_18.updates.last().unwrap().epoch, 18);
+        let updates_from_oldest = updates_since(&at_epoch_18, 2).unwrap();
+        assert_eq!(updates_from_oldest.len(), 16);
+        let stale_at_2 = tempdir().unwrap();
+        saved_identity(stale_at_2.path());
+        std::fs::create_dir_all(groups_dir(stale_at_2.path())).unwrap();
+        write_group(stale_at_2.path(), &at_epoch_2).unwrap();
+        let applied =
+            apply_updates(stale_at_2.path(), &group.id, &updates_from_oldest, None).unwrap();
+        assert_eq!(applied.epoch, 18);
+        assert_eq!(
+            find(stale_at_2.path(), &group.id).unwrap().unwrap().key,
+            at_epoch_18.key
+        );
     }
 
     #[test]

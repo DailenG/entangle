@@ -581,6 +581,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn epoch_before_oldest_retained_key_is_too_far_behind_before_noise() {
+        let client = ring_at(1, BTreeMap::from([(1, [1; 32])]));
+        let server = ring_at(
+            18,
+            (2..=18).map(|epoch| (epoch, [epoch as u8; 32])).collect(),
+        );
+        let (client, server) = connected_pair_result(client, server).await;
+        assert!(matches!(
+            client,
+            Err(TransportError::TooFarBehind {
+                local: 1,
+                current: 18
+            })
+        ));
+        assert!(server.is_err());
+    }
+
+    #[tokio::test]
     async fn initiator_without_responder_epoch_returns_peer_too_far_behind_before_noise() {
         let client = ring_at(
             17,

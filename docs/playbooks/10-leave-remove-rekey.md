@@ -67,7 +67,10 @@ Left work. Told 2 of 2 members.
 
 - If an update is delivered to only some members, those members can relay its
   signed update chain when they next link to another current member.
-- A device that is too far out of date must be invited again by the admin.
+- A device that is too far out of date must be invited again by the admin. On
+  joining, it refreshes the existing local group to the current key while
+  keeping its local group name. The join command prints:
+  `Refreshed <name>: this device was out of date and now has the current key.`
 - A removed device must ask the admin to invite it again; a non-admin cannot
   restore its membership.
 

@@ -323,8 +323,9 @@ impl InviteServer {
             .send(
                 stream,
                 &Message::GroupInfo {
-                    name: group.meta.name,
-                    group_id: group.id,
+                    name: group.meta.name.clone(),
+                    group_id: group.id.clone(),
+                    epoch: group.meta.epoch,
                     inviter_name: self.inviter_name.clone(),
                 },
             )
@@ -455,6 +456,7 @@ enum Message {
     GroupInfo {
         name: String,
         group_id: String,
+        epoch: u32,
         inviter_name: String,
     },
     Decline {
@@ -503,6 +505,12 @@ impl DeclineReason {
 pub struct Joined {
     pub group: Group,
     pub inviter_name: String,
+    pub refreshed: bool,
+}
+
+enum JoinMutation {
+    Inserted(String),
+    Refreshed(Box<Group>),
 }
 
 /// Joins an inviter over an arbitrary byte stream.
@@ -546,7 +554,7 @@ where
     else {
         return Err(GroupError::MissingIdentity(root.to_owned()).into());
     };
-    let mut inserted_group = None;
+    let mut mutation = None;
     let result = timeout(
         session_timeout,
         join_inner(
@@ -556,7 +564,7 @@ where
             local_name,
             particle_name,
             (id, static_private),
-            &mut inserted_group,
+            &mut mutation,
         ),
     )
     .await;
@@ -567,10 +575,18 @@ where
     match result {
         Ok(joined) => Ok(joined),
         Err(error) => {
-            if let Some(group_id) = inserted_group.take() {
-                match groups::leave(root, &group_id) {
-                    Ok(_) | Err(GroupError::NotFound(_)) => Err(InviteError::Incomplete),
-                    Err(error) => Err(error.into()),
+            if let Some(mutation) = mutation.take() {
+                match mutation {
+                    JoinMutation::Inserted(group_id) => match groups::leave(root, &group_id) {
+                        Ok(_) | Err(GroupError::NotFound(_)) => Err(InviteError::Incomplete),
+                        Err(error) => Err(error.into()),
+                    },
+                    JoinMutation::Refreshed(previous) => {
+                        match groups::replace_existing(root, *previous) {
+                            Ok(_) => Err(InviteError::Incomplete),
+                            Err(error) => Err(error.into()),
+                        }
+                    }
                 }
             } else {
                 Err(error)
@@ -586,7 +602,7 @@ async fn join_inner<S>(
     local_name: Option<&str>,
     particle_name: &str,
     identity: (entangle_core::ParticleId, [u8; 32]),
-    inserted_group: &mut Option<String>,
+    mutation: &mut Option<JoinMutation>,
 ) -> Result<Joined, InviteError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -614,26 +630,38 @@ where
 
     let mut sender = SecureJson::new(keys.enc_joiner);
     let mut receiver = SecureJson::new(keys.enc_inviter);
-    let (name, group_id, inviter_name) = match receiver.receive::<_, Message>(stream).await? {
-        Message::GroupInfo {
-            name,
-            group_id,
-            inviter_name,
-        } => (name, group_id, inviter_name),
-        message => {
-            return Err(InviteError::Message(format!(
-                "expected group info, got {message:?}"
-            )))
-        }
-    };
-    let local_group_name = local_name.unwrap_or(&name);
-    groups::validate_name(local_group_name)?;
+    let (name, group_id, inviter_epoch, inviter_name) =
+        match receiver.receive::<_, Message>(stream).await? {
+            Message::GroupInfo {
+                name,
+                group_id,
+                epoch,
+                inviter_name,
+            } => (name, group_id, epoch, inviter_name),
+            message => {
+                return Err(InviteError::Message(format!(
+                    "expected group info, got {message:?}"
+                )))
+            }
+        };
     let local_groups = groups::list(root)?;
-    let decline = if local_groups.iter().any(|group| group.id == group_id) {
+    let existing_group = local_groups
+        .iter()
+        .find(|group| group.id == group_id)
+        .cloned();
+    let refresh_existing = existing_group
+        .as_ref()
+        .is_some_and(|group| !group.outdated && group.meta.epoch < inviter_epoch);
+    let local_group_name = existing_group
+        .as_ref()
+        .map(|group| group.meta.name.as_str())
+        .unwrap_or_else(|| local_name.unwrap_or(&name));
+    groups::validate_name(local_group_name)?;
+    let decline = if existing_group.is_some() && !refresh_existing {
         Some(DeclineReason::AlreadyMember)
     } else if local_groups
         .iter()
-        .any(|group| group.meta.name == local_group_name)
+        .any(|group| group.id != group_id && group.meta.name == local_group_name)
     {
         Some(DeclineReason::NameTaken)
     } else {
@@ -715,11 +743,10 @@ where
         .map_err(|_| InviteError::Message("invalid group key".into()))?
         .try_into()
         .map_err(|_| InviteError::Message("invalid group key".into()))?;
-    let group = groups::insert_with_id(
-        root,
-        grant.0,
+    let group = Group {
+        id: grant.0,
         key,
-        GroupMeta {
+        meta: GroupMeta {
             version: 2,
             name: local_group_name.to_owned(),
             created_at: grant.3,
@@ -729,17 +756,35 @@ where
             revoked: grant.7,
             leaving: false,
         },
-        grant.8,
-    )?;
-    *inserted_group = Some(group.id.clone());
+        members: grant.8,
+        retained_keys: Default::default(),
+        updates: Vec::new(),
+        outdated: false,
+    };
+    let group = if refresh_existing {
+        let previous = groups::replace_existing(root, group.clone())?;
+        *mutation = Some(JoinMutation::Refreshed(Box::new(previous)));
+        group
+    } else {
+        let inserted = groups::insert_with_id(
+            root,
+            group.id.clone(),
+            group.key,
+            group.meta.clone(),
+            group.members.clone(),
+        )?;
+        *mutation = Some(JoinMutation::Inserted(inserted.id.clone()));
+        inserted
+    };
     sender.send(stream, &Message::Done).await?;
     if receiver.receive::<_, Message>(stream).await? != Message::Committed {
         return Err(InviteError::Message("expected commit confirmation".into()));
     }
-    *inserted_group = None;
+    *mutation = None;
     Ok(Joined {
         group,
         inviter_name,
+        refreshed: refresh_existing,
     })
 }
 

@@ -414,6 +414,19 @@ impl Particle {
         backoff.contains_key(peer_key)
     }
 
+    fn first_repeater_group(&self) -> Option<String> {
+        let groups = self.groups.read().expect("group store lock").clone();
+        let key_ring = self.keys.read().expect("key ring lock").clone();
+        groups
+            .into_iter()
+            .find(|group| {
+                !group.outdated
+                    && groups::id_bytes(&group.id)
+                        .is_some_and(|id| key_ring.groups.contains_key(&id))
+            })
+            .map(|group| group.id)
+    }
+
     fn backoff_peer(&self, peer_key: &str) {
         self.peer_backoff.lock().expect("peer backoff lock").insert(
             peer_key.to_owned(),
@@ -798,8 +811,8 @@ impl Particle {
                 }
                 continue;
             };
-            let has_groups = !self.keys.read().expect("key ring lock").groups.is_empty();
-            if !self._identity.persistent || !has_groups {
+            if !self._identity.persistent {
+                let has_groups = self.first_repeater_group().is_some();
                 debug!(
                     persistent = self._identity.persistent,
                     has_groups, "repeater connection gated by identity or group membership"
@@ -813,13 +826,12 @@ impl Particle {
                 }
                 continue;
             }
-            let Some(group) = self
-                .groups
-                .read()
-                .expect("group store lock")
-                .first()
-                .map(|group| group.id.clone())
-            else {
+            let Some(group) = self.first_repeater_group() else {
+                debug!(
+                    persistent = self._identity.persistent,
+                    has_groups = false,
+                    "repeater connection gated by identity or group membership"
+                );
                 self.clear_repeater();
                 if !self
                     .wait_or_shutdown(&mut shutdown, Duration::from_secs(1))
@@ -973,13 +985,8 @@ impl Particle {
                     }
                 }
                 _ = health_poll.tick() => {
-                    let has_groups = !self.keys.read().expect("key ring lock").groups.is_empty();
-                    let current_group = self
-                        .groups
-                        .read()
-                        .expect("group store lock")
-                        .first()
-                        .map(|group| group.id.clone());
+                    let current_group = self.first_repeater_group();
+                    let has_groups = current_group.is_some();
                     let closed = dialer.is_closed();
                     let group_changed = current_group.as_deref() != Some(group);
                     if closed || !has_groups || group_changed {
@@ -2079,7 +2086,7 @@ impl Particle {
                     .any(|member| member.particle_id == peer.particle_id.as_str())
             })
         });
-        for group in candidates {
+        'groups: for group in candidates {
             let Some(group_id) = groups::id_bytes(&group.id) else {
                 continue;
             };
@@ -2204,14 +2211,17 @@ impl Particle {
                 }
                 Err(error) => {
                     self.log_epoch_error(&error, &group, &peer_name, &peer_key);
+                    if matches!(&error, LinkError::Stale) {
+                        return true;
+                    }
                     if matches!(
                         &error,
                         LinkError::Transport(
                             entangle_transport::TransportError::TooFarBehind { .. }
                                 | entangle_transport::TransportError::PeerTooFarBehind { .. }
-                        ) | LinkError::Stale
+                        )
                     ) {
-                        return true;
+                        continue 'groups;
                     }
                     let route_description = match &route {
                         Route::Direct(address) => address.to_string(),
@@ -3031,6 +3041,17 @@ mod tests {
         );
     }
 
+    fn write_outdated_test_group(root: &Path, name: &str, key: [u8; 32]) {
+        let path = root.join("groups").join(groups::group_id(&key));
+        std::fs::create_dir_all(&path).unwrap();
+        std::fs::write(path.join("key"), format!("{}\n", hex::encode(key))).unwrap();
+        std::fs::write(
+            path.join("meta.json"),
+            serde_json::to_vec(&json!({"version": 1, "name": name})).unwrap(),
+        )
+        .unwrap();
+    }
+
     async fn start_test_repeater(root: PathBuf, port: u16) -> (JoinHandle<()>, String, [u8; 32]) {
         let store = entangle_repeater::store::Store::new(&root);
         let private = store.key().unwrap();
@@ -3270,6 +3291,84 @@ mod tests {
         assert_eq!(result["group"], "test");
         let observed = b.observe(&json!({ "limit": 20 })).await;
         assert_eq!(observed["states"][0]["group"], "test");
+        a.shutdown().await;
+        b.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn too_far_behind_group_does_not_block_another_shared_group() {
+        let temp = tempfile::tempdir().unwrap();
+        let root_a = temp.path().join("a");
+        let root_b = temp.path().join("b");
+        let (id_a, private_a) = saved_identity(&root_a);
+        let (id_b, private_b) = saved_identity(&root_b);
+        let members = vec![
+            test_member(&id_a, "particle-a", &private_a, id_a.as_str()),
+            test_member(&id_b, "particle-b", &private_b, id_a.as_str()),
+        ];
+        for (root, role) in [
+            (&root_a, groups::Role::Admin),
+            (&root_b, groups::Role::Member),
+        ] {
+            insert_test_group(root, "a-stale", [0x61; 32], members.clone(), role.clone());
+            insert_test_group(root, "b-current", [0x62; 32], members.clone(), role);
+        }
+        let stale_id = groups::group_id(&[0x61; 32]);
+        let current_id = groups::group_id(&[0x62; 32]);
+        for _ in 0..17 {
+            groups::issue_update(
+                &root_a,
+                &stale_id,
+                entangle_core::UpdateKind::Rekey,
+                &private_a,
+            )
+            .unwrap();
+        }
+
+        let (b, _) = Particle::start(options("particle-b", 0, root_b, None), None)
+            .await
+            .unwrap();
+        let (a, _) = Particle::start(options("particle-a", 0, root_a, None), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            a.groups
+                .read()
+                .unwrap()
+                .iter()
+                .map(|group| group.meta.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a-stale", "b-current"]
+        );
+        assert!(
+            a.dial(
+                Route::Direct(SocketAddr::from(([127, 0, 0, 1], b.manifest.link_port))),
+                None,
+            )
+            .await
+        );
+
+        let record = a
+            .field
+            .read()
+            .unwrap()
+            .by_id(&b.manifest.particle_id)
+            .expect("the peers should link over the current group");
+        assert_eq!(record.state, PeerState::Entangled);
+        assert_eq!(
+            record.group_id,
+            Some(groups::id_bytes(&current_id).unwrap())
+        );
+        let synced = a
+            .sync_state(json!({
+                "particle_id": b.manifest.particle_id.as_str(),
+                "state": { "group": "b-current" }
+            }))
+            .await
+            .unwrap();
+        assert_eq!(synced["delivered"], true);
+        assert_eq!(synced["group"], "b-current");
+
         a.shutdown().await;
         b.shutdown().await;
     }
@@ -4294,6 +4393,98 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reinviting_stale_member_refreshes_group_and_restores_links() {
+        let temp = tempfile::tempdir().unwrap();
+        let root_a = temp.path().join("a");
+        let root_b = temp.path().join("b");
+        let key = [0x66; 32];
+        let (id_a, private_a) = saved_identity(&root_a);
+        let (id_b, private_b) = saved_identity(&root_b);
+        let members = vec![
+            test_member(&id_a, "particle-a", &private_a, id_a.as_str()),
+            test_member(&id_b, "particle-b", &private_b, id_a.as_str()),
+        ];
+        insert_test_group(&root_a, "work", key, members.clone(), groups::Role::Admin);
+        insert_test_group(&root_b, "local-work", key, members, groups::Role::Member);
+        let group_id = groups::group_id(&key);
+        for _ in 0..18 {
+            groups::issue_update(
+                &root_a,
+                &group_id,
+                entangle_core::UpdateKind::Rekey,
+                &private_a,
+            )
+            .unwrap();
+        }
+
+        let invite = crate::invite::protocol::InviteServer::new(
+            &root_a,
+            group_id.clone(),
+            "particle-a".into(),
+            crate::invite::code::InviteCode::parse("7-amber-photon-quasar").unwrap(),
+            1,
+            Duration::from_secs(30),
+        )
+        .unwrap();
+        let (joiner, inviter) = tokio::io::duplex(1024 * 1024);
+        let invite_task = tokio::spawn(async move { invite.handle(inviter).await });
+        let joined = crate::invite::protocol::join(
+            joiner,
+            &root_b,
+            crate::invite::code::InviteCode::parse("7-amber-photon-quasar").unwrap(),
+            None,
+            "particle-b",
+        )
+        .await
+        .unwrap();
+        invite_task.await.unwrap().unwrap();
+        assert!(joined.refreshed);
+        assert_eq!(joined.group.meta.epoch, 18);
+        assert_eq!(joined.group.meta.name, "local-work");
+        assert!(joined.group.retained_keys.is_empty());
+        assert!(joined.group.updates.is_empty());
+        let mut output = Vec::new();
+        crate::write_join_success(&mut output, joined).unwrap();
+        assert_eq!(
+            String::from_utf8(output).unwrap(),
+            "Refreshed local-work: this device was out of date and now has the current key.\n"
+        );
+
+        let (a, _) = Particle::start(options("particle-a", 0, root_a, None), None)
+            .await
+            .unwrap();
+        let (b, _) = Particle::start(options("particle-b", 0, root_b, None), None)
+            .await
+            .unwrap();
+        assert!(
+            a.dial(
+                Route::Direct(SocketAddr::from(([127, 0, 0, 1], b.manifest.link_port))),
+                None,
+            )
+            .await
+        );
+        let record = a
+            .field
+            .read()
+            .unwrap()
+            .by_id(&b.manifest.particle_id)
+            .expect("refreshed member should link at the current epoch");
+        assert_eq!(record.state, PeerState::Entangled);
+        assert_eq!(record.group_id, Some(groups::id_bytes(&group_id).unwrap()));
+        let synced = a
+            .sync_state(json!({
+                "particle_id": b.manifest.particle_id.as_str(),
+                "state": { "message": "refreshed" }
+            }))
+            .await
+            .unwrap();
+        assert_eq!(synced["delivered"], true);
+
+        a.shutdown().await;
+        b.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn inbound_link_introduces_new_member_when_inviter_cannot_dial_peer() {
         let temp = tempfile::tempdir().unwrap();
         let root_a = temp.path().join("a");
@@ -4902,6 +5093,43 @@ mod tests {
             assert_eq!(peer["via_repeater"], true);
             assert_eq!(peer["addrs"], json!([]));
             assert!(!view.to_string().contains("0.0.0.0"));
+        }
+
+        a.shutdown().await;
+        b.shutdown().await;
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn repeater_uses_active_group_when_outdated_group_sorts_first() {
+        let temp = tempfile::tempdir().unwrap();
+        let temp_root = canonical_temp_root(&temp);
+        let root_a = temp_root.join("a");
+        let root_b = temp_root.join("b");
+        let repeater_root = temp_root.join("repeater");
+        let active_key = [0x41; 32];
+        let old_key = [0x11; 32];
+        assert_ne!(groups::group_id(&active_key), groups::group_id(&old_key));
+        let (server, _, _) =
+            prepare_test_repeater_pair(&root_a, &root_b, &repeater_root, free_port()).await;
+        write_outdated_test_group(&root_a, "aaa-legacy", old_key);
+
+        let mut options_a = options("particle-a", 0, root_a.clone(), None);
+        let mut options_b = options("particle-b", 0, root_b.clone(), None);
+        options_a.relay_only = true;
+        options_b.relay_only = true;
+        let (a, _) = Particle::start(options_a, None).await.unwrap();
+        let (b, _) = Particle::start(options_b, None).await.unwrap();
+        assert!(a.groups.read().unwrap()[0].outdated);
+
+        wait_for_repeater(&a, &b).await;
+        sleep(Duration::from_millis(1100)).await;
+        for particle in [&a, &b] {
+            assert_eq!(
+                particle.find_particles(&json!({}))["self"]["repeater"]["connected"],
+                true
+            );
         }
 
         a.shutdown().await;

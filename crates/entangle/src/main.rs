@@ -1088,14 +1088,22 @@ fn write_join_failure(output: &mut dyn Write, error: InviteError) -> Result<i32>
 }
 
 fn write_join_success(output: &mut dyn Write, joined: protocol::Joined) -> Result<()> {
-    writeln!(
-        output,
-        "Joined {} ({}) via {}. {} members.",
-        joined.group.meta.name,
-        joined.group.id,
-        joined.inviter_name,
-        joined.group.members.len()
-    )?;
+    if joined.refreshed {
+        writeln!(
+            output,
+            "Refreshed {}: this device was out of date and now has the current key.",
+            joined.group.meta.name
+        )?;
+    } else {
+        writeln!(
+            output,
+            "Joined {} ({}) via {}. {} members.",
+            joined.group.meta.name,
+            joined.group.id,
+            joined.inviter_name,
+            joined.group.members.len()
+        )?;
+    }
     Ok(())
 }
 
