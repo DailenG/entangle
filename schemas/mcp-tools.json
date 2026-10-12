@@ -71,7 +71,7 @@
     {
       "name": "sync_entangled_state",
       "title": "Sync entangled state",
-      "description": "Send a JSON message or a single file to one entangled particle, a subset, or every member of a local group. Select exactly one target mode: `particle_id`, `particle_ids`, or `group` alone. An optional `group` with a particle target pins the group used to authenticate the send. The call returns after receivers verify payload size and SHA-256. Provide exactly one of `state` or `file_path`.",
+      "description": "Send a JSON message or a single file to one entangled particle, a subset, or every member of a local group. Set exactly one of `particle_id` or `particle_ids`; use `group` alone for group-wide sending, or alongside one particle selector to pin its authenticating group. Provide exactly one of `state` or `file_path`. The call returns after receivers verify payload size and SHA-256.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -84,32 +84,11 @@
             "description": "Target particle IDs (full IDs or unambiguous prefixes). Duplicate targets are sent only once."
           },
           "group": { "type": "string", "minLength": 1, "description": "Local group name or ID. Alone, send to all other members; with a particle target, pin the authenticating group." },
-          "state": { "description": "Arbitrary JSON value to deliver to the peer agent." },
-          "file_path": { "type": "string", "description": "Path to a single regular file on this machine to deliver." },
+          "state": { "description": "Arbitrary JSON value to deliver. Provide exactly one of `state` and `file_path`." },
+          "file_path": { "type": "string", "description": "Path to a single regular file on this machine to deliver. Provide exactly one of `state` and `file_path`." },
           "label": { "type": "string", "maxLength": 200, "description": "Short human-readable note describing the payload for the receiving agent." },
           "timeout_secs": { "type": "integer", "minimum": 5, "maximum": 3600, "default": 120 }
         },
-        "anyOf": [
-          { "required": ["particle_id"] },
-          { "required": ["particle_ids"] },
-          { "required": ["group"] }
-        ],
-        "not": {
-          "required": ["particle_id", "particle_ids"]
-        },
-        "allOf": [
-          {
-            "anyOf": [
-              { "required": ["state"] },
-              { "required": ["file_path"] }
-            ]
-          },
-          {
-            "not": {
-              "required": ["state", "file_path"]
-            }
-          }
-        ],
         "additionalProperties": false
       },
       "outputSchema": {
@@ -139,24 +118,11 @@
                 "error": { "type": "string" }
               },
               "required": ["particle_id", "name", "ok"],
-              "oneOf": [
-                { "required": ["sync_id", "route", "group"], "not": { "required": ["error"] } },
-                { "required": ["error"], "not": { "required": ["sync_id", "route", "group"] } }
-              ],
               "additionalProperties": false
             }
           }
         },
-        "oneOf": [
-          {
-            "required": ["sync_id", "particle_id", "group", "kind", "bytes", "sha256", "delivered", "path"],
-            "not": { "required": ["results"] }
-          },
-          {
-            "required": ["group", "delivered", "failed", "results"],
-            "not": { "required": ["sync_id"] }
-          }
-        ]
+        "required": ["delivered"]
       }
     },
     {

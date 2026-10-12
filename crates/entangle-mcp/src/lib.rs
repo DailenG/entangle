@@ -235,6 +235,15 @@ mod tests {
             assert!(tool["name"].is_string());
             assert!(tool["description"].is_string());
             assert!(tool["inputSchema"].is_object());
+            for schema_name in ["inputSchema", "outputSchema"] {
+                for keyword in ["anyOf", "oneOf", "allOf", "not"] {
+                    assert!(
+                        tool[schema_name].get(keyword).is_none(),
+                        "{} has top-level {keyword} in {schema_name}",
+                        tool["name"]
+                    );
+                }
+            }
         }
         let sync = schema["tools"]
             .as_array()

@@ -1133,6 +1133,7 @@ impl Particle {
                     "from_particle_id": item.from_particle_id,
                     "from_name": item.from_name,
                     "group": render_group(&item.group),
+                    "trust": "untrusted",
                     "kind": item.kind,
                     "label": item.label,
                     "received_at": item.received_at,
@@ -2833,6 +2834,19 @@ mod tests {
 
     #[tokio::test]
     async fn group_and_subset_sends_filter_by_authenticated_group() {
+        let schema: Value =
+            serde_json::from_str(include_str!("../../../schemas/mcp-tools.json")).unwrap();
+        let observe_required = schema["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == "observe_entangled_states")
+            .unwrap()["outputSchema"]["properties"]["states"]["items"]["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|value| value.as_str().unwrap().to_owned())
+            .collect::<Vec<_>>();
         let temp = tempfile::tempdir().unwrap();
         let root_a = temp.path().join("a");
         let root_b = temp.path().join("b");
@@ -2920,6 +2934,13 @@ mod tests {
             let observed = observer.observe(&json!({ "group": "work" })).await;
             assert_eq!(observed["states"].as_array().unwrap().len(), 1);
             assert_eq!(observed["states"][0]["group"], "work");
+            assert_eq!(observed["states"][0]["trust"], "untrusted");
+            for key in &observe_required {
+                assert!(
+                    observed["states"][0].get(key).is_some(),
+                    "observe item is missing schema-required key {key}"
+                );
+            }
         }
 
         let c_before = c.observe(&json!({})).await["states"]
