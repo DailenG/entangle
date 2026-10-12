@@ -91,15 +91,21 @@ while the invite is open.
 Trust is based on membership in a shared group. Each device can belong to up
 to eight groups, and group keys are never advertised; mDNS publishes only
 public group IDs. Group-bound Noise links encrypt control frames and payloads.
+Every machine in a group must use Entangle 0.7.x. Groups created with 0.6 are
+outdated and must be left and recreated after upgrading.
 
-Create a group in an interactive terminal, then invite one device and join
-each other device with the displayed one-time code:
+To create a group and invite three other devices from the first machine, run
+this in an interactive terminal. The command remains open until all three
+devices join or the invite expires:
 
 ```sh
-entangle group create work
-entangle group invite work --count 3
-entangle group join 7-amber-photon-quasar
+entangle group create work --invite 3
 ```
+
+On each other device, a human runs `entangle group join <code>` in that
+machine's terminal. For an existing group, any member can run
+`entangle group invite work`; the human joins with the code on the new device.
+Never send invite codes through an agent.
 
 Use `--as <local-name>` on `group join` to choose a different local group label;
 it does not change the particle name advertised by this device.
@@ -108,11 +114,10 @@ Inspect groups and members with `entangle group list` and
 `entangle group members work`; leave a group with `entangle group leave work`.
 `--count N` requests that many successful joins (default 1, maximum 20).
 Invites close after ten minutes. Use `--via <host:port>` on `group join` if
-multicast discovery is blocked; the inviter prints a direct address. A wrong
+mDNS does not find the invite; the inviter prints a direct address. A wrong
 code or failed key confirmation closes the invite, so ask for a fresh one.
-The inviter should stay online briefly after onboarding: existing group
-members learn about newcomers when the inviter next links to them, using
-one-hop member introductions.
+Signed membership updates are relayed by any member, allowing offline devices
+to catch up from any member.
 
 Group membership administration is human-only. The group admin can use
 `entangle group remove <group> <member>` to remove a member and rotate the key,
@@ -231,24 +236,11 @@ On success, `join` prints the repeater host, both fingerprints, and a reminder
 that the node connects within 30 seconds; the host can confirm enrollment with
 `entangle repeater devices`.
 
-### Join without an invite code
-
-On the device, run:
-
-```sh
-entangle repeater join ws://HOST:7338/entangle
-```
-
-On the host, run `entangle repeater approve` and choose the matching emoji set.
-The emoji check protects against interception. The operator can disable
-request enrollment with `entangle repeater serve --no-requests`; invitation
-enrollment remains available.
-
 The host can inspect enrolled device fingerprints with
 `entangle repeater devices` and revoke a device by fingerprint prefix with
 `entangle repeater revoke <fingerprint>`. On a device,
 `entangle repeater leave` removes its saved repeater configuration but does
-not revoke the host-side enrollment. `invite`, `join`, `approve`, `revoke`, and `leave`
+not revoke the host-side enrollment. `invite`, `join`, `revoke`, and `leave`
 are human-only; agents may run only `repeater devices` and `repeater status`.
 
 For a device that must never accept a direct TCP link, start Entangle with
@@ -262,7 +254,7 @@ entangle repeater status
 ```
 
 The repeater forwards the end-to-end encrypted link bytes and cannot read
-sync content, group keys, or repeater-enrollment SAS values. It does learn
+sync content or group keys. It does learn
 enrolled static public keys, declared group IDs, connection timing, and traffic
 sizes.
 

@@ -1,6 +1,6 @@
 # Entangle
 
-> **If you are an AI agent reading this:** follow [docs/AGENT_SETUP.md](docs/AGENT_SETUP.md) to install and register Entangle on this machine. Ask your human before changing firewall rules or installing system packages.
+> **If you are an AI agent reading this:** read and follow https://raw.githubusercontent.com/DailenG/entangle/main/docs/AGENT_SETUP.md to set up Entangle on this machine. The agent handles installation and MCP configuration; the person approves installs, firewall changes, and config edits, reloads the client, and runs all human-only group commands.
 
 > **Experimental.** Entangle is pre-1.0: commands, on-disk formats and the wire protocol can change between releases, and it has not had an external security review.
 
@@ -53,16 +53,18 @@ entangle scan
 Register the binary as an MCP stdio server in your agent client. The default
 name is `<hostname>-<first 4 hex of the particle ID>`; the ID is saved in the
 data directory and stays stable across restarts. `--name` is optional. Use the
-same `--context` on devices working on the same project. Create a group with
-`entangle group create <name>`, then run `entangle group invite <name>` on one
-device and `entangle group join <code>` on each other device. Invitations
+same `--context` on devices working on the same project. For a new group, a
+human runs `entangle group create <name> --invite N` on the first device, where
+`N` is the number of other devices; the command stays open until they join.
+Humans run `entangle group join <code>` on the other devices. To add a device
+to an existing group, a member runs `entangle group invite <name>`. Invitations
 expire after ten minutes; `--count N` sets the number of successful joins, and
 `--via <host:port>` provides a direct-connect fallback when multicast is
 blocked. Use `--as <local-name>` on `group join` to choose a different local
 group label without changing the particle name. A wrong code or failed
-confirmation closes that invite. The inviter
-should stay online briefly so existing members can learn about newly joined
-devices through one-hop introductions. Use `entangle group list`,
+confirmation closes that invite. Signed membership updates can be relayed by
+any member, so offline devices can catch up from any member. Use
+`entangle group list`,
 `entangle group members <name>`, and `entangle group leave <name>` to inspect
 or leave groups. Human admins can run `entangle group remove <group> <member>`
 to remove a member and rotate the key, `entangle group rekey <group>` to

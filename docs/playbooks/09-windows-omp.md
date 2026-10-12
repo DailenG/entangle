@@ -7,8 +7,8 @@ Use this when you install Entangle on Windows and register it with omp.
 - 64-bit Windows; the prebuilt `install.ps1` installer downloads the x64
   executable.
 - An interactive PowerShell terminal and omp with an MCP `mcp.json`.
-- A human operator for installation approval, firewall changes, and group
-  invite or join commands.
+- A human operator to approve installation and config/firewall edits, reload
+  omp, and run all human-only group commands.
 
 ## Steps
 
@@ -38,10 +38,11 @@ Use this when you install Entangle on Windows and register it with omp.
    <path>` (`<path>` is the temporary script's full path) and delete the
    script. Do not pass inline `-Command` strings.
 
-3. **In omp's `mcp.json`:** Add an Entangle server entry and replace
-   `<user>` with the Windows account folder. The executable path must be
-   absolute; keep other existing server entries. The default Entangle data
-   directory is `%APPDATA%\entangle`.
+3. **In omp's MCP config:** Add an Entangle server entry in
+   `%USERPROFILE%\.omp\agent\mcp.json` and replace `<user>` with the Windows
+   account folder. The executable path must be absolute; keep other existing
+   server entries. The default Entangle data directory is
+   `%APPDATA%\entangle`.
 
    ```json
    {
@@ -54,6 +55,11 @@ Use this when you install Entangle on Windows and register it with omp.
    }
    ```
 
+   Ask the human to reload omp with `/mcp reload`. Its first server start
+   creates the saved identity required by group commands. If a custom data
+   directory is configured, the human must use the same directory for group
+   commands.
+
 4. **On the Windows device (PowerShell):** Confirm the command is available
    and inspect its flags.
 
@@ -62,10 +68,14 @@ Use this when you install Entangle on Windows and register it with omp.
    entangle --help
    ```
 
-5. **On the group devices (each operator's terminal):** Have a person create
-   or invite to the group, then have a person enter the code on each other
-   device. Group invite and join are human-only commands; use the address
-   printed by the inviter with `--via` if multicast is blocked.
+5. **On the group devices (each operator's terminal):** For a new group, a
+   person runs `entangle group create <name> --invite <N>` on the first device,
+   where `<N>` is the number of other devices. For an existing group, any
+   member runs `entangle group invite <name>`. A person runs
+   `entangle group join <code>` on each other device, or adds
+   `--via <host:port>` using the inviter's output if mDNS cannot find the
+   invite. All group-changing commands are human-only; never ask a person to
+   share an invite code with the agent.
 
 ## It worked if
 
