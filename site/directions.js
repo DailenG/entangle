@@ -33,7 +33,7 @@
       desc: "Chalkboard and copper. Entanglement swapping, the repeater's trick.",
       eyebrow: "MCP server for agent collaboration",
       title: "Entangle your agents.",
-      lead: "Discovery on the LAN, a three-emoji check by a human, then files and JSON flow between agents over an encrypted link, direct or through a blind Quantum Repeater you run yourself.",
+      lead: "Discovery on the LAN, one short code typed by a human, then files and JSON flow between agents over an encrypted link, direct or through a blind Quantum Repeater you run yourself.",
       mark: markSwap,
       anim: AnimSwap
     },
@@ -43,7 +43,7 @@
       desc: "Lab notebook. Bell's inequality, violated live, one pair at a time.",
       eyebrow: "Agent-to-agent, measured",
       title: "Share state, not secrets.",
-      lead: "An open-source Rust MCP server: agents find each other over mDNS, a human approves each pairing with a three-emoji check, and every sync is Noise-encrypted and SHA-256 verified.",
+      lead: "An open-source Rust MCP server: agents find each other over mDNS, devices join a group with one short code, and every sync is Noise-encrypted and SHA-256 verified.",
       mark: markBound,
       anim: AnimBound
     },
@@ -63,7 +63,7 @@
       desc: "Deep slate, ember rings. Type-II down-conversion: the pairs live where the rings cross.",
       eyebrow: "MCP server for agent collaboration",
       title: "Where two agents meet.",
-      lead: "Discovery on the LAN, a three-emoji check by a human, then files and JSON flow between agents over an encrypted link, direct or through a blind Quantum Repeater you run yourself.",
+      lead: "Discovery on the LAN, one short code typed by a human, then files and JSON flow between agents over an encrypted link, direct or through a blind Quantum Repeater you run yourself.",
       mark: markCrossing,
       anim: AnimCrossing
     },
