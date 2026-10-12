@@ -46,6 +46,36 @@
       lead: "An open-source Rust MCP server: agents find each other over mDNS, a human approves each pairing with a three-emoji check, and every sync is Noise-encrypted and SHA-256 verified.",
       mark: markBound,
       anim: AnimBound
+    },
+    {
+      id: "quadrant",
+      name: "Quadrant",
+      desc: "Dark room, amber ring. The 2019 Bell image: photon A's pattern follows photon B's filter.",
+      eyebrow: "Encrypted agent-to-agent sync",
+      title: "One state, seen twice.",
+      lead: "Agents on your LAN discover each other over mDNS; agents on different networks meet through a repeater you host. Either way the link is Noise-encrypted end to end, and what one agent holds, the other can observe.",
+      mark: markQuadrant,
+      anim: AnimQuadrant
+    },
+    {
+      id: "crossing",
+      name: "Crossing",
+      desc: "Deep slate, ember rings. Type-II down-conversion: the pairs live where the rings cross.",
+      eyebrow: "MCP server for agent collaboration",
+      title: "Where two agents meet.",
+      lead: "Discovery on the LAN, a three-emoji check by a human, then files and JSON flow between agents over an encrypted link, direct or through a blind Quantum Repeater you run yourself.",
+      mark: markCrossing,
+      anim: AnimCrossing
+    },
+    {
+      id: "collapse",
+      name: "Collapse",
+      desc: "Paper, vermilion and teal. Two probability clouds; one measurement, one frame, no beam.",
+      eyebrow: "Local-first MCP · Agent to agent",
+      title: "Same state. Any distance.",
+      lead: "Entangle lets AI agents find each other, pair under a human's eye, and share files and JSON over end-to-end encrypted links. Nothing travels through anyone who could read it.",
+      mark: markCollapse,
+      anim: AnimCollapse
     }
   ];
 
@@ -71,6 +101,30 @@
   function markSinglet(c) {
     return '<circle cx="13" cy="16" r="10" fill="none" stroke="' + c.ink + '" stroke-width="1.5"/>' + halfDisc(13, 16, 9.25, -32, 1, c.a) +
       '<circle cx="35" cy="16" r="10" fill="none" stroke="' + c.ink + '" stroke-width="1.5"/>' + halfDisc(35, 16, 9.25, -32, -1, c.b);
+  }
+  function markQuadrant(c) {
+    var s = '<circle cx="24" cy="16" r="11" fill="none" stroke="' + c.ink + '" stroke-width="1" opacity="0.35"/>', rs = [11.5, 9.5, 11.5, 9.5];
+    for (var q = 0; q < 4; q++) {
+      var a0 = q * Math.PI / 2 + 0.12, a1 = (q + 1) * Math.PI / 2 - 0.12, r = rs[q];
+      s += '<path d="M' + (24 + r * Math.cos(a0)).toFixed(2) + ' ' + (16 + r * Math.sin(a0)).toFixed(2) + ' A' + r + ' ' + r + ' 0 0 1 ' + (24 + r * Math.cos(a1)).toFixed(2) + ' ' + (16 + r * Math.sin(a1)).toFixed(2) + '" fill="none" stroke="' + (q % 2 ? c.b : c.a) + '" stroke-width="3" stroke-linecap="round"/>';
+    }
+    return s;
+  }
+  function markCrossing(c) {
+    var y = Math.sqrt(10 * 10 - 6 * 6);
+    return '<circle cx="18" cy="16" r="10" fill="none" stroke="' + c.a + '" stroke-width="1.75"/><circle cx="30" cy="16" r="10" fill="none" stroke="' + c.a + '" stroke-width="1.75"/>' +
+      '<circle cx="24" cy="' + (16 - y).toFixed(2) + '" r="2.4" fill="' + c.b + '"/><circle cx="24" cy="' + (16 + y).toFixed(2) + '" r="2.4" fill="' + c.b + '"/>';
+  }
+  function markCollapse(c) {
+    var s = "";
+    for (var side = 0; side < 2; side++) {
+      var cx = side ? 34 : 14, col = side ? c.b : c.a;
+      for (var i = 0; i < 26; i++) {
+        var r = Math.sqrt(hash(side * 50 + i + 0.2)) * 9, th = hash(side * 50 + i + 0.7) * Math.PI * 2;
+        s += '<circle cx="' + (cx + Math.cos(th) * r).toFixed(1) + '" cy="' + (16 + Math.sin(th) * r * 0.75 + (side ? 4 : -4)).toFixed(1) + '" r="' + (0.9 + hash(i + side) * 0.9).toFixed(1) + '" fill="' + col + '"/>';
+      }
+    }
+    return s;
   }
   function markSpacelike(c) {
     return '<path d="M14 3 L34 29 M34 3 L14 29" fill="none" stroke="' + c.ink + '" stroke-width="1.5" stroke-linecap="round"/>' +
@@ -331,6 +385,210 @@
     };
   }
 
+  // ---------- shared: photon-count accumulation field (round 2) ----------
+  // A low-resolution count buffer that single "photons" are drawn into by rejection
+  // sampling against an intensity function, then mapped through a 3-stop colour ramp.
+  // This is how the Glasgow (2019) and SPDC ring images are actually formed: many
+  // individual detections accumulating into a pattern, with real shot-noise grain.
+  function PhotonField(S, intensity, ramp) {
+    var self = this;
+    this.S = S; this.n = new Float32Array(S * S); this.total = 0;
+    this.off = document.createElement("canvas"); this.off.width = S; this.off.height = S;
+    this.octx = this.off.getContext("2d"); this.img = this.octx.createImageData(S, S);
+    this.add = function (count, phase) {
+      var S2 = self.S, added = 0, tries = count * 6;
+      for (var i = 0; i < tries && added < count; i++) {
+        var x = Math.random() * 2 - 1, y = Math.random() * 2 - 1;
+        if (Math.random() < intensity(x, y, phase)) {
+          var ix = (x * 0.5 + 0.5) * S2 | 0, iy = (y * 0.5 + 0.5) * S2 | 0;
+          self.n[iy * S2 + ix] += 1; added++;
+        }
+      }
+      self.total += added;
+    };
+    this.decay = function (f) { var n = self.n; for (var i = 0; i < n.length; i++) n[i] *= f; };
+    this.render = function (scale) {
+      var d = self.img.data, n = self.n;
+      for (var i = 0, j = 0; i < n.length; i++, j += 4) {
+        var v = n[i] / scale; if (v > 1) v = 1;
+        var k = v < 0.5 ? v * 2 : (v - 0.5) * 2, a = v < 0.5 ? ramp[0] : ramp[1], b = v < 0.5 ? ramp[1] : ramp[2];
+        d[j] = a[0] + (b[0] - a[0]) * k; d[j + 1] = a[1] + (b[1] - a[1]) * k; d[j + 2] = a[2] + (b[2] - a[2]) * k; d[j + 3] = 255;
+      }
+      self.octx.putImageData(self.img, 0, 0);
+      return self.off;
+    };
+  }
+  function rgb(hex) { return [parseInt(hex.slice(1, 3), 16), parseInt(hex.slice(3, 5), 16), parseInt(hex.slice(5, 7), 16)]; }
+  function mix(a, b, k) { return [a[0] + (b[0] - a[0]) * k, a[1] + (b[1] - a[1]) * k, a[2] + (b[2] - a[2]) * k]; }
+  function gauss(x, s) { return Math.exp(-(x * x) / (2 * s * s)); }
+
+  // ---------- 5. Quadrant: the Glasgow 2019 Bell-image ring ----------
+  // Moreau et al. imaged photon A with a camera while photon B passed a phase filter that
+  // was stepped through four settings. Each quadrant of the image shows photon A's
+  // interference pattern shifted by the phase chosen for B. Here the ring forms from
+  // individual detections; the quadrant phases follow B's rotating filter, and the
+  // pattern re-forms, one photon at a time, to match it.
+  function AnimQuadrant(ctx, c) {
+    var S = 224;
+    var ramp = [rgb(c.bg), mix(rgb(c.bg), rgb(c.a), 0.8), mix(rgb(c.b), [255, 255, 255], 0.25)];
+    function intensity(x, y, phase) {
+      var r = Math.sqrt(x * x + y * y); if (r > 0.95 || r < 0.28) return 0;
+      var ring = gauss(r - 0.63, 0.1) * 0.85 + gauss(r - 0.63, 0.24) * 0.1;
+      var q = (x >= 0 ? (y < 0 ? 0 : 1) : (y < 0 ? 3 : 2));
+      var phi = Math.atan2(y, x);
+      var ang = 0.5 + 0.5 * Math.cos(7 * phi + phase + q * Math.PI / 2);   // angular fringes, phase-stepped per quadrant
+      var rad = 0.72 + 0.28 * Math.cos(r * 52 + q * Math.PI / 2);          // fine radial fringes: the interference texture
+      return ring * (0.08 + 0.92 * ang * ang) * rad;
+    }
+    var field = new PhotonField(S, intensity, ramp), lastT = -1, seeded = false;
+    this.P = 24;
+    this.draw = function (w, h, t, still) {
+      var narrow = w < 700;
+      var B = ((t / 24) % 1) * Math.PI;           // B's filter: half a turn every 24 s
+      var phase = 2 * B;
+      if (still) { if (!seeded) { for (var k = 0; k < 90; k++) field.add(2200, 0.6); seeded = true; } }
+      else {
+        var dt = lastT < 0 ? 0.016 : Math.min(0.1, Math.abs(t - lastT)); lastT = t;
+        field.decay(Math.pow(0.5, dt / 2.4));
+        field.add(Math.round(1500 * (dt / 0.016)), phase);
+      }
+      var img = field.render(11);
+      ctx.clearRect(0, 0, w, h);
+      var size = Math.min(w, h) * (narrow ? 1.02 : 0.98), cx = w / 2, cy = h / 2;
+      ctx.imageSmoothingEnabled = true; ctx.imageSmoothingQuality = "low";
+      ctx.drawImage(img, cx - size / 2, cy - size / 2, size, size);
+      ctx.strokeStyle = withAlpha(c.ink, 0.22); ctx.lineWidth = 1; ctx.setLineDash([3, 5]); ctx.beginPath();
+      ctx.moveTo(cx, cy - size * 0.47); ctx.lineTo(cx, cy + size * 0.47); ctx.moveTo(cx - size * 0.47, cy); ctx.lineTo(cx + size * 0.47, cy); ctx.stroke(); ctx.setLineDash([]);
+      var rr = narrow ? 14 : 18, bx = w - rr - 14, by = rr + 14;
+      ctx.strokeStyle = withAlpha(c.ink, 0.5); ctx.beginPath(); ctx.arc(bx, by, rr, 0, Math.PI * 2); ctx.stroke();
+      ctx.strokeStyle = c.a; ctx.lineWidth = 1.5; ctx.beginPath();
+      ctx.moveTo(bx - Math.cos(B) * rr, by - Math.sin(B) * rr); ctx.lineTo(bx + Math.cos(B) * rr, by + Math.sin(B) * rr); ctx.stroke();
+      var deg = Math.round(B * 180 / Math.PI);
+      ctx.fillStyle = c.muted; ctx.font = mono(narrow ? 10 : 11); ctx.textAlign = "right"; ctx.textBaseline = "middle";
+      ctx.fillText("B filter " + pad(deg, 3) + "°", bx - rr - 10, by);
+      return pad(Math.round(field.total / 1000), 3) + "k photons of A · B's filter at " + deg + "° · A's pattern follows it";
+    };
+  }
+
+  // ---------- 6. Crossing: type-II SPDC rings ----------
+  // Kwiat et al. 1995: a pump photon splits inside a BBO crystal into two photons of
+  // orthogonal polarisation, emitted on two cones. On a screen the cones are two offset
+  // rings; where they intersect a photon could belong to either ring, so its polarisation
+  // is undefined until its partner is measured. Pairs born at the two crossings are the
+  // polarisation-entangled ones. Each pair here lands in the same frame, no line between.
+  function AnimCrossing(ctx, c) {
+    var S = 224, R = 0.5, D = 0.32;
+    var ramp = [rgb(c.bg), mix(rgb(c.bg), rgb(c.a), 0.9), mix(rgb(c.b), [255, 255, 255], 0.15)];
+    function intensity(x, y) {
+      var r1 = Math.sqrt((x + D) * (x + D) + y * y), r2 = Math.sqrt((x - D) * (x - D) + y * y);
+      var i = gauss(r1 - R, 0.028) + gauss(r2 - R, 0.028) + 0.18 * (gauss(r1 - R, 0.07) + gauss(r2 - R, 0.07));
+      var phi1 = Math.atan2(y, x + D), phi2 = Math.atan2(y, x - D);
+      i *= 0.78 + 0.22 * Math.cos(11 * phi1 + 1.7) * Math.cos(9 * phi2);
+      return i * 0.72;
+    }
+    var field = new PhotonField(S, intensity, ramp), lastT = -1, seeded = false, pairs = [], nextPair = 0, count = 0;
+    var cy0 = Math.sqrt(R * R - D * D);
+    this.P = 8;
+    this.draw = function (w, h, t, still) {
+      var narrow = w < 700;
+      if (still) { if (!seeded) { for (var k = 0; k < 70; k++) field.add(2400, 0); seeded = true; pairs = [{ t: 0 }]; count = 1; } }
+      else {
+        var dt = lastT < 0 ? 0.016 : Math.min(0.1, Math.abs(t - lastT)); lastT = t;
+        field.decay(Math.pow(0.5, dt / 3.5));
+        field.add(Math.round(1300 * (dt / 0.016)), 0);
+        if (t >= nextPair) { pairs.push({ t: t }); count++; nextPair = t + 0.55 + hash(count) * 0.9; }
+        pairs = pairs.filter(function (p) { return t - p.t < 1.6; });
+      }
+      var img = field.render(9);
+      ctx.clearRect(0, 0, w, h);
+      var size = Math.min(w / 1.05, h / 0.78 * 1.15), cx = w / 2, cy = h / 2;
+      ctx.imageSmoothingEnabled = true; ctx.imageSmoothingQuality = "low";
+      ctx.drawImage(img, cx - size / 2, cy - size / 2, size, size);
+      function fx(u) { return cx + u * size / 2; } function fy(v) { return cy + v * size / 2; }
+      for (var i = 0; i < pairs.length; i++) {
+        var age = still ? 0.15 : t - pairs[i].t, a = Math.max(0, 1 - age / 1.6), rad = 3 + age * 9;
+        ctx.strokeStyle = withAlpha(c.b, a * 0.9); ctx.lineWidth = 1.25;
+        ctx.beginPath(); ctx.arc(fx(0), fy(-cy0), rad, 0, Math.PI * 2); ctx.stroke();
+        ctx.beginPath(); ctx.arc(fx(0), fy(cy0), rad, 0, Math.PI * 2); ctx.stroke();
+        if (age < 0.25) { ctx.fillStyle = c.b; ctx.beginPath(); ctx.arc(fx(0), fy(-cy0), 2.2, 0, Math.PI * 2); ctx.fill(); ctx.beginPath(); ctx.arc(fx(0), fy(cy0), 2.2, 0, Math.PI * 2); ctx.fill(); }
+      }
+      ctx.fillStyle = c.muted; ctx.font = mono(narrow ? 10 : 11); ctx.textBaseline = "middle";
+      if (!narrow) {
+        ctx.textAlign = "right"; ctx.fillText("H", fx(-D - R) - 8, fy(0));
+        ctx.textAlign = "left"; ctx.fillText("V", fx(D + R) + 8, fy(0));
+      }
+      return "pair " + pad(count, 4) + " · one photon at each crossing · which ring either came from is undefined, so the pair is entangled";
+    };
+  }
+
+  // ---------- 7. Collapse: two probability clouds, one measurement ----------
+  // Each cloud is a probability density drawn as a few thousand sample points that drift
+  // independently: no signal passes between them. On measurement both collapse in the same
+  // frame to complementary outcomes (one up, one down); then the state is prepared again.
+  // The drama is the simultaneous snap. Nothing crosses the gap.
+  function AnimCollapse(ctx, c) {
+    var N = 2400;
+    function cloud(seed) {
+      var pts = [];
+      for (var i = 0; i < N; i++) {
+        var r = Math.sqrt(-2 * Math.log(1 - hash(seed + i * 2.11 + 0.3))), th = hash(seed + i * 3.7 + 0.6) * Math.PI * 2;
+        var r2 = Math.sqrt(-2 * Math.log(1 - hash(seed + i * 5.3 + 0.9))), th2 = hash(seed + i * 7.1 + 0.2) * Math.PI * 2;
+        pts.push({ lobe: hash(seed + i * 1.37) < 0.5 ? -1 : 1, ox: r * Math.cos(th), oy: r * Math.sin(th), ax: r2 * Math.cos(th2), ay: r2 * Math.sin(th2),
+          ph: hash(seed + i * 9.9) * Math.PI * 2, f: 0.6 + hash(seed + i * 4.4) * 0.9, k: hash(seed + i * 6.6) < 0.5 ? 0 : 1 });
+      }
+      return pts;
+    }
+    var A = cloud(11), Bc = cloud(29);
+    // particles are stamped from pre-rendered dot sprites: ~5k drawImage calls per frame is
+    // cheap where 5k arc fills are not (mid-range phone budget)
+    var sprites = {};
+    function sprite(color, sz) {
+      var key = color + sz; if (sprites[key]) return sprites[key];
+      var dpr = Math.min(2, window.devicePixelRatio || 1), px = Math.ceil(sz * 2 * dpr) + 2;
+      var cv = document.createElement("canvas"); cv.width = px; cv.height = px;
+      var g = cv.getContext("2d"); g.fillStyle = color; g.beginPath(); g.arc(px / 2, px / 2, sz * dpr, 0, Math.PI * 2); g.fill();
+      sprites[key] = { cv: cv, css: px / dpr }; return sprites[key];
+    }
+    this.P = 7;
+    this.draw = function (w, h, t, still) {
+      var narrow = w < 700, P = 7, u = ((t % P) + P) % P, n = Math.floor(t / P);
+      var outcome = hash(n + 0.5) < 0.5 ? 1 : -1;
+      var snap = u < 3 ? 0 : u < 3.18 ? ease((u - 3) / 0.18) : u < 5.2 ? 1 : u < 6.2 ? 1 - ease((u - 5.2) / 1.0) : 0;
+      if (still) { snap = 1; u = 4; }
+      ctx.clearRect(0, 0, w, h);
+      var lobeY = h * 0.19, sig = Math.min(w * 0.36, h) * 0.13;
+      var xs = [w * 0.27, w * 0.73], cols = [c.a, c.b];
+      var step = narrow ? 2 : 1;                                   // fewer samples on phones
+      for (var side = 0; side < 2; side++) {
+        var pts = side ? Bc : A, cxs = xs[side], cys = h / 2, res = side ? -outcome : outcome;
+        var color = snap > 0.5 ? withAlpha(cols[side], 0.55) : withAlpha(c.ink, 0.34);
+        var base = narrow ? 1.0 : 1.3, sp = [sprite(color, base * 0.8), sprite(color, base * 1.35)];
+        var tight = 1 - 0.32 * snap;
+        for (var i = 0; i < pts.length; i += step) {
+          var p = pts[i];
+          var jx = Math.sin(t * p.f * 1.3 + p.ph) * 0.18, jy = Math.cos(t * p.f + p.ph * 1.7) * 0.18;
+          var ox = p.ox, oy = p.oy;
+          if (snap > 0 && p.lobe !== res) { ox = p.ax; oy = p.ay; }
+          var x0 = (ox + jx) * sig * tight, y0 = -p.lobe * lobeY + (oy + jy) * sig * tight;
+          var y = p.lobe === res ? y0 : y0 + ((-res * lobeY + (oy + jy) * sig * tight) - y0) * snap;
+          var s = sp[p.k];
+          ctx.drawImage(s.cv, cxs + x0 - s.css / 2, cys + y - s.css / 2, s.css, s.css);
+        }
+        ctx.strokeStyle = withAlpha(c.ink, 0.35); ctx.lineWidth = 1; ctx.setLineDash([2, 4]);
+        ctx.beginPath(); ctx.moveTo(cxs, cys - h * 0.42); ctx.lineTo(cxs, cys + h * 0.42); ctx.stroke(); ctx.setLineDash([]);
+        ctx.fillStyle = c.muted; ctx.font = mono(narrow ? 10.5 : 11.5); ctx.textAlign = "center"; ctx.textBaseline = "bottom";
+        ctx.fillText(side ? "B" : "A", cxs, cys - h * 0.44);
+        if (snap > 0.5) {
+          ctx.fillStyle = cols[side]; ctx.font = sans(narrow ? 13 : 15, 600); ctx.textBaseline = "top";
+          ctx.fillText(res > 0 ? "↑" : "↓", cxs, cys + h * 0.44 - 2);
+        }
+      }
+      var state = snap > 0.5 ? ("measured · A " + (outcome > 0 ? "↑" : "↓") + "  B " + (outcome > 0 ? "↓" : "↑") + " · same frame; nothing crossed the gap")
+        : (u > 6.2 || u < 0.2 ? "state prepared again · each cloud fluctuates on its own" : "superposition · two independent probability clouds · measurement in " + (3 - u).toFixed(1) + " s");
+      return "measurement " + pad(n + 1, 4) + " · " + state;
+    };
+  }
+
   function copyRect() {
     var copy = document.querySelector(".hero-copy"); if (!copy) return null;
     var a = copy.getBoundingClientRect(), b = canvas.getBoundingClientRect();
@@ -403,7 +661,7 @@
     var corner = document.createElement("div"); corner.className = "dir-corner";
     var pill = document.createElement("button");
     pill.type = "button"; pill.className = "dir-pill"; pill.setAttribute("aria-controls", "dir-picker"); pill.setAttribute("aria-expanded", "false");
-    pill.innerHTML = '<svg class="icon" aria-hidden="true"><use href="#i-sliders"/></svg><span>Direction: <strong></strong></span><kbd>1\u20134</kbd>';
+    pill.innerHTML = '<svg class="icon" aria-hidden="true"><use href="#i-sliders"/></svg><span>Direction: <strong></strong></span><kbd>1\u20137</kbd>';
     corner.appendChild(picker); corner.appendChild(pill);
     document.body.appendChild(backdrop); document.body.appendChild(corner);
 

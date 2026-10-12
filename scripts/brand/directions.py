@@ -24,6 +24,9 @@ PALETTES = {
     "spacelike": {"ink": "#ECEBE6", "a": "#F0B23A", "b": "#F0B23A"},
     "swap": {"ink": "#EFEBE0", "a": "#D7935B", "b": "#D7935B"},
     "bound": {"ink": "#0F1B1E", "a": "#0F7A5A", "b": "#9AA7AC"},
+    "quadrant": {"ink": "#F1ECE2", "a": "#E9A23B", "b": "#F4E8D2"},
+    "crossing": {"ink": "#EDEEEA", "a": "#D9532F", "b": "#F6D4BE"},
+    "collapse": {"ink": "#17171B", "a": "#B8341C", "b": "#1C6E6B"},
 }
 
 
@@ -91,7 +94,54 @@ def bound(p):
     return "\n".join(out)
 
 
-MARKS = {"singlet": singlet, "spacelike": spacelike, "swap": swap, "bound": bound}
+def _hash(k):
+    """Deterministic pseudo-random in [0, 1); same formula as site/directions.js hash()."""
+    x = math.sin(k * 12.9898 + 78.233) * 43758.5453
+    return x - math.floor(x)
+
+
+def quadrant(p):
+    """The Glasgow 2019 Bell image: a ring whose four quadrants carry phase-shifted patterns.
+    Drawn as four quadrant arcs at alternating radii, the shift between settings made literal."""
+    out = ['<circle cx="24" cy="16" r="11" fill="none" stroke="%s" stroke-width="1" opacity="0.35"/>' % p["ink"]]
+    radii = [11.5, 9.5, 11.5, 9.5]
+    for q in range(4):
+        a0, a1, r = q * math.pi / 2 + 0.12, (q + 1) * math.pi / 2 - 0.12, radii[q]
+        out.append('<path d="M%s %s A%s %s 0 0 1 %s %s" fill="none" stroke="%s" stroke-width="3" stroke-linecap="round"/>'
+                   % (f(24 + r * math.cos(a0)), f(16 + r * math.sin(a0)), f(r), f(r),
+                      f(24 + r * math.cos(a1)), f(16 + r * math.sin(a1)), p["b"] if q % 2 else p["a"]))
+    return "\n".join(out)
+
+
+def crossing(p):
+    """Type-II SPDC: two offset rings of down-converted light; the entangled pairs are born
+    where the rings cross, so the two crossing points are the only filled shapes."""
+    y = math.sqrt(10 ** 2 - 6 ** 2)
+    return "\n".join([
+        '<circle cx="18" cy="16" r="10" fill="none" stroke="%s" stroke-width="1.75"/>' % p["a"],
+        '<circle cx="30" cy="16" r="10" fill="none" stroke="%s" stroke-width="1.75"/>' % p["a"],
+        '<circle cx="24" cy="%s" r="2.4" fill="%s"/>' % (f(16 - y), p["b"]),
+        '<circle cx="24" cy="%s" r="2.4" fill="%s"/>' % (f(16 + y), p["b"]),
+    ])
+
+
+def collapse(p):
+    """Two probability clouds as stippled densities, already collapsed to complementary
+    outcomes: the left cloud sits high, the right one low. No line joins them."""
+    out = []
+    for side in range(2):
+        cx, col = (34 if side else 14), (p["b"] if side else p["a"])
+        for i in range(26):
+            r = math.sqrt(_hash(side * 50 + i + 0.2)) * 9
+            th = _hash(side * 50 + i + 0.7) * math.pi * 2
+            out.append('<circle cx="%s" cy="%s" r="%s" fill="%s"/>'
+                       % (f(cx + math.cos(th) * r), f(16 + math.sin(th) * r * 0.75 + (4 if side else -4)),
+                          f(0.9 + _hash(i + side) * 0.9), col))
+    return "\n".join(out)
+
+
+MARKS = {"singlet": singlet, "spacelike": spacelike, "swap": swap, "bound": bound,
+         "quadrant": quadrant, "crossing": crossing, "collapse": collapse}
 
 
 def svg(w, h, body, extra=""):
