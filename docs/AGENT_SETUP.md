@@ -191,9 +191,9 @@ proceeding.
    for each invite. `--via` bypasses mDNS discovery, not a firewall.
 
    On Linux, ask the human to check UFW and only change it if it is active.
-   The human runs the allow commands only when `sudo ufw status` reports active. These
-   fixed-port rules cover the default link and optional mDNS discovery; they
-   do not open the random invite listener:
+   The human runs the allow commands only when `sudo ufw status` reports
+   active. These fixed-port rules cover the default link and optional mDNS
+   discovery; they do not open the random invite listener:
 
    ```sh
    sudo ufw status
@@ -236,7 +236,7 @@ proceeding.
    or `(Get-Command entangle).Source` on Windows, using a temporary `.ps1`
    script.
 
-   **omp on Windows:** Use `%USERPROFILE%\.omp\agent\mcp.json` and the same
+   **omp on Windows:** Use `$env:USERPROFILE\.omp\agent\mcp.json` and the same
    `mcpServers` object shape as [playbook 09](playbooks/09-windows-omp.md):
 
    ```json

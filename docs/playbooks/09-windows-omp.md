@@ -48,10 +48,10 @@ Use this when you install Entangle on Windows and register it with omp.
    policy. `--via` bypasses mDNS, not the firewall.
 
 3. **In omp's MCP config:** Add an Entangle server entry in
-   `%USERPROFILE%\.omp\agent\mcp.json` and replace `<user>` with the Windows
-   account folder. The executable path must be absolute; keep other existing
-   server entries. The default Entangle data directory is
-   `%APPDATA%\entangle`.
+   `$env:USERPROFILE\.omp\agent\mcp.json`. The executable path must be
+   absolute; keep other existing server entries. The default Entangle data
+   directory is `$env:APPDATA\entangle`. (PowerShell syntax; write fully
+   expanded paths into config files.)
 
    ```json
    {
