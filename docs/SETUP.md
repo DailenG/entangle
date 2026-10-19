@@ -75,11 +75,11 @@ sudo ufw allow 7337/tcp
 sudo ufw allow 5353/udp
 ```
 
-On Windows, ask the human to run this in elevated PowerShell. Set `<abs>` to
-the install directory containing the executable path printed by the installer:
+On Windows, run this in an elevated PowerShell. Set `<abs-path>` to the
+executable path printed by the installer:
 
 ```powershell
-New-NetFirewallRule -DisplayName "Entangle" -Direction Inbound -Program "<abs>\entangle.exe" -Action Allow -Profile Private
+New-NetFirewallRule -DisplayName "Entangle" -Direction Inbound -Program "<abs-path>" -Action Allow -Profile Private
 ```
 
 Keep an existing UDP 5353 mDNS rule. If discovery needs it and no rule exists,
@@ -94,6 +94,12 @@ system firewall. If an active firewall blocks an invite, the human must choose
 an appropriate policy for its random listener; do not suggest a fixed port.
 Multicast behavior can also depend on the network interface and router
 configuration.
+
+An agent following [AGENT_SETUP.md](AGENT_SETUP.md) may apply these rules for
+you, but only through an operating-system consent prompt you answer (UAC on
+Windows, the `pkexec` password dialog on a Linux desktop). It never uses
+`sudo`, cached credentials or stored passwords, and on SSH or headless
+machines it asks you to run the commands yourself.
 
 ## Groups
 

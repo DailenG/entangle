@@ -190,10 +190,38 @@ proceeding.
    address. Do not ask the human to open a guessed invite port: it is random
    for each invite. `--via` bypasses mDNS discovery, not a firewall.
 
-   On Linux, ask the human to check UFW and only change it if it is active.
-   The human runs the allow commands only when `sudo ufw status` reports
-   active. These fixed-port rules cover the default link and optional mDNS
-   discovery; they do not open the random invite listener:
+   **Elevation rule.** Firewall changes need administrator rights. Elevate
+   only through an operating-system consent prompt that the human answers:
+   UAC on Windows, or the polkit password dialog that `pkexec` opens on a
+   Linux desktop. Before launching it, show the human the exact script, say
+   that a prompt will appear, and wait for approval. Never use `sudo`
+   (including `sudo -n`), `runas /savecred`, or stored credentials: they can
+   reuse cached rights without the human seeing a prompt. If the prompt is
+   declined, cannot appear (SSH or headless session), or fails, stop, report
+   it, and give the human the commands below to run in their own
+   administrator terminal. Do not retry. Delete temporary scripts afterwards.
+
+   **Linux (UFW).** Act only if UFW is installed (`command -v ufw` or
+   `/usr/sbin/ufw`). These fixed-port rules cover the default link and
+   optional mDNS discovery; they do not open the random invite listener. On a
+   local desktop session (`DISPLAY` or `WAYLAND_DISPLAY` set, no
+   `SSH_CONNECTION`) with `pkexec` available, write this script to a file
+   created with `mktemp`:
+
+   ```sh
+   set -eu
+   if ! ufw status | grep -q '^Status: active'; then
+       echo 'UFW is not active; no rule changed.'
+       exit 0
+   fi
+   ufw allow 7337/tcp
+   ufw allow 5353/udp
+   ```
+
+   After the human approves, run `pkexec /bin/sh <script>`. Exit code 126
+   means the human dismissed the dialog; 127 means authorization failed or no
+   authentication agent is available. Otherwise, the human runs these in
+   their own terminal:
 
    ```sh
    sudo ufw status
@@ -201,32 +229,67 @@ proceeding.
    sudo ufw allow 5353/udp
    ```
 
-   On Windows, ask the human to run an executable rule in elevated
-   PowerShell; never try to elevate. Set `<abs>` to the install directory
-   containing the executable path printed by the installer:
+   The human runs the two `allow` commands only when `sudo ufw status`
+   reports active.
+
+   **Windows.** Write this rule script to
+   `$env:TEMP\entangle-firewall.ps1`, replacing `<abs-path>` with the
+   executable path recorded in step 2:
 
    ```powershell
-   New-NetFirewallRule -DisplayName "Entangle" -Direction Inbound -Program "<abs>\entangle.exe" -Action Allow -Profile Private
+   $ErrorActionPreference = 'Stop'
+   $exe = '<abs-path>'
+   if (-not (Get-NetFirewallRule -DisplayName 'Entangle' -ErrorAction SilentlyContinue)) {
+       New-NetFirewallRule -DisplayName 'Entangle' -Direction Inbound -Program $exe -Action Allow -Profile Private | Out-Null
+   }
    ```
 
    Keep an existing UDP 5353 mDNS rule. If the human needs mDNS and no rule
-   exists, they can add one in the same elevated PowerShell:
+   exists, append this to the same script:
 
    ```powershell
-   New-NetFirewallRule -DisplayName "Entangle mDNS" -Direction Inbound -Protocol UDP -LocalPort 5353 -Action Allow -Profile Private
+   if (-not (Get-NetFirewallRule -DisplayName 'Entangle mDNS' -ErrorAction SilentlyContinue)) {
+       New-NetFirewallRule -DisplayName 'Entangle mDNS' -Direction Inbound -Protocol UDP -LocalPort 5353 -Action Allow -Profile Private | Out-Null
+   }
    ```
+
+   Then write this launcher to a second temporary `.ps1` and run it with
+   `powershell.exe -NoProfile -ExecutionPolicy Bypass -File <launcher>`. It
+   opens the UAC prompt; if this session is already elevated, it runs without
+   one:
+
+   ```powershell
+   $script = Join-Path $env:TEMP 'entangle-firewall.ps1'
+   try {
+       $p = Start-Process -FilePath 'powershell.exe' -Verb RunAs -Wait -PassThru -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$script`"")
+   } catch {
+       Write-Output 'Elevation was declined or is unavailable; no firewall rule was changed.'
+       exit 1
+   }
+   exit $p.ExitCode
+   ```
+
+   Exit code 0 means the rule exists. If the launcher prints the declined
+   message or exits nonzero, follow the elevation rule above; the human can
+   run the rule script's `New-NetFirewallRule` command in an elevated
+   PowerShell themselves.
 
    On macOS, ask the human to allow incoming connections for Entangle if the
    system firewall prompts.
 
    If an active firewall blocks an invite, ask the human to choose an
    appropriate policy for the random listener; do not suggest a fixed port.
-   **Verify:** Ask the human to confirm the approved firewall policy or a
-   successful connection. Do not claim rules changed unless an approved
+
+   **Verify:** On Windows, run `Get-NetFirewallRule -DisplayName 'Entangle'`
+   (read-only, no elevation) and confirm `Enabled`, `Inbound`, `Allow` and
+   `Private`. On Linux, report the script's output or ask the human for
+   `sudo ufw status`. Otherwise ask the human to confirm the firewall policy
+   or a successful connection. Do not claim rules changed unless an approved
    command changed them.
 
-   **If this fails:** Report the exact error. Do not retry with elevated
-   privileges or change network policy without approval.
+   **If this fails:** Report the exact error and exit code. Do not retry the
+   elevation, try another elevation method, or change network policy without
+   approval.
 
 ## 5. Register MCP
 

@@ -27,17 +27,20 @@ Use this when you install Entangle on Windows and register it with omp.
    Restart the terminal if the installer adds its directory to PATH.
 
 2. **On the Windows device (PowerShell, only if required):** If Windows
-   Firewall blocks discovery or incoming links, ask the human to run the
-   following program rule in elevated PowerShell. Use the installer's
-   absolute executable path's containing directory as `<abs>`; do not try to
-   elevate:
+   Firewall blocks discovery or incoming links, add a program rule for the
+   installer's absolute executable path. An agent follows
+   [AGENT_SETUP step 4](../AGENT_SETUP.md#4-network): it shows the human the
+   rule script, then launches it through the UAC prompt, which the human
+   approves. It never uses stored credentials and does not retry if the
+   prompt is declined. A human can instead run this in an elevated
+   PowerShell, with `<abs-path>` replaced by the executable path:
 
    ```powershell
-   New-NetFirewallRule -DisplayName "Entangle" -Direction Inbound -Program "<abs>\entangle.exe" -Action Allow -Profile Private
+   New-NetFirewallRule -DisplayName "Entangle" -Direction Inbound -Program "<abs-path>" -Action Allow -Profile Private
    ```
 
    Keep an existing UDP 5353 rule for mDNS. If discovery needs it and no rule
-   exists, the human can add one in elevated PowerShell:
+   exists, add one the same way:
 
    ```powershell
    New-NetFirewallRule -DisplayName "Entangle mDNS" -Direction Inbound -Protocol UDP -LocalPort 5353 -Action Allow -Profile Private
