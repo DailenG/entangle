@@ -6,9 +6,7 @@ use crossterm::{
     event::{read, Event, KeyCode, KeyEventKind, KeyModifiers},
     terminal::{disable_raw_mode, enable_raw_mode},
 };
-use entangle_core::sas;
 use entangle_repeater::{client, invite, server, store::Store};
-use rand::seq::SliceRandom;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
@@ -25,6 +23,15 @@ static CONFIG_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum KeyOutcome {
     Pick(u8),
+    Cancel,
+    Invalid,
+    Ignore,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum YesNo {
+    Yes,
+    No,
     Cancel,
     Invalid,
     Ignore,
@@ -68,6 +75,32 @@ fn read_approval_key(max: u8) -> Result<KeyOutcome> {
             KeyOutcome::Ignore => continue,
             KeyOutcome::Pick(value) if value > max => return Ok(KeyOutcome::Invalid),
             outcome => return Ok(outcome),
+        }
+    }
+}
+
+fn classify_yes_no(code: KeyCode, modifiers: KeyModifiers) -> YesNo {
+    match code {
+        KeyCode::Char('y' | 'Y') => YesNo::Yes,
+        KeyCode::Char('n' | 'N') => YesNo::No,
+        KeyCode::Esc | KeyCode::Char('q' | 'Q') => YesNo::Cancel,
+        KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => YesNo::Cancel,
+        KeyCode::Modifier(_) => YesNo::Ignore,
+        _ => YesNo::Invalid,
+    }
+}
+
+fn read_yes_no_key() -> Result<YesNo> {
+    let _raw_mode = RawModeGuard::enter()?;
+    loop {
+        let outcome = match read()? {
+            Event::Key(key) if key.kind == KeyEventKind::Press => {
+                classify_yes_no(key.code, key.modifiers)
+            }
+            _ => YesNo::Ignore,
+        };
+        if outcome != YesNo::Ignore {
+            return Ok(outcome);
         }
     }
 }
@@ -183,6 +216,29 @@ pub(crate) fn websocket_host(url: &str) -> Result<&str> {
 
 fn short_fingerprint(public: &[u8; 32]) -> String {
     hex::encode(sha2::Sha256::digest(public))[..8].to_owned()
+}
+
+fn long_fingerprint(public: &[u8; 32]) -> String {
+    let fingerprint = hex::encode(sha2::Sha256::digest(public));
+    format!(
+        "{} {} {} {}",
+        &fingerprint[..4],
+        &fingerprint[4..8],
+        &fingerprint[8..12],
+        &fingerprint[12..16]
+    )
+}
+
+fn request_waiting_message(
+    host: &str,
+    repeater_public: &[u8; 32],
+    device_public: &[u8; 32],
+) -> String {
+    format!(
+        "Asked the Quantum Repeater at {host} to enroll this device (repeater fingerprint {}).\nThis device's fingerprint: {}\nOn the host, run `entangle repeater approve` and check that it shows the same fingerprint.\nWaiting for the host to decide (up to 10 minutes; Ctrl+C cancels)...",
+        short_fingerprint(repeater_public),
+        long_fingerprint(device_public)
+    )
 }
 
 fn join_summary(host: &str, repeater_public: &[u8; 32], device_public: &[u8; 32]) -> String {
@@ -456,11 +512,12 @@ async fn request_join(
             biased;
             received = &mut sas_rx, if !printed && !sas_closed => {
                 match received {
-                    Ok((public, sas)) => {
-                        writeln!(output, "Asked the Quantum Repeater at {host} to enroll this device (repeater fingerprint {}).", short_fingerprint(&public))?;
-                        writeln!(output, "On the host, run `entangle repeater approve` and pick:")?;
-                        writeln!(output, "{}", sas::render(sas))?;
-                        writeln!(output, "Waiting for the host to decide (up to 10 minutes; Ctrl+C cancels)...")?;
+                    Ok((public, _sas)) => {
+                        writeln!(
+                            output,
+                            "{}",
+                            request_waiting_message(&host, &public, &device_public)
+                        )?;
                         output.flush()?;
                         printed = true;
                     }
@@ -516,6 +573,22 @@ fn request_age(requested_at: &str) -> String {
     } else {
         format!("{}m", seconds / 60)
     }
+}
+
+fn approval_prompt(
+    request: &entangle_repeater::store::EnrollmentRequest,
+    age: &str,
+) -> Result<String> {
+    let public: [u8; 32] = hex::decode(&request.key)?
+        .try_into()
+        .map_err(|_| anyhow!("invalid request key"))?;
+    let label = request.label.as_deref().unwrap_or("(unnamed)");
+    let device = request.label.as_deref().unwrap_or("this device");
+    Ok(format!(
+        "{label} from {}, {age} ago\nDevice fingerprint: {}\nDoes `entangle repeater join` on {device} show this fingerprint? Approve? [y/n] ",
+        request.source,
+        long_fingerprint(&public)
+    ))
 }
 
 fn approve_request(root: PathBuf, output: &mut dyn Write) -> Result<i32> {
@@ -576,38 +649,32 @@ fn approve_request(root: PathBuf, output: &mut dyn Write) -> Result<i32> {
             }
         }
     };
-    writeln!(
-        output,
-        "On {}, which set does `entangle repeater join` show?",
-        request.label.as_deref().unwrap_or("(unnamed)")
-    )?;
-    let real = request.sas;
-    let mut sets = sas::decoys(real, &mut rand::thread_rng())
-        .into_iter()
-        .collect::<Vec<_>>();
-    sets.push(real);
-    sets.shuffle(&mut rand::thread_rng());
-    for (index, set) in sets.iter().enumerate() {
-        writeln!(output, "{}) {}", index + 1, sas::render(*set))?;
-    }
-    writeln!(output, "5) none of these")?;
     let mut invalid = 0;
-    let choice = loop {
-        write!(output, "Press 1-5: ")?;
+    let approved = loop {
+        let prompt = approval_prompt(&request, &request_age(&request.requested_at))?;
+        output.write_all(prompt.as_bytes())?;
         output.flush()?;
-        match read_approval_key(5)? {
-            KeyOutcome::Pick(value) => {
-                writeln!(output, "{value}")?;
-                break usize::from(value);
+        match read_yes_no_key()? {
+            YesNo::Yes => {
+                writeln!(output, "y")?;
+                break true;
             }
-            KeyOutcome::Cancel => return cancel_approval(output),
-            _ => {
+            YesNo::No => {
+                writeln!(output, "n")?;
+                break false;
+            }
+            YesNo::Cancel => return cancel_approval(output),
+            YesNo::Invalid => {
                 invalid += 1;
-                writeln!(output, "\r\nPress a number from 1 to 5.")?;
+                writeln!(
+                    output,
+                    "\r\nPress y to approve, n to deny, or Esc to cancel."
+                )?;
                 if invalid == 3 {
                     return cancel_approval(output);
                 }
             }
+            YesNo::Ignore => unreachable!(),
         }
     };
     let still_pending = store.requests()?.contains(&request)
@@ -626,7 +693,6 @@ fn approve_request(root: PathBuf, output: &mut dyn Write) -> Result<i32> {
     let key: [u8; 32] = hex::decode(&request.key)?
         .try_into()
         .map_err(|_| anyhow!("invalid request key"))?;
-    let approved = choice != 5 && sets[choice - 1] == real;
     store.decide_device(key, request.label.clone(), approved)?;
     let public: [u8; 32] = key;
     if approved {
@@ -745,11 +811,106 @@ fn reject_symlink_components(path: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{join_summary, leave_summary, short_fingerprint};
+    use super::{
+        approval_prompt, classify_yes_no, join_summary, leave_summary, long_fingerprint,
+        request_waiting_message, short_fingerprint, YesNo,
+    };
+    use crossterm::event::{KeyCode, KeyModifiers, ModifierKeyCode};
+    use entangle_repeater::store::EnrollmentRequest;
 
     #[test]
     fn repeater_short_fingerprint_matches_known_sha256() {
         assert_eq!(short_fingerprint(&[0; 32]), "66687aad");
+    }
+
+    #[test]
+    fn repeater_long_fingerprint_matches_known_sha256() {
+        assert_eq!(long_fingerprint(&[0; 32]), "6668 7aad f862 bd77");
+    }
+
+    #[test]
+    fn request_waiting_message_shows_device_fingerprint() {
+        assert_eq!(
+            request_waiting_message("relay.example", &[1; 32], &[0; 32]),
+            "Asked the Quantum Repeater at relay.example to enroll this device (repeater fingerprint 72cd6e84).\nThis device's fingerprint: 6668 7aad f862 bd77\nOn the host, run `entangle repeater approve` and check that it shows the same fingerprint.\nWaiting for the host to decide (up to 10 minutes; Ctrl+C cancels)..."
+        );
+    }
+
+    fn request(label: Option<&str>) -> EnrollmentRequest {
+        EnrollmentRequest {
+            key: hex::encode([0; 32]),
+            label: label.map(str::to_owned),
+            source: "192.0.2.7".to_owned(),
+            requested_at: "2025-01-01T00:00:00Z".to_owned(),
+            sas: [1, 2, 3],
+        }
+    }
+
+    #[test]
+    fn approval_prompt_shows_label_source_and_fingerprint() {
+        assert_eq!(
+            approval_prompt(&request(Some("alice")), "3s").unwrap(),
+            "alice from 192.0.2.7, 3s ago\nDevice fingerprint: 6668 7aad f862 bd77\nDoes `entangle repeater join` on alice show this fingerprint? Approve? [y/n] "
+        );
+    }
+
+    #[test]
+    fn approval_prompt_uses_device_for_unlabelled_request() {
+        assert_eq!(
+            approval_prompt(&request(None), "4s").unwrap(),
+            "(unnamed) from 192.0.2.7, 4s ago\nDevice fingerprint: 6668 7aad f862 bd77\nDoes `entangle repeater join` on this device show this fingerprint? Approve? [y/n] "
+        );
+    }
+
+    #[test]
+    fn yes_no_classification_handles_approval_denial_and_cancellation() {
+        assert_eq!(
+            classify_yes_no(KeyCode::Char('y'), KeyModifiers::NONE),
+            YesNo::Yes
+        );
+        assert_eq!(
+            classify_yes_no(KeyCode::Char('Y'), KeyModifiers::NONE),
+            YesNo::Yes
+        );
+        assert_eq!(
+            classify_yes_no(KeyCode::Char('n'), KeyModifiers::NONE),
+            YesNo::No
+        );
+        assert_eq!(
+            classify_yes_no(KeyCode::Char('N'), KeyModifiers::NONE),
+            YesNo::No
+        );
+        assert_eq!(
+            classify_yes_no(KeyCode::Esc, KeyModifiers::NONE),
+            YesNo::Cancel
+        );
+        assert_eq!(
+            classify_yes_no(KeyCode::Char('q'), KeyModifiers::NONE),
+            YesNo::Cancel
+        );
+        assert_eq!(
+            classify_yes_no(KeyCode::Char('Q'), KeyModifiers::NONE),
+            YesNo::Cancel
+        );
+        assert_eq!(
+            classify_yes_no(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            YesNo::Cancel
+        );
+        assert_eq!(
+            classify_yes_no(KeyCode::Char('x'), KeyModifiers::NONE),
+            YesNo::Invalid
+        );
+        assert_eq!(
+            classify_yes_no(KeyCode::Enter, KeyModifiers::NONE),
+            YesNo::Invalid
+        );
+        assert_eq!(
+            classify_yes_no(
+                KeyCode::Modifier(ModifierKeyCode::LeftShift),
+                KeyModifiers::NONE
+            ),
+            YesNo::Ignore
+        );
     }
 
     #[test]

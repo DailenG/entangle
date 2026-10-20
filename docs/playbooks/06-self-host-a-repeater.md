@@ -101,8 +101,8 @@ Use this when devices on different networks need a common relay for their encryp
 
 7. **On a device and the repeater host:** If you cannot share an invite code,
    use URL-request enrollment instead. The device command is human-only; the
-   host operator then compares the displayed symbol set and runs the
-   human-only approval command.
+   host operator compares the device fingerprint shown on both screens, then
+   presses `y` to approve. Press `n` to deny or Esc to cancel.
 
    ```sh
    entangle repeater join ws://<host>:7338/entangle

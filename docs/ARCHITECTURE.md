@@ -152,10 +152,12 @@ authorization boundary. The group-derived PSK and membership-bound static key
 are the end-to-end security boundary.
 
 Devices can request repeater enrollment at `{path}/request` without knowing the
-repeater key: Noise `XX` authenticates the exchange, then an encrypted
-commit/reveal SAS lets a host operator approve the matching emoji set. Pending
-requests and device decisions use single-writer atomic files; the repeater
-alone writes `requests.json`, while the host CLI updates the device allowlist.
+repeater key: Noise `XX` authenticates the exchange. The host operator
+approves after comparing the device key fingerprint shown on both the device
+and the host. The protocol still runs the commit/reveal SAS exchange for wire
+compatibility, but the CLI no longer displays it. Pending requests and device
+decisions use single-writer atomic files; the repeater alone writes
+`requests.json`, while the host CLI updates the device allowlist.
 
 ### Known limits (v1)
 

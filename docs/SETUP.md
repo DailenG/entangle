@@ -275,10 +275,12 @@ On the device, run:
 entangle repeater join ws://HOST:7338/entangle
 ```
 
-On the host, run `entangle repeater approve` and choose the matching emoji set.
-The emoji check protects against interception. The operator can disable
-request enrollment with `entangle repeater serve --no-requests`; invitation
-enrollment remains available.
+The device's `join` command prints its fingerprint. On the host, run
+`entangle repeater approve` and compare the device fingerprint shown there with
+the one printed on the device. Press `y` to approve; `n` denies, and Esc
+cancels. The operator can disable request enrollment with
+`entangle repeater serve --no-requests`; invitation enrollment remains
+available.
 
 The host can inspect enrolled device fingerprints with
 `entangle repeater devices` and revoke a device by fingerprint prefix with
