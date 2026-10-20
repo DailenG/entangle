@@ -235,9 +235,10 @@ fn request_waiting_message(
     device_public: &[u8; 32],
 ) -> String {
     format!(
-        "Asked the Quantum Repeater at {host} to enroll this device (repeater fingerprint {}).\nThis device's fingerprint: {}\nOn the host, run `entangle repeater approve` and check that it shows the same fingerprint.\nWaiting for the host to decide (up to 10 minutes; Ctrl+C cancels)...",
+        "Asked the Quantum Repeater at {host} to enroll this device (repeater fingerprint {}).\nThis device's fingerprint: {}\nRepeater fingerprint: {}\nOn the host, run `entangle repeater approve` and check that it shows the same two fingerprints.\nWaiting for the host to decide (up to 10 minutes; Ctrl+C cancels)...",
         short_fingerprint(repeater_public),
-        long_fingerprint(device_public)
+        long_fingerprint(device_public),
+        long_fingerprint(repeater_public)
     )
 }
 
@@ -578,6 +579,7 @@ fn request_age(requested_at: &str) -> String {
 fn approval_prompt(
     request: &entangle_repeater::store::EnrollmentRequest,
     age: &str,
+    repeater_public: &[u8; 32],
 ) -> Result<String> {
     let public: [u8; 32] = hex::decode(&request.key)?
         .try_into()
@@ -585,9 +587,10 @@ fn approval_prompt(
     let label = request.label.as_deref().unwrap_or("(unnamed)");
     let device = request.label.as_deref().unwrap_or("this device");
     Ok(format!(
-        "{label} from {}, {age} ago\nDevice fingerprint: {}\nDoes `entangle repeater join` on {device} show this fingerprint? Approve? [y/n] ",
+        "{label} from {}, {age} ago\nDevice fingerprint: {}\nRepeater fingerprint: {}\nDoes `entangle repeater join` on {device} show these two fingerprints? Approve? [y/n] ",
         request.source,
-        long_fingerprint(&public)
+        long_fingerprint(&public),
+        long_fingerprint(repeater_public)
     ))
 }
 
@@ -649,9 +652,14 @@ fn approve_request(root: PathBuf, output: &mut dyn Write) -> Result<i32> {
             }
         }
     };
+    let repeater_public = entangle_transport::public_key(&store.key()?);
     let mut invalid = 0;
     let approved = loop {
-        let prompt = approval_prompt(&request, &request_age(&request.requested_at))?;
+        let prompt = approval_prompt(
+            &request,
+            &request_age(&request.requested_at),
+            &repeater_public,
+        )?;
         output.write_all(prompt.as_bytes())?;
         output.flush()?;
         match read_yes_no_key()? {
@@ -832,7 +840,7 @@ mod tests {
     fn request_waiting_message_shows_device_fingerprint() {
         assert_eq!(
             request_waiting_message("relay.example", &[1; 32], &[0; 32]),
-            "Asked the Quantum Repeater at relay.example to enroll this device (repeater fingerprint 72cd6e84).\nThis device's fingerprint: 6668 7aad f862 bd77\nOn the host, run `entangle repeater approve` and check that it shows the same fingerprint.\nWaiting for the host to decide (up to 10 minutes; Ctrl+C cancels)..."
+            "Asked the Quantum Repeater at relay.example to enroll this device (repeater fingerprint 72cd6e84).\nThis device's fingerprint: 6668 7aad f862 bd77\nRepeater fingerprint: 72cd 6e84 22c4 07fb\nOn the host, run `entangle repeater approve` and check that it shows the same two fingerprints.\nWaiting for the host to decide (up to 10 minutes; Ctrl+C cancels)..."
         );
     }
 
@@ -849,16 +857,16 @@ mod tests {
     #[test]
     fn approval_prompt_shows_label_source_and_fingerprint() {
         assert_eq!(
-            approval_prompt(&request(Some("alice")), "3s").unwrap(),
-            "alice from 192.0.2.7, 3s ago\nDevice fingerprint: 6668 7aad f862 bd77\nDoes `entangle repeater join` on alice show this fingerprint? Approve? [y/n] "
+            approval_prompt(&request(Some("alice")), "3s", &[1; 32]).unwrap(),
+            "alice from 192.0.2.7, 3s ago\nDevice fingerprint: 6668 7aad f862 bd77\nRepeater fingerprint: 72cd 6e84 22c4 07fb\nDoes `entangle repeater join` on alice show these two fingerprints? Approve? [y/n] "
         );
     }
 
     #[test]
     fn approval_prompt_uses_device_for_unlabelled_request() {
         assert_eq!(
-            approval_prompt(&request(None), "4s").unwrap(),
-            "(unnamed) from 192.0.2.7, 4s ago\nDevice fingerprint: 6668 7aad f862 bd77\nDoes `entangle repeater join` on this device show this fingerprint? Approve? [y/n] "
+            approval_prompt(&request(None), "4s", &[1; 32]).unwrap(),
+            "(unnamed) from 192.0.2.7, 4s ago\nDevice fingerprint: 6668 7aad f862 bd77\nRepeater fingerprint: 72cd 6e84 22c4 07fb\nDoes `entangle repeater join` on this device show these two fingerprints? Approve? [y/n] "
         );
     }
 

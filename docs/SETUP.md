@@ -277,10 +277,13 @@ entangle repeater join ws://HOST:7338/entangle
 
 The device's `join` command prints its fingerprint. On the host, run
 `entangle repeater approve` and compare the device fingerprint shown there with
-the one printed on the device. Press `y` to approve; `n` denies, and Esc
-cancels. The operator can disable request enrollment with
-`entangle repeater serve --no-requests`; invitation enrollment remains
-available.
+the one printed on the device. Also compare the repeater fingerprint shown on
+both screens. Press `y` to approve; `n` denies, and Esc cancels. URL-request
+enrollment requires Entangle 0.7.1 or later on both the device and host; with
+an older host or device, use an invite code (`entangle repeater invite` /
+`entangle repeater join <code>`), which works across versions. The operator
+can disable request enrollment with `entangle repeater serve --no-requests`;
+invitation enrollment remains available.
 
 The host can inspect enrolled device fingerprints with
 `entangle repeater devices` and revoke a device by fingerprint prefix with
